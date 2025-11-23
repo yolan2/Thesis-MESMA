@@ -3668,4 +3668,4 @@ cat("======================\n\n")
   cat("\nMESMA fitting completed successfully!\n")
 
 }
-
+print("Script fit_veg_mixture_mesma.R execution finished.")
