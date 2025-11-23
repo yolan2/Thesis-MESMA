@@ -1,0 +1,17 @@
+# Ignore generated data folders
+modis/
+landsat/
+phenology_results/
+
+# Python virtual environments
+venv/
+.venv/
+venv.*
+
+# Local editor/IDE settings
+.idea/
+
+# R-specific
+.Rhistory
+.RData
+.Rproj.user/
