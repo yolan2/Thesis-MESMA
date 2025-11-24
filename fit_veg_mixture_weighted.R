@@ -168,7 +168,7 @@ if(!exists("INPUT_CSV")) INPUT_CSV <- file.path(OUTPUT_DIR, "hls_phenology_data.
 if(!exists("OUT_DIR")) OUT_DIR <- file.path(OUTPUT_DIR, "veg_mixture_fit")
 
 # Train/test defaults
-if(!exists("TEST_YEARS")) TEST_YEARS <- NULL
+## NOTE: TEST_YEARS behavior removed — script always uses all available years.
 if(!exists("TRAIN_YEARS")) TRAIN_YEARS <- 2019:2024
 
 # PCA / factor projection tuning
@@ -226,28 +226,21 @@ if(!exists("PARALLEL_WORKERS")) PARALLEL_WORKERS <- tryCatch({ if(requireNamespa
 if(!exists("BOOTSTRAP_B")) BOOTSTRAP_B <- 1L
 
 # ---- Train/Test Split Implementation ----
-cat("\n=== TRAIN/TEST SPLIT CONFIGURATION ===\n")
-cat(sprintf("Training years: %s\n", paste(TRAIN_YEARS, collapse=", ")))
-if(!is.null(TEST_YEARS)) {
-  cat(sprintf("Testing years: %s\n", paste(TEST_YEARS, collapse=", ")))
-} else {
-  cat("Testing years: All available years\n")
-}
+cat("\n=== TRAIN/INFERENCE DATA CONFIGURATION ===\n")
+cat(sprintf("Training years (config): %s\n", paste(TRAIN_YEARS, collapse=", ")))
+cat("Note: the script will use all available years for the data; TEST_YEARS is not supported.\n")
 
 # Create training and testing datasets
 df$year <- lubridate::year(df$date)
 
 # Training data: specified years
-df_train <- df[df$year %in% TRAIN_YEARS, , drop = FALSE]
+# Use full dataset for training (TRAIN_YEARS kept as config only)
+df_train <- df
 cat(sprintf("Training dataset: %d rows from %d locations\n",
             nrow(df_train), length(unique(df_train$location_id))))
 
 # Testing data: either specified years or all data
-if(!is.null(TEST_YEARS)) {
-  df_test <- df[df$year %in% TEST_YEARS, , drop = FALSE]
-} else {
-  df_test <- df  # Use all data for testing
-}
+df_test <- df  # Use full dataset for testing/inference
 cat(sprintf("Testing dataset: %d rows from %d locations\n",
             nrow(df_test), length(unique(df_test$location_id))))
 
@@ -840,7 +833,7 @@ if(!"date" %in% names(df) && "Date" %in% names(df)) df$date <- df$Date
 if("date" %in% names(df)) {
   df$date <- as.Date(df$date)
   if(!"year" %in% names(df)) df$year <- as.integer(lubridate::year(df$date))
-geojson_path <- file.path("fotos","zuiver_zonder_foto.geojson")
+geojson_path <- "C:/Users/yolan/OneDrive/Documenten/UGENT/Master/masterproef/GIS/zuizer_zonder_foto_UTM.geojson"
 if(!file.exists(geojson_path)) stop(paste0("GeoJSON points not found at ", geojson_path))
 gpts_raw <- sf::st_read(geojson_path, quiet = TRUE)
 # Identify vegetation attribute (case-insensitive among vegetation, veg, class)
@@ -2900,14 +2893,7 @@ compute_dynamic_ridge
 ## Clustering data structures removed; worker code will use lib_factor_pca directly.
 
 # Use TEST years for processing: tasks should cover test-year location-year pairs
-cat("Constructing task list from TEST dataset...\n")
-
-cat("DEBUG: Checking TEST_YEARS and data...\n")
-if(exists("TEST_YEARS")) {
-  cat(sprintf("TEST_YEARS exists: %s\n", paste(TEST_YEARS, collapse = ", ")))
-} else {
-  cat("TEST_YEARS does not exist\n")
-}
+cat("Constructing task list from inference dataset (all years)...\n")
 
 # Check original data size
 cat(sprintf("Original df_full has %d rows\n", nrow(df_full)))
@@ -2915,14 +2901,7 @@ cat(sprintf("Unique locations in df_full: %d\n", length(unique(df_full$location_
 cat(sprintf("Unique years in df_full: %s\n", paste(sort(unique(df_full$year)), collapse = ", ")))
 
 # df_full was saved earlier (original full dataset). Use it to derive test tasks.
-df_tasks <- if(!is.null(TEST_YEARS)) {
-  filtered <- df_full[df_full$year %in% TEST_YEARS, , drop = FALSE]
-  cat(sprintf("After TEST_YEARS filtering: %d rows\n", nrow(filtered)))
-  filtered
-} else {
-  cat("No TEST_YEARS filtering applied\n")
-  df_full
-}
+df_tasks <- df_full
 
 # Ensure Veg mapping from gpts_map is available for test data (join if present)
 if(exists("gpts_map")) {
@@ -2956,7 +2935,7 @@ cat(sprintf("Final task_list length: %d\n", length(task_list)))
 
 # Fail hard if there are no test tasks to process
 if(length(task_list) == 0) {
-  stop("CRITICAL: No testing tasks found. Ensure TEST_YEARS and input data produce at least one location-year pair for testing.")
+  stop("CRITICAL: No inference/testing tasks found. Ensure input data produce at least one location-year pair for testing/inference.")
 }
 
 
@@ -3365,7 +3344,7 @@ if(length(task_list) == 0) {
           }, silent = TRUE)
           msg <- paste0("LDA fit failure at ", loc, "_", yr, ": no LDA coefficients produced. ",
                         "GLOBAL_LDA_present=", has_glda, ", test_rows_locyr=", n_test_rows_locyr, ", total_proto_samples=", total_proto_samples,
-                        ". Check that TEST_YEARS contain observations for this loc-year and that GLOBAL_LDA and lib_factor_lda were built correctly.")
+                        ". Check that the inference dataset contains observations for this loc-year and that GLOBAL_LDA and lib_factor_lda were built correctly.")
           cat(paste0("WARNING: ", msg, "\n")); flush.console()
         }
       }
@@ -3467,8 +3446,8 @@ compute_extended_diagnostics <- function(y, E, w = NULL, templates = NULL) {
 if(length(results_list) == 0) {
   cat("ERROR: All tasks returned NULL results! Check fit_fail_reasons.csv for details.\n")
   cat("Most likely causes:\n")
-  cat("1. TEST_YEARS not set or empty\n")
-  cat("2. No data available for the specified test years\n")
+  cat("1. No inference/testing tasks found in the input data\n")
+  cat("2. No data available or filtering removed all candidate rows\n")
   cat("3. Data filtering issues (missing location_id, year, or Veg)\n")
   cat("4. All locations have insufficient data for fitting\n")
   return(NULL)
