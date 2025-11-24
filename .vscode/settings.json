@@ -1,9 +1,0 @@
-{
-  "terminal.integrated.profiles.windows": {
-    "PowerShell (No Conda)": {
-      "source": "PowerShell",
-      "args": ["-NoExit", "-File", ".vscode/terminal.ps1"]
-    }
-  },
-  "terminal.integrated.defaultProfile.windows": "PowerShell (No Conda)"
-}

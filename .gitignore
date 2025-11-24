@@ -2,7 +2,6 @@
 modis/
 landsat/
 phenology_results/
-.vscode/
 
 # Python virtual environments
 venv/
@@ -13,7 +12,8 @@ venv.*
 .idea/
 
 # R-specific
+.vscode/    # ignore VS Code workspace settings (keep this line to ignore the folder)
 .Rhistory
 .RData
 .Rproj.user/
-
+!.vscode/extensions.json
