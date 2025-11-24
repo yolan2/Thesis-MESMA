@@ -16,4 +16,4 @@ venv.*
 .Rhistory
 .RData
 .Rproj.user/
-.vscode/
+
