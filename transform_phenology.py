@@ -51,8 +51,8 @@ class PhenologyTransformer:
 
         # Allow explicit combined_csv override, otherwise default to workspace's expected file
         if combined_csv is None:
-            # Default combined CSV: use the MESMA input path by default
-            combined_csv = Path(r"C:\Users\yolan\OneDrive\Documenten\UGENT\Master\masterproef\phenology_results\hls_phenology_data.csv")
+            # Default combined CSV: use the incremental results produced by MAP
+            combined_csv = Path(r"C:\MAP\incremental_results.csv")
 
         # If a results_dir was provided and combined_csv points to a directory style, prefer results_dir / filename
         if self.results_dir is not None and (isinstance(combined_csv, Path) and combined_csv.name == "all_locations_timeseries.csv"):
@@ -78,68 +78,21 @@ class PhenologyTransformer:
         df["year"] = df["date"].dt.year
         df["doy"] = df["date"].dt.dayofyear
 
-        # Create location_id
-        # identify lon/lat candidate columns up front so they are available later
         lon_candidates = [c for c in df.columns if c in ("lon", "longitude", "x", "imagery_lon", "target_lon")]
         lat_candidates = [c for c in df.columns if c in ("lat", "latitude", "y", "imagery_lat", "target_lat")]
         lon_col = lon_candidates[0] if len(lon_candidates) > 0 else None
         lat_col = lat_candidates[0] if len(lat_candidates) > 0 else None
 
-        # Prefer an existing 'location_id' column if present and containing values.
-        if not require_latlon and "location_id" in df.columns and df["location_id"].notna().any():
-            # Normalize to string and strip whitespace
-            df["location_id"] = df["location_id"].astype(str).str.strip()
-            # Use .loc to avoid chained-assignment warnings
-            df.loc[df["location_id"] == "nan", "location_id"] = None
-            df.loc[df["location_id"] == "", "location_id"] = None
-            # If the existing location_id looks purely numeric and lon/lat are available, prefer building
-            # the R-compatible location_id format (L_<lon>_<lat>) to ensure joins with geojson work.
-            # Inspect the full set of non-null location_id values to decide formatting
-            loc_sample = df["location_id"].dropna().astype(str).str.strip()
-            looks_numeric = loc_sample.str.match(r'^\s*\d+(?:\.0*)?\s*$').any()
-            if looks_numeric and lon_col is not None and lat_col is not None:
-                # Try to coerce lon/lat columns now and replace numeric ids
-                df[lon_col] = pd.to_numeric(df[lon_col], errors="coerce")
-                df[lat_col] = pd.to_numeric(df[lat_col], errors="coerce")
-                if not (df[lon_col].isna().all() or df[lat_col].isna().all()):
-                    # overwrite numeric IDs with formatted L_lon_lat strings
-                    before_count = df["location_id"].notna().sum()
-                    df["location_id"] = df.apply(lambda row: f"L_{row[lon_col]:.4f}_{row[lat_col]:.4f}" if (pd.notna(row[lon_col]) and pd.notna(row[lat_col])) else None, axis=1)
-                    after_count = df["location_id"].notna().sum()
-                    print(f"✓ Replaced numeric 'location_id' values with 'L_lon_lat' using lon/lat columns ({before_count} -> {after_count} non-empty).")
-                else:
-                    print("✓ Using existing 'location_id' column from input CSV (numeric IDs detected but lon/lat not usable)")
-            else:
-                print("✓ Using existing 'location_id' column from input CSV")
-        else:
-            # require lon/lat fields; accept common names
-            if lon_col is None or lat_col is None:
-                present = list(df.columns)[:30]
-                raise RuntimeError(
-                    "Longitude/latitude columns not found (required to create location_id). "
-                    f"Expected one of lon/lat-like names. Found columns (first 30): {present}"
-                )
-
+        if lon_col is not None:
             df[lon_col] = pd.to_numeric(df[lon_col], errors="coerce")
+        if lat_col is not None:
             df[lat_col] = pd.to_numeric(df[lat_col], errors="coerce")
 
-            if df[lon_col].isna().all() or df[lat_col].isna().all():
-                # Provide a helpful diagnostic sample to help user debug formatting issues
-                sample_vals = {}
-                sample_vals[lon_col] = df[lon_col].dropna().unique()[:5].tolist() if df[lon_col].dropna().shape[0] > 0 else []
-                sample_vals[lat_col] = df[lat_col].dropna().unique()[:5].tolist() if df[lat_col].dropna().shape[0] > 0 else []
-                raise RuntimeError(
-                    "Longitude/latitude columns contain no valid numeric values. "
-                    f"Found sample values for {lon_col}/{lat_col}: {sample_vals} -- check for embedded commas or wrong delimiter."
-                )
+        if "location_id" not in df.columns:
+            raise RuntimeError("Input CSV must provide a 'location_id' column; deriving it from lon/lat has been removed.")
 
-            # Build location_id from lon/lat
-            df["location_id"] = df.apply(
-                lambda row: f"L_{row[lon_col]:.4f}_{row[lat_col]:.4f}"
-                if (pd.notna(row[lon_col]) and pd.notna(row[lat_col]))
-                else None,
-                axis=1,
-            )
+        df["location_id"] = df["location_id"].astype(str)
+        print("✓ Using existing 'location_id' column from incremental_results.csv")
 
         # Rename band columns if needed
         band_mapping = {

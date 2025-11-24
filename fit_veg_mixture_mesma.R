@@ -199,81 +199,84 @@ OUT_DIR <- file.path(OUTPUT_DIR, "veg_mixture_fit")
 # NOTE: explicit TEST_YEARS functionality has been removed — the script always
 # uses all available years for the data but still maintains separate
 # variables for training and inference where needed.
-if (!exists("TRAIN_YEARS")) TRAIN_YEARS <- 2019:2024
+TRAIN_YEARS <- 2019:2024
 
 # Allow skipping a minimal number of DOYs per-location when computing sufficiency
 # This is useful for small gaps — set to 0 to preserve the strict 50% requirement
-if (!exists("MIN_SKIP_DOYS_PER_LOCATION")) MIN_SKIP_DOYS_PER_LOCATION <- 2L
+MIN_SKIP_DOYS_PER_LOCATION <- 2L
 
 # PCA / factor projection tuning
-if (!exists("MAX_PCA_COMPONENTS")) MAX_PCA_COMPONENTS <- 20L
-if (!exists("MAX_FACTORS_CAP")) MAX_FACTORS_CAP <- 20L
+MAX_PCA_COMPONENTS <- 20L
+MAX_FACTORS_CAP <- 20L
 
 # General algorithm toggles
-if (!exists("FAST_VAR")) FAST_VAR <- TRUE
-if (!exists("factor_mode")) factor_mode <- FALSE
-if (!exists("SHAPE_NORMALIZATION_ENABLE")) SHAPE_NORMALIZATION_ENABLE <- FALSE
-if (!exists("TEMPORAL_BUDGET")) TEMPORAL_BUDGET <- 10L
-if (!exists("TOPK_VARIANTS")) TOPK_VARIANTS <- 2L
-if (!exists("ENABLE_PHASE_ALIGNMENT")) ENABLE_PHASE_ALIGNMENT <- FALSE
-if (!exists("REFERENCE_PHASE_MARKERS")) REFERENCE_PHASE_MARKERS <- c(1, 90, 180, 270, 365)
-if (!exists("ENABLE_MULTISCALE")) ENABLE_MULTISCALE <- FALSE
-if (!exists("MULTISCALE_WINDOWS")) MULTISCALE_WINDOWS <- c(7L, 14L, 30L)
-if (!exists("ENABLE_QP_SOLVER")) ENABLE_QP_SOLVER <- TRUE
-if (!exists("COMBO_PARALLEL_ENABLE")) COMBO_PARALLEL_ENABLE <- FALSE
-if (!exists("COMBO_PARALLEL_WORKERS")) COMBO_PARALLEL_WORKERS <- max(1L, if (exists("PARALLEL_WORKERS")) floor(PARALLEL_WORKERS/2) else 1L)
-if (!exists("EARLY_STOP_RMSE_THRESHOLD")) EARLY_STOP_RMSE_THRESHOLD <- 0.0
-if (!exists("ENABLE_DIAGNOSTICS")) ENABLE_DIAGNOSTICS <- TRUE
+FAST_VAR <- TRUE
+factor_mode <- FALSE
+SHAPE_NORMALIZATION_ENABLE <- FALSE
+TEMPORAL_BUDGET <- 10L
+TOPK_VARIANTS <- 2L
+ENABLE_PHASE_ALIGNMENT <- FALSE
+REFERENCE_PHASE_MARKERS <- c(1, 90, 180, 270, 365)
+ENABLE_MULTISCALE <- FALSE
+MULTISCALE_WINDOWS <- c(7L, 14L, 30L)
+ENABLE_QP_SOLVER <- TRUE
+COMBO_PARALLEL_ENABLE <- FALSE
+EARLY_STOP_RMSE_THRESHOLD <- 0.0
+ENABLE_DIAGNOSTICS <- TRUE
 
 # Combination expansion safety thresholds
-if (!exists("COMBO_SAFE_EXPAND_LIMIT")) COMBO_SAFE_EXPAND_LIMIT <- 1e6    # fully expand grid up to this many combos
-if (!exists("COMBO_ABORT_LIMIT")) COMBO_ABORT_LIMIT <- 5e7                # abort if combos exceed this hard limit
+COMBO_SAFE_EXPAND_LIMIT <- 1e6    # fully expand grid up to this many combos
+COMBO_ABORT_LIMIT <- 5e7          # abort if combos exceed this hard limit
 
 # Bootstrap settings 
-if (!exists("BOOTSTRAP_B")) BOOTSTRAP_B <- 200L
-if (!exists("BOOT_MIN_REPS_PER_VEG")) BOOT_MIN_REPS_PER_VEG <- 10L
-if (!exists("MIN_OBS_FOR_BOOT")) MIN_OBS_FOR_BOOT <- 5L
-if (!exists("ENABLE_UNCERTAINTY")) ENABLE_UNCERTAINTY <- TRUE
-if (!exists("GLSBB_MIN_BLOCK")) GLSBB_MIN_BLOCK <- 5L
-if (!exists("GLSBB_MAX_BLOCK")) GLSBB_MAX_BLOCK <- 60L
+BOOTSTRAP_B <- 200L
+BOOT_MIN_REPS_PER_VEG <- 10L
+MIN_OBS_FOR_BOOT <- 5L
+ENABLE_UNCERTAINTY <- TRUE
+GLSBB_MIN_BLOCK <- 5L
+GLSBB_MAX_BLOCK <- 60L
 
 # Optimization/solver defaults
-if (!exists("VARIANCE_THRESHOLD")) VARIANCE_THRESHOLD <- 0.90
-if (!exists("MAX_VEG_COMPONENTS")) MAX_VEG_COMPONENTS <- 8
-if (!exists("GAM_K_MAX")) GAM_K_MAX <- 40
-if (!exists("GAM_GAMMA")) GAM_GAMMA <- 1.0
+VARIANCE_THRESHOLD <- 0.90
+MAX_VEG_COMPONENTS <- 8
+GAM_K_MAX <- 40
+GAM_GAMMA <- 1.0
 
 # Index selection and prefiltering
-if (!exists("USE_INDICES_MIN")) USE_INDICES_MIN <- 1L
-if (!exists("MIN_INDEX_SD")) MIN_INDEX_SD <- 0.05
+USE_INDICES_MIN <- 1L
+MIN_INDEX_SD <- 0.05
 
 # Sample-balancing and augmentation
-if (!exists("ENABLE_SAMPLE_BALANCING")) ENABLE_SAMPLE_BALANCING <- TRUE
+ENABLE_SAMPLE_BALANCING <- TRUE
+
+# Memory-safe clustering limits (sampling parameters to avoid RAM overload)
+MAX_PROJECTIONS_PER_VEG <- 25000L  # subsample before clustering to avoid OOM
+SILHOUETTE_SAMPLE_SIZE <- 20000L   # subsample for silhouette distance matrix
+MEDOID_SAMPLE_SIZE <- 10000L       # subsample for medoid distance computation
 
 # Vegetation whitelist
-if (!exists("ALLOWED_VEG")) ALLOWED_VEG <- c("populus", "tamarix", "phragmites")
+ALLOWED_VEG <- c("populus", "tamarix", "phragmites")
 
 # Numeric safety constants
-if (!exists("EPS_SIGMA")) EPS_SIGMA <- 1e-8
-if (!exists("LOWER_BND")) LOWER_BND <- 0
+EPS_SIGMA <- 1e-8
+LOWER_BND <- 0
 
 # DOY / index presence tuning
-if (!exists("MIN_IDX_PRESENCE")) MIN_IDX_PRESENCE <- 0.5
+MIN_IDX_PRESENCE <- 0.5
 
 # Parallel / progress settings
-if (!exists("PROGRESS_EVERY_TASK")) PROGRESS_EVERY_TASK <- 25
-if (!exists("PROGRESS_LOG_TO_FILE")) PROGRESS_LOG_TO_FILE <- TRUE
-if (!exists("PROGRESS_BAR")) PROGRESS_BAR <- TRUE
-if (!exists("PARALLEL_ENABLE")) PARALLEL_ENABLE <- TRUE
-if (!exists("PARALLEL_WORKERS")) {
-  PARALLEL_WORKERS <- tryCatch(
-    {
-      if (requireNamespace("parallel", quietly = TRUE)) max(1L, parallel::detectCores(logical = TRUE) - 1L) else 1L
-    },
-    error = function(...) 1L
-  )
-}
-if (!exists("PERSISTENT_PARALLEL_BACKEND")) PERSISTENT_PARALLEL_BACKEND <- TRUE
+PROGRESS_EVERY_TASK <- 25
+PROGRESS_LOG_TO_FILE <- TRUE
+PROGRESS_BAR <- TRUE
+PARALLEL_ENABLE <- TRUE
+PARALLEL_WORKERS <- tryCatch(
+  {
+    if (requireNamespace("parallel", quietly = TRUE)) max(1L, parallel::detectCores(logical = TRUE) - 1L) else 1L
+  },
+  error = function(...) 1L
+)
+COMBO_PARALLEL_WORKERS <- max(1L, floor(PARALLEL_WORKERS/2))
+PERSISTENT_PARALLEL_BACKEND <- TRUE
 
 # Strict validation: enforce extractor/predictor output format only
 if (!file.exists(INPUT_CSV)) stop(paste0("Required input CSV not found: ", INPUT_CSV))
@@ -391,8 +394,6 @@ project_to_simplex <- function(v) {
 }
 
 # Progress logging helpers
-if (!exists("PROGRESS_EVERY_TASK")) PROGRESS_EVERY_TASK <- 25
-if (!exists("PROGRESS_LOG_TO_FILE")) PROGRESS_LOG_TO_FILE <- TRUE
 LOG_FILE <- tryCatch(
   {
     if (exists("OUT_DIR") && is.character(OUT_DIR) && nchar(OUT_DIR) > 0) {
@@ -591,16 +592,31 @@ precompute_compressed_templates <- function(mesma_lib, budget = TEMPORAL_BUDGET)
 }
 
 # Helper: index of medoid row (row with minimal total distance)
+# For large matrices, sample to avoid O(N^2) memory allocation
 medoid_row_index <- function(M) {
   if (is.null(M) || !is.matrix(M) || nrow(M) == 0) return(NA_integer_)
   if (nrow(M) == 1) return(1L)
   X <- M
   X[!is.finite(X)] <- 0
-  D <- tryCatch(as.matrix(stats::dist(X)), error = function(e) stop(sprintf("medoid_row_index: distance computation failed: %s", e$message)))
-  # dist returns lower triangular; as.matrix rebuilds full symmetric
-  rs <- rowSums(D, na.rm = TRUE)
-  idx <- which.min(rs)
-  if (length(idx) == 0 || !is.finite(idx)) idx <- 1L
+  
+  # For large matrices, compute medoid on a random subsample
+  n <- nrow(X)
+  
+  if (n > MEDOID_SAMPLE_SIZE) {
+    # Sample rows, find medoid among sample, return index in original matrix
+    samp_idx <- sample.int(n, size = min(as.integer(MEDOID_SAMPLE_SIZE), n))
+    X_samp <- X[samp_idx, , drop = FALSE]
+    D_samp <- tryCatch(as.matrix(stats::dist(X_samp)), error = function(e) stop(sprintf("medoid_row_index: distance computation failed: %s", e$message)))
+    rs_samp <- rowSums(D_samp, na.rm = TRUE)
+    local_idx <- which.min(rs_samp)
+    if (length(local_idx) == 0 || !is.finite(local_idx)) local_idx <- 1L
+    idx <- samp_idx[local_idx]
+  } else {
+    D <- tryCatch(as.matrix(stats::dist(X)), error = function(e) stop(sprintf("medoid_row_index: distance computation failed: %s", e$message)))
+    rs <- rowSums(D, na.rm = TRUE)
+    idx <- which.min(rs)
+    if (length(idx) == 0 || !is.finite(idx)) idx <- 1L
+  }
   as.integer(idx)
 }
 
@@ -693,61 +709,90 @@ if (length(matched_cols) > 0) {
 coords <- sf::st_coordinates(gpts_raw)
 gpts_raw$.__lon__ <- coords[, 1]
 gpts_raw$.__lat__ <- coords[, 2]
-gpts_raw$location_id <- make_location_id(gpts_raw$.__lon__, gpts_raw$.__lat__)
+# Preserve the coordinate-based id under a separate name so we can use row numbers as the canonical id
+gpts_raw$location_id_geo <- make_location_id(gpts_raw$.__lon__, gpts_raw$.__lat__)
+# Use geojson row number as the canonical location_id for matching with CSV indices
+gpts_raw$location_id <- as.character(seq_len(nrow(gpts_raw)))
 
 gpts_map <- sf::st_drop_geometry(gpts_raw) %>%
   dplyr::select(location_id, Veg = .__veg__, no_soil = .__no_soil__) %>%
+  dplyr::mutate(location_row = as.character(seq_len(dplyr::n()))) %>%
   dplyr::distinct(location_id, .keep_all = TRUE)
 
 if (nrow(gpts_map) == 0) stop("GeoJSON mapping produced no valid points")
 
 if ("location_id" %in% names(df) && "location_id" %in% names(gpts_map)) {
-  # Ensure both sides are character to avoid incompatible-type join errors
-  # If df has numeric IDs but gpts_map uses 'L_x_y' format, prefer building location_id from lon/lat when available
-  if (!is.character(df$location_id)) {
-  sample_df <- unique(na.omit(as.character(df$location_id)))
-  sample_g  <- unique(na.omit(as.character(gpts_map$location_id)))
-    if (length(sample_df) && length(sample_g) && all(grepl("^\\s*[0-9]+\\s*$", sample_df)) && any(grepl("^L_", sample_g))) {
-      # Attempt to reconstruct df$location_id from lon/lat columns if available
-      lon_candidates_local <- names(df)[grepl("(^|_)(lon|longitude|x)(_|$)", names(df), ignore.case = TRUE)]
-      lat_candidates_local <- names(df)[grepl("(^|_)(lat|latitude|y)(_|$)", names(df), ignore.case = TRUE)]
-      if (length(lon_candidates_local) > 0 && length(lat_candidates_local) > 0) {
-        lon_col_local <- lon_candidates_local[1]
-        lat_col_local <- lat_candidates_local[1]
-        df$location_id <- make_location_id(df[[lon_col_local]], df[[lat_col_local]])
-        cat("[NOTICE] Recreated df$location_id from lon/lat to match gpts_map format before joining.\n")
-      } else {
-        df$location_id <- as.character(df$location_id)
-        cat("[NOTICE] Coerced df$location_id to character to match gpts_map for joining.\n")
-        cat("[WARNING] df$location_id looks numeric while gpts_map$location_id looks like formatted 'L_x_y' strings — join will not match without remapping (e.g., use lon/lat or consistent IDs).\n")
+  # Robust left-join: normalize and coerce types so mismatched formats (whitespace/case)
+  # do not prevent the mapping.
+  if (!is.character(df$location_id)) df$location_id <- as.character(df$location_id)
+  if (!is.character(gpts_map$location_id)) gpts_map$location_id <- as.character(gpts_map$location_id)
+
+  # Trim whitespace and coerce empty->NA for stable joining
+  df$location_id <- trimws(df$location_id)
+  df$location_id[df$location_id == ""] <- NA_character_
+  gpts_map$location_id <- trimws(gpts_map$location_id)
+  gpts_map$location_id[gpts_map$location_id == ""] <- NA_character_
+
+  # For safety, normalize simple differences (e.g. lowercase/uppercase 'L_' prefix)
+  df$location_id <- ifelse(grepl('^l_', df$location_id, ignore.case = TRUE), sub('^l_', 'L_', df$location_id, ignore.case = TRUE), df$location_id)
+  gpts_map$location_id <- ifelse(grepl('^l_', gpts_map$location_id, ignore.case = TRUE), sub('^l_', 'L_', gpts_map$location_id, ignore.case = TRUE), gpts_map$location_id)
+
+  # Try joining in two ways:
+  #  1) by 'location_id' (preferable), 2) by row-number (if CSV location_id are numeric row indices)
+  # Ensure `Veg` exists so subsequent checks don't raise 'unknown column' warnings
+  if (!"Veg" %in% names(df)) df$Veg <- NA_character_
+  pre_non_na <- sum(!is.na(df$Veg) & df$Veg != "")
+
+  joined <- dplyr::left_join(df, gpts_map, by = "location_id", suffix = c("", ".geo"))
+  if ("Veg.geo" %in% names(joined)) {
+    joined$Veg <- ifelse(is.na(joined$Veg) | joined$Veg == "", joined$Veg.geo, joined$Veg)
+    joined$Veg.geo <- NULL
+  }
+
+  post_non_na <- sum(!is.na(joined$Veg) & joined$Veg != "")
+
+  # If no Veg found, try matching by geo row-number values (CSV may contain numeric row ids)
+  if (post_non_na == pre_non_na && "location_row" %in% names(gpts_map)) {
+    # check for intersection between CSV values and location_row
+    df_ids <- unique(na.omit(as.character(df$location_id)))
+    match_count <- length(intersect(df_ids, unique(na.omit(as.character(gpts_map$location_row)))))
+    if (match_count > 0) {
+      cat(sprintf("[NOTICE] No matches by 'location_id' — attempting join by geojson row-number mapping (matched ids=%d)\n", match_count))
+      joined2 <- dplyr::left_join(df, gpts_map, by = c("location_id" = "location_row"), suffix = c("", ".geo"))
+      if ("Veg.geo" %in% names(joined2)) {
+        joined2$Veg <- ifelse(is.na(joined2$Veg) | joined2$Veg == "", joined2$Veg.geo, joined2$Veg)
+        joined2$Veg.geo <- NULL
       }
-    } else {
-      df$location_id <- as.character(df$location_id)
-      cat("[NOTICE] Coerced df$location_id to character to match gpts_map for joining.\n")
+      if (sum(!is.na(joined2$Veg) & joined2$Veg != "") > post_non_na) {
+        joined <- joined2
+        post_non_na <- sum(!is.na(joined$Veg) & joined$Veg != "")
+        cat(sprintf("[NOTICE] GeoJSON join (row-number) gained %d Veg rows\n", post_non_na - pre_non_na))
+      } else {
+        cat("[NOTICE] Row-number join did not increase Veg mapping; keeping original join state.\n")
+      }
     }
   }
-  if (!is.character(gpts_map$location_id)) {
-    gpts_map$location_id <- as.character(gpts_map$location_id)
-    cat("[NOTICE] Coerced gpts_map$location_id to character for joining.\n")
+
+  df <- joined
+
+  matched_locs <- length(intersect(na.omit(unique(as.character(df$location_id))), na.omit(unique(as.character(gpts_map$location_id)))))
+  cat(sprintf("[NOTICE] GeoJSON join results - Veg before=%d after=%d; matched location_id strings=%d\n", pre_non_na, post_non_na, matched_locs))
+
+  if (post_non_na == 0L) {
+    sample_df_ids <- unique(na.omit(as.character(head(df$location_id, 20))))
+    sample_geo_ids <- unique(na.omit(as.character(head(gpts_map$location_id, 20))))
+    sample_geo_rows <- unique(na.omit(as.character(head(gpts_map$location_row, 20))))
+    cat("[WARNING] GeoJSON join produced no Veg values. Sample df$location_id (first 20):\n")
+    print(sample_df_ids)
+    cat("Sample gpts_map$location_id (first 20):\n")
+    print(sample_geo_ids)
+    cat("Sample gpts_map row-numbers (first 20):\n")
+    print(sample_geo_rows)
+    cat("Hint: CSV 'location_id' might be numeric row indices; try setting location IDs in the CSV to match the GeoJSON row order or use the row-number mapping.\n")
   }
-  # Warn if the values are likely incompatible (numeric IDs versus L_x_y strings)
-  sample_df <- unique(na.omit(df$location_id))
-  sample_g <- unique(na.omit(gpts_map$location_id))
-  if (length(sample_df) && length(sample_g) && all(grepl("^[0-9]+$", sample_df)) && any(grepl("^L_", sample_g))) {
-    cat("[WARNING] df$location_id looks numeric while gpts_map$location_id looks like formatted 'L_x_y' strings — join will not match these values.\n")
-  }
-  df <- dplyr::left_join(df, gpts_map, by = "location_id")
 }
 
 loc_years <- data.frame(location_id = character(0), year = integer(0), stringsAsFactors = FALSE)
-
-lon_candidates <- names(df)[grepl("(^|_)(lon|longitude|x)(_|$)", names(df), ignore.case = TRUE)]
-lat_candidates <- names(df)[grepl("(^|_)(lat|latitude|y)(_|$)", names(df), ignore.case = TRUE)]
-if (length(lon_candidates) > 0 && length(lat_candidates) > 0) {
-  lon_col <- lon_candidates[1]
-  lat_col <- lat_candidates[1]
-  df$location_id <- make_location_id(df[[lon_col]], df[[lat_col]])
-}
 
 if (!"year" %in% names(df)) {
   if ("date" %in% names(df)) {
@@ -758,6 +803,8 @@ if (!"year" %in% names(df)) {
 
 if (!"Veg" %in% names(df)) df$Veg <- NA_character_
 
+lon_candidates <- names(df)[grepl("(^|_)(lon|longitude|x)(_|$)", names(df), ignore.case = TRUE)]
+lat_candidates <- names(df)[grepl("(^|_)(lat|latitude|y)(_|$)", names(df), ignore.case = TRUE)]
 if (length(lon_candidates) > 0 && length(lat_candidates) > 0) {
   if ("location_id" %in% names(df) && "location_id" %in% names(gpts_map) && nrow(gpts_map) > 0) {
     # coerce consistent type before join
@@ -919,7 +966,7 @@ cat(sprintf("Selected %d indices: %s\n", length(avail), paste(avail, collapse = 
 
   # Data sufficiency check DISABLED per user request - all locations are kept regardless of DOY coverage
   
-  if (FALSE && !exists("TRAIN_YEARS") || is.null(TRAIN_YEARS) || length(TRAIN_YEARS) == 0) stop("TRAIN_YEARS must be defined and non-empty for data sufficiency checks; no fallback permitted.")
+  if (FALSE && (is.null(TRAIN_YEARS) || length(TRAIN_YEARS) == 0)) stop("TRAIN_YEARS must be defined and non-empty for data sufficiency checks; no fallback permitted.")
   if (FALSE && "location_id" %in% names(df_full)) {
     # For each location and each selected index, count finite observations and error if below threshold
     offenders <- list()
@@ -999,7 +1046,7 @@ cat(sprintf("Selected %d indices: %s\n", length(avail), paste(avail, collapse = 
     }
   } else {
     # Global time series: require TRAIN_YEARS and enforce proportional check globally
-    if (!exists("TRAIN_YEARS") || is.null(TRAIN_YEARS) || length(TRAIN_YEARS) == 0) stop("TRAIN_YEARS must be defined for global sufficiency checks; no fallback permitted.")
+    if (is.null(TRAIN_YEARS) || length(TRAIN_YEARS) == 0) stop("TRAIN_YEARS must be defined for global sufficiency checks; no fallback permitted.")
     base_req_global <- as.integer(ceiling(length(TRAIN_YEARS) * 365 / 2))
     required_days_global <- as.integer(max(1L, base_req_global - as.integer(MIN_SKIP_DOYS_PER_LOCATION)))
     if (nrow(df_full) < required_days_global) stop(sprintf("Data sufficiency check failed: overall data contains fewer than %d rows (50%% of days across TRAIN_YEARS after allowing up to %d missing DOYs)", required_days_global, MIN_SKIP_DOYS_PER_LOCATION))
@@ -1168,7 +1215,6 @@ cat("Data preprocessing complete.\n")
 adj_cols <- intersect(avail, names(df))
 
 # Simple feature pruning
-if (!exists("MIN_INDEX_SD")) MIN_INDEX_SD <- 0.05
 if (length(avail) > 0) {
   idx_sd <- vapply(avail, function(nm) {
     x <- df[[nm]]
@@ -1230,37 +1276,22 @@ if (matched_veg_n == 0) {
   stop("No vegetation classes found after join; cannot build library")
 }
 
-# Recompute standardized location_id
-lon_candidates <- names(df)[grepl("(^|_)(lon|longitude|x)(_|$)", names(df), ignore.case = TRUE)]
-lat_candidates <- names(df)[grepl("(^|_)(lat|latitude|y)(_|$)", names(df), ignore.case = TRUE)]
-if (length(lon_candidates) > 0 && length(lat_candidates) > 0) {
-  lon_col <- lon_candidates[1]
-  lat_col <- lat_candidates[1]
-  df$location_id <- make_location_id(df[[lon_col]], df[[lat_col]])
-}
-
 loc_years <- df %>%
   dplyr::filter(!is.na(.data$location_id) & .data$location_id != "" & !is.na(.data$year) & .data$year > 0) %>%
   dplyr::distinct(.data$location_id, .data$year)
 cat(sprintf("Constructed loc_years with %d rows from filtered df\n", nrow(loc_years)))
 if (nrow(loc_years) == 0) {
-  # Try a last-ditch fallback: use the full (unfiltered) dataframe to construct location-year pairs
-  alt_loc_years <- df_full %>%
-    dplyr::filter(!is.na(.data$location_id) & .data$location_id != "" & !is.na(.data$year) & .data$year > 0) %>%
-    dplyr::distinct(.data$location_id, .data$year)
-  if (nrow(alt_loc_years) > 0) {
-    cat(sprintf("[NOTICE] No location-year pairs found in filtered training data; falling back to full dataset and using %d loc-year pairs for library construction.\n", nrow(alt_loc_years)))
-    loc_years <- alt_loc_years
-  } else {
-    stop(paste0(
-      "No location-year pairs found after filtering, and none were available in the full dataset.\n",
-      "Suggestions:\n",
-      " - Verify TRAIN_YEARS is correct and includes the years you expect (e.g. TRAIN_YEARS <- 2019:2024).\n",
-      " - If your sampling cadence is sparse, consider adjusting training years or the fractional threshold (e.g. reduce MIN_DAYS_FRACTION from 0.5).\n",
-      " - Re-run the transformer to ensure 'location_id' values align with your geojson mapping (transform_phenology.py ensures 'L_lon_lat' formatting).\n",
-      "Processing cannot continue without at least one location-year pair.")
-    )
-  }
+  # Hard fail: do not fall back silently to the full dataset. Training data
+  # must contain at least one location-year pair after filtering.
+  stop(paste0(
+    "No location-year pairs found after filtering. This is a fatal error — library construction cannot continue.\n",
+    "Possible causes and suggestions:\n",
+    " - Your filtered training dataset has zero valid location/year pairs (check column 'location_id' and 'year').\n",
+    " - Verify TRAIN_YEARS and any prior filtering steps do not remove all data (e.g. TRAIN_YEARS <- 2019:2024).\n",
+    " - Ensure your transformer produced valid 'location_id' values that match your geojson mapping (transform_phenology.py formats 'L_lon_lat').\n",
+    " - If your data are intentionally sparse, reduce the filtering thresholds or increase available training data.\n",
+    "Processing cannot continue without at least one location-year pair in filtered training data.")
+  )
 }
 
 # Construct vegetation library
@@ -1338,7 +1369,20 @@ augment_minority_class <- function(df_class, target_n, seed = NULL, alpha_range 
       })
       jitter <- rnorm(length(interp), sd = pmax(abs(rng), 1e-8) * jitter_frac)
       interp <- interp + jitter
-      new_row[1, num_cols] <- interp
+      # Assign numeric interpolated values element-wise to avoid tibble/vctrs
+      # assignment errors when new_row is a tibble-like object
+      if (length(num_cols) == length(interp)) {
+        for (k in seq_along(num_cols)) {
+          colname <- num_cols[k]
+          new_row[[colname]] <- interp[k]
+        }
+      } else {
+        # fallback - use vector assignment with recycling if shapes mismatch
+        for (k in seq_along(num_cols)) {
+          colname <- num_cols[k]
+          new_row[[colname]] <- interp[k %% length(interp) + 1]
+        }
+      }
     }
 
     for (col in other_cols) {
@@ -2113,10 +2157,32 @@ build_mesma_variants <- function(lib_df, lib_factor_pca, veg_types, min_cluster_
     }
 
     # Project vegetation data to PCA space for clustering
+    # NOTE: For large per-veg datasets (e.g. 225k rows), subsample before projecting
+    # to avoid building huge projection matrices that cause OOM during clustering.
+    n_veg_rows <- nrow(veg_data)
+    use_sampling <- n_veg_rows > MAX_PROJECTIONS_PER_VEG
+    
+    if (use_sampling) {
+      cat(sprintf("  [%s] Sampling %d/%d rows for clustering (MAX_PROJECTIONS_PER_VEG=%d)\n", 
+                  veg, MAX_PROJECTIONS_PER_VEG, n_veg_rows, MAX_PROJECTIONS_PER_VEG))
+      # Stratified sample by DOY to preserve temporal coverage
+      veg_data_doy <- veg_data
+      veg_data_doy$doy_for_sampling <- lubridate::yday(veg_data_doy$date)
+      doy_groups <- split(seq_len(nrow(veg_data_doy)), veg_data_doy$doy_for_sampling)
+      n_per_doy <- ceiling(MAX_PROJECTIONS_PER_VEG / length(doy_groups))
+      sampled_indices <- unlist(lapply(doy_groups, function(idx) {
+        if (length(idx) <= n_per_doy) idx else sample(idx, size = n_per_doy, replace = FALSE)
+      }))
+      sampled_indices <- sampled_indices[seq_len(min(MAX_PROJECTIONS_PER_VEG, length(sampled_indices)))]
+      veg_data_for_clustering <- veg_data[sampled_indices, ]
+    } else {
+      veg_data_for_clustering <- veg_data
+    }
+    
     veg_projections <- list()
-    for (i in seq_len(nrow(veg_data))) {
+    for (i in seq_len(nrow(veg_data_for_clustering))) {
       date_data <- prepare_factor_data(
-        veg_data[i, , drop = FALSE],
+        veg_data_for_clustering[i, , drop = FALSE],
         GLOBAL_PCA,
         avail,
         veg
@@ -2140,16 +2206,40 @@ build_mesma_variants <- function(lib_df, lib_factor_pca, veg_types, min_cluster_
     # Cluster to find variants
   proj_matrix <- chunked_rbind(veg_projections, chunk_size = 25L)
   gc()
+  cat(sprintf("  [%s] Built projection matrix: %d rows x %d cols\n", veg, nrow(proj_matrix), ncol(proj_matrix)))
     max_k <- min(5, floor(nrow(proj_matrix) / 5))
     if (max_k < 2) max_k <- 2
 
-    # Find optimal number of clusters using silhouette
+    # Find optimal number of clusters using silhouette.
+    # NOTE: silhouette() computes a full pairwise distance matrix which is O(n^2)
+    # memory and will OOM for large n. To avoid this, compute silhouette on a
+    # random subsample when the number of projections is large (controlled by SILHOUETTE_SAMPLE_SIZE).
     best_k <- 2
-    best_sil <- -1
+    best_sil <- -Inf
     for (k in 2:max_k) {
       km <- kmeans(proj_matrix, centers = k, nstart = 10, iter.max = 100)
-      sil <- mean(silhouette(km$cluster, dist(proj_matrix))[, 3])
-      if (sil > best_sil) {
+
+      # Compute silhouette on a subsample if proj_matrix is large
+      nproj <- nrow(proj_matrix)
+      if (nproj > SILHOUETTE_SAMPLE_SIZE) {
+        # sample without replacement
+        samp_idx <- sample.int(nproj, size = min(as.integer(SILHOUETTE_SAMPLE_SIZE), nproj))
+        # Only compute distances for the sample (safe memory footprint)
+        dsub <- stats::dist(proj_matrix[samp_idx, , drop = FALSE])
+        labels_sub <- km$cluster[samp_idx]
+        sil_obj <- tryCatch(cluster::silhouette(labels_sub, dsub), error = function(e) NULL)
+        sil <- if (!is.null(sil_obj) && is.matrix(sil_obj)) mean(sil_obj[, 3], na.rm = TRUE) else NA_real_
+      } else {
+        sil_obj <- tryCatch(cluster::silhouette(km$cluster, stats::dist(proj_matrix)), error = function(e) NULL)
+        sil <- if (!is.null(sil_obj) && is.matrix(sil_obj)) mean(sil_obj[, 3], na.rm = TRUE) else NA_real_
+      }
+
+      # Fallback: when silhouette fails (e.g. NA) use inverse within-cluster spread
+      if (!is.finite(sil)) {
+        sil <- -mean(km$withinss / pmax(1, km$size), na.rm = TRUE)
+      }
+
+      if (is.finite(sil) && sil > best_sil) {
         best_sil <- sil
         best_k <- k
       }
@@ -2658,8 +2748,7 @@ compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGE
       if (nrow(sub) == 0) next
 
       idx_present_orig <- intersect(avail_idx, names(sub))
-      if (!exists("min_idx_presence")) min_idx_presence <- 0.5
-      min_required <- ceiling(length(avail_idx) * min_idx_presence)
+      min_required <- ceiling(length(avail_idx) * MIN_IDX_PRESENCE)
       if (length(idx_present_orig) < min_required) {
         next
       }
@@ -2753,17 +2842,28 @@ compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGE
 
         mi_mv <- gpca$col_means[kpos_mv]
         # Moving-variance scale - only use veg-specific scales when veg_type valid and indexes exist
+        # Ensure si_mv has a safe default so it never triggers 'object not found'
+        si_mv <- 1
         if (exists("valid_veg") && valid_veg) {
           if (is.list(gpca$col_scales) && length(names(gpca$col_scales)) > 0) {
             nm_idx <- which(tolower(names(gpca$col_scales)) == veg_type_lc)
             if (length(nm_idx) > 0) {
               nm <- names(gpca$col_scales)[nm_idx[1]]
-              if (kpos_mv <= length(gpca$col_scales[[nm]])) si_mv <- gpca$col_scales[[nm]][kpos_mv]
+              # Guard: if the veg-specific scale vector is too short, fall back to default
+              if (kpos_mv <= length(gpca$col_scales[[nm]])) {
+                si_mv <- gpca$col_scales[[nm]][kpos_mv]
+              } else {
+                si_mv <- 1
+              }
             }
           }
           else if (is.matrix(gpca$col_scales) && !is.null(rownames(gpca$col_scales))) {
             rn_idx_mv <- which(tolower(rownames(gpca$col_scales)) == veg_type_lc)
-            if (length(rn_idx_mv) > 0 && kpos_mv <= ncol(gpca$col_scales)) si_mv <- gpca$col_scales[rownames(gpca$col_scales)[rn_idx_mv[1]], kpos_mv]
+            if (length(rn_idx_mv) > 0 && kpos_mv <= ncol(gpca$col_scales)) {
+              si_mv <- gpca$col_scales[rownames(gpca$col_scales)[rn_idx_mv[1]], kpos_mv]
+            } else {
+              si_mv <- 1
+            }
           } else {
             si_mv <- 1
           }
@@ -3435,7 +3535,11 @@ cat("======================\n\n")
       if (!is.null(res$diagnostics)) res$diagnostics else NULL
     })
     diag_list <- diag_list[!sapply(diag_list, is.null)]
-    all_diagnostics <- if (length(diag_list) > 0) tryCatch({ do.call(rbind, diag_list) }, error = function(e) stop(sprintf("Failed to combine diagnostics: %s", e$message))) else NULL
+    # Use dplyr::bind_rows so differing diagnostic column sets are safely merged (missing columns filled with NA)
+    all_diagnostics <- if (length(diag_list) > 0) tryCatch({
+      if (!requireNamespace("dplyr", quietly = TRUE)) stop("dplyr is required to combine diagnostics robustly")
+      dplyr::bind_rows(diag_list)
+    }, error = function(e) stop(sprintf("Failed to combine diagnostics: %s", e$message))) else NULL
 
     # Collect Q10 and Q90 DVI values
     q_dvi_data <- do.call(rbind, lapply(results_list, function(res) {
