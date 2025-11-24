@@ -2,6 +2,7 @@
 modis/
 landsat/
 phenology_results/
+.vscode/
 
 # Python virtual environments
 venv/
