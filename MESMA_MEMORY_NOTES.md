@@ -14,3 +14,12 @@ Practical recommendations:
 - If you need to search very large spaces, consider sampling strategies, heuristic search (greedy/local search), or approximate algorithms — exhaustive search beyond millions to tens of millions of combos is generally impractical on a workstation.
 
 If you want, I can add a configurable sampling-based fallback (random sampling of combinations) or implement a heuristic greedy search to keep compute bounded while still producing good results.
+
+New preprocessing step (soil-first MESMA):
+- The pipeline now supports constructing a soil prototype from geojson-labeled 'no soil' points and subtracting the estimated soil fraction from each observation's spectral signature before vegetation library construction.
+- This is controlled by ENABLE_SOIL_PREPROCESS (default TRUE). Parameters SOIL_PURE_THRESHOLD and SOIL_MIN_SAMPLES let you tune how pure the soil set is selected.
+- After subtraction, the original values are preserved under `raw_<index>` columns and the estimated per-location-year soil fraction is stored in `soil_frac` (constant for all rows within a location-year).
+
+Important: there is no per-row soil-subtraction fallback. If the provisional PCA cannot be built (insufficient data) or the per-location-year alpha estimator fails, the script will skip soil subtraction rather than try a per-row subtraction.
+
+This helps removing soil contamination from vegetation endmember extraction and preserves the time-dimension reduction (PCA) downstream.

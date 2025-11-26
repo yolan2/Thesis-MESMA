@@ -1,0 +1,10 @@
+{
+"type": "FeatureCollection",
+"name": "updated_tmp_veg_barren",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+"features": [
+{ "type": "Feature", "properties": { "id": 1, "vegetation": "barren", "no soil": 0.0, "no_soil": 0.0 }, "geometry": { "type": "Point", "coordinates": [ 0.0, 0.0 ] } },
+{ "type": "Feature", "properties": { "id": 2, "vegetation": "grassland", "no soil": null, "no_soil": null }, "geometry": { "type": "Point", "coordinates": [ 1.0, 1.0 ] } },
+{ "type": "Feature", "properties": { "id": 3, "vegetation": null, "no soil": null, "no_soil": null }, "geometry": { "type": "Point", "coordinates": [ 2.0, 2.0 ] } }
+]
+}

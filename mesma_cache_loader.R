@@ -48,6 +48,7 @@ rload_mesma_cache <- function(cache_dir = file.path(OUT_DIR, "mesma_cache")) {
   cache$avail <- lib_data$avail
   cache$ALLOWED_VEG <- lib_data$ALLOWED_VEG
   cache$BAND_SCALE <- lib_data$BAND_SCALE
+  cache$COMPRESSED_STAGE1_LIB <- lib_data$COMPRESSED_STAGE1_LIB
 
   # Load projections
   proj_path <- file.path(cache_dir, "projection_matrices.rds")

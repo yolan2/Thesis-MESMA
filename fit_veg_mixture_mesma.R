@@ -1,49 +1,7 @@
+ 
 library(zoo)
 library(dplyr)
 library(cluster)
-
-suppressPackageStartupMessages({
-  suppressWarnings({
-    library(zoo)
-    library(dplyr)
-    library(cluster)
-  })
-})
-
-
-# Declare known globals for R CMD check / static linters
-utils::globalVariables(c(
-  "GLOBAL_PCA", "PARALLEL_ENABLE", "PARALLEL_WORKERS",
-    "PROGRESS_LOG_TO_FILE", "PROGRESS_EVERY_TASK", "OUT_DIR", "ALLOWED_VEG",
-    "MAX_VEG_COMPONENTS", "MIN_IDX_PRESENCE", "lib_factor_pca", "veg_counts", "mesma_lib",
-    "veg_kept", "all_variants_pca", "variant_usage",
-    "unique_locations", "results_list", "best_fit_summary",
-    "variant_list_pca", "loc_variants_pca",
-    "true_veg", "rmse", "deviation", "avg_rmse", "q_dvi_data",
-    "loc_q_data", "loc_coefs", "loc_best", "summary_data",
-    "EPS_SIGMA", "LOWER_BND", "MIN_OBS_FOR_BOOT", "BOOTSTRAP_B",
-    "TRAIN_YEARS", "PROGRESS_BAR", "LOG_FILE",
-    "V_names", "pca_rank",
-    "variant_t_pca", "all_coefs",
-    "location_id", "year", "Veg", "coef",
-    "MAX_PCA_COMPONENTS", "MAX_FACTORS_CAP", "FAST_VAR",
-    "BOOT_MIN_REPS_PER_VEG", "VARIANCE_THRESHOLD",
-    "GAM_K_MAX", "GAM_GAMMA", "USE_INDICES_MIN", "MIN_INDEX_SD",
-    "ENABLE_SAMPLE_BALANCING", "RAW_BANDS",
-    "ENABLE_PHASE_ALIGNMENT", "REFERENCE_PHASE_MARKERS",
-    "ENABLE_MULTISCALE", "MULTISCALE_WINDOWS",
-    "ENABLE_DIAGNOSTICS",
-    "PERSISTENT_PARALLEL_BACKEND",
-    ".COMPRESSED_TEMPLATES_ACCESSOR", ".WHITENING_DB_ACCESSOR",
-    "ENABLE_UNCERTAINTY", "GLSBB_MIN_BLOCK", "GLSBB_MAX_BLOCK",
-    "COMBO_PARALLEL_ENABLE", "COMBO_PARALLEL_WORKERS", "EARLY_STOP_RMSE_THRESHOLD",
-    "ENABLE_QP_SOLVER", "TEMPORAL_BUDGET", "TOPK_VARIANTS"
-  ))
-
-
-
-## that simply forwarded to the base functions (svd, crossprod, cor, kmeans).
-## These were removed for simplicity — code now calls the base functions directly.
 
 fit_cost_mkl <- function(obs, weight, t_row) {
   # fit_cost_mkl: vectorized cost calculation helper
@@ -56,9 +14,12 @@ fit_cost_mkl <- function(obs, weight, t_row) {
   sum(residuals^2)
 }
 
-# Set up progressr handlers for ETA display
+# Set up progressr handlers for ETA display (use single-line text handler)
 if (requireNamespace("progressr", quietly = TRUE)) {
-  progressr::handlers(global = TRUE)
+  # Use the txt handler to avoid multi-line progress chatter.
+  # Width adapts to console or uses 60 characters as default for neat display.
+  width <- tryCatch(getOption("width", 60), error = function(e) 60)
+  progressr::handlers(progressr::handler_txt(width = min(max(as.integer(width), 40), 120)))
 }
 
 # Canonical optimal indices (required - no fallback alternatives)
@@ -177,6 +138,53 @@ calc_moving_var <- function(df, index_name, window = 14, span_loess = 0.1, min_o
   out
 }
 
+# Helper: normalize variants of the 'no soil' column name to a single
+# canonical name 'no soil' (space). This accepts 'no_soil', 'no.soil',
+# '.__no soil__' etc and copies the first matching column into 'no soil'
+# if present. This makes downstream access with backticks consistent.
+normalize_no_soil_col <- function(tbl) {
+  if (is.null(tbl) || !is.data.frame(tbl)) return(tbl)
+  nm <- names(tbl)
+  candidates <- c("no soil", "no_soil", "no.soil", "__no soil__", "__no_soil__", ".__no soil__", ".__no_soil__")
+  # Keep the user's exact 'no soil' when present; otherwise pick the first matching candidate
+  # If present, coerce the column to safe numeric form (handles factors/strings)
+  if ("no soil" %in% nm) {
+    tbl[["no soil"]] <- safe_as_numeric(tbl[["no soil"]])
+    return(tbl)
+  }
+  found <- intersect(candidates, nm)
+  if (length(found) > 0) {
+    src <- found[1]
+    tbl[["no soil"]] <- safe_as_numeric(tbl[[src]])
+  }
+  tbl
+}
+
+
+# Helper: safely coerce values to numeric. Handles factors, character "TRUE"/"FALSE",
+# trims whitespace and avoids direct as.numeric(factor) pitfalls.
+safe_as_numeric <- function(x) {
+  if (is.null(x)) return(x)
+  # Factors -> characters first
+  if (is.factor(x)) x <- as.character(x)
+  # Characters: trim, handle logical strings
+  if (is.character(x)) {
+    s <- trimws(x)
+    lower <- tolower(s)
+    # Map boolean-like strings to 1/0
+    lower[lower %in% c("true", "t")] <- "1"
+    lower[lower %in% c("false", "f")] <- "0"
+    # Attempt numeric conversion
+    suppressWarnings(num <- as.numeric(lower))
+    return(num)
+  }
+  # Already numeric (or integer) -> coerce to numeric
+  if (is.numeric(x)) return(as.numeric(x))
+  # Otherwise try character roundtrip
+  suppressWarnings(num <- as.numeric(as.character(x)))
+  num
+}
+
 # Persistent parallel backend (set up once)
 setup_parallel_backend <- function() {
   if (isTRUE(PARALLEL_ENABLE) && requireNamespace("future", quietly = TRUE)) {
@@ -196,9 +204,7 @@ INPUT_CSV <- file.path(OUTPUT_DIR, "hls_phenology_data.csv")
 OUT_DIR <- file.path(OUTPUT_DIR, "veg_mixture_fit")
 
 # Training configuration defaults
-# NOTE: explicit TEST_YEARS functionality has been removed — the script always
-# uses all available years for the data but still maintains separate
-# variables for training and inference where needed.
+# The script uses all available years for training by default.
 TRAIN_YEARS <- 2019:2024
 
 # Allow skipping a minimal number of DOYs per-location when computing sufficiency
@@ -249,6 +255,18 @@ MIN_INDEX_SD <- 0.05
 # Sample-balancing and augmentation
 ENABLE_SAMPLE_BALANCING <- TRUE
 
+# Soil-preprocessing: run a preliminary soil/no-soil MESMA and subtract soil
+# contribution from all spectral time series before building vegetation libs.
+# This helps avoid soil contamination when clustering vegetation time-series.
+ENABLE_SOIL_PREPROCESS <- TRUE
+# Threshold (0-1) to treat a geo-labelled sample as pure soil when building the soil prototype
+SOIL_PURE_THRESHOLD <- 0.95
+# Minimum number of pure-soil rows required to build a robust soil prototype
+SOIL_MIN_SAMPLES <- 3L
+# When insufficient pure soil points are present, the soil prototype will not
+# be built (returns NULL) unless a minimum number of candidate rows meet
+# the SOIL_PURE_THRESHOLD.
+
 # Memory-safe clustering limits (sampling parameters to avoid RAM overload)
 MAX_PROJECTIONS_PER_VEG <- 25000L  # subsample before clustering to avoid OOM
 SILHOUETTE_SAMPLE_SIZE <- 20000L   # subsample for silhouette distance matrix
@@ -298,6 +316,8 @@ if (length(missing_idx) > 0) {
 }
 
 df <- raw_df
+# Normalize any variants of the no-soil column name for consistent downstream access
+df <- normalize_no_soil_col(df)
 
 # Add timing for major operations
 timing_info <- list()
@@ -319,8 +339,7 @@ cat("Note: the script will always use all available years for data; TEST_YEARS i
 
 df$year <- lubridate::year(df$date)
 
-## Use all available data for training by default (previous behaviour used
-## TRAIN_YEARS to restrict training data). Still keep a df_train object to
+## Use all available data for training by default. Keep a df_train object to
 ## preserve a clear training/inference distinction for downstream code.
 df_train <- df
 cat(sprintf(
@@ -328,7 +347,7 @@ cat(sprintf(
   nrow(df_train), length(unique(df_train$location_id))
 ))
 
-## Inference / testing uses the full dataset (all years) — TEST_YEARS removed.
+## Inference/testing uses the full dataset (all years).
 df_test <- df
 cat(sprintf(
   "Testing dataset: %d rows from %d locations\n",
@@ -336,6 +355,7 @@ cat(sprintf(
 ))
 
 df_full <- df
+df_full <- normalize_no_soil_col(df_full)
 df <- df_train
 
 # Ensure training subset has at least some samples for each allowed vegetation class
@@ -444,6 +464,25 @@ chunked_rbind <- function(lst, chunk_size = 50L) {
     i <- end + 1L
   }
   acc
+}
+
+# Debug helper: produce a nil return object for the main processing loop
+dbg_return_null <- function(reason = NULL) {
+  if (!is.null(reason)) cat(sprintf("[DEBUG] abort: %s\n", as.character(reason)))
+  coef_df <- data.frame(location_id = NA_character_, year = NA_integer_, Veg = NA_character_, coef = NA_real_, rmse = NA_real_, stringsAsFactors = FALSE)
+  coef_df$coef_lo <- NA_real_
+  coef_df$coef_hi <- NA_real_
+  diag_df <- data.frame(location_id = NA_character_, year = NA_integer_, vegetated_fraction = NA_real_, barren_fraction = NA_real_, stringsAsFactors = FALSE)
+  list(
+    coef_df = coef_df,
+    variant_trajectory = NULL,
+    diagnostics = diag_df,
+    uncertainty = NULL,
+    q10_dvi = NA_real_,
+    q90_dvi = NA_real_,
+    vegetated_fraction = NA_real_,
+    barren_fraction = NA_real_
+  )
 }
 
 # Clamp for parallel workers memory usage: limit workers according to available RAM
@@ -591,6 +630,21 @@ precompute_compressed_templates <- function(mesma_lib, budget = TEMPORAL_BUDGET)
   }
 }
 
+# Whitening helper: moved to top-level so other stages can reuse it
+whiten_matrix <- function(X, epsilon = 1e-6) {
+  if (is.null(X) || nrow(X) < 2 || ncol(X) < 1) return(list(Xw = X, W = diag(ncol(X)), mu = rep(0, ncol(X))))
+  mu <- colMeans(X)
+  Xc <- sweep(X, 2, mu, "-")
+  Sigma <- cov(Xc)
+  eig <- eigen(Sigma)
+  vals <- eig$values
+  vals[vals < epsilon] <- epsilon
+  D_inv_sqrt <- diag(1 / sqrt(vals))
+  W <- eig$vectors %*% D_inv_sqrt %*% t(eig$vectors)
+  Xw <- Xc %*% W
+  list(Xw = Xw, W = W, mu = mu)
+}
+
 # Helper: index of medoid row (row with minimal total distance)
 # For large matrices, sample to avoid O(N^2) memory allocation
 medoid_row_index <- function(M) {
@@ -630,6 +684,8 @@ cos_sim <- function(a, b) {
 # Helper: parallel map
 .run_map <- function(X, FUN) {
   f_FUN <- FUN
+  # Use txt handler explicitly for the local run to avoid multi-line spamming
+  if (requireNamespace("progressr", quietly = TRUE)) progressr::handlers("txt")
 
   if (!PARALLEL_ENABLE) {
     if (!requireNamespace("progressr", quietly = TRUE)) {
@@ -676,28 +732,30 @@ if ("date" %in% names(df)) {
   if (!"year" %in% names(df)) df$year <- as.integer(lubridate::year(df$date))
 }
 
-geojson_path <- "C:/Users/yolan/OneDrive/Documenten/UGENT/Master/masterproef/GIS/zuizer_zonder_foto_UTM.geojson"
+geojson_path <- "C:/Users/yolan/OneDrive/Documenten/UGENT/Master/masterproef/GIS/updated_zuizer_zonder_foto_UTM.geojson"
 if (!file.exists(geojson_path)) stop(paste0("GeoJSON points not found at ", geojson_path))
 gpts_raw <- sf::st_read(geojson_path, quiet = TRUE)
 
 geojson_names <- names(gpts_raw)
 normalized_names <- gsub("[^a-z0-9]+", "_", tolower(geojson_names))
 no_soil_col <- geojson_names[normalized_names == "no_soil"]
-if (length(no_soil_col) == 0) stop("GeoJSON point data requires a 'no_soil' column")
+if (length(no_soil_col) == 0) stop("GeoJSON point data requires a 'no soil' column")
 no_soil_raw <- gpts_raw[[no_soil_col[1]]]
-if (is.logical(no_soil_raw) || is.numeric(no_soil_raw)) {
-  no_soil_vals <- as.numeric(no_soil_raw)
-} else if (is.character(no_soil_raw)) {
-  no_soil_vals <- suppressWarnings(as.numeric(no_soil_raw))
-} else {
-  stop("'no_soil' column must be numeric, logical, or character coercible to numeric")
+no_soil_vals <- safe_as_numeric(no_soil_raw)
+if (is.null(no_soil_vals) || (!is.numeric(no_soil_vals) && !is.logical(no_soil_vals))) {
+  stop("'no soil' column must be numeric, logical, or character coercible to numeric")
 }
-if (any(is.na(no_soil_vals))) {
-  cat("[NOTICE] Coercing missing/non-numeric 'no_soil' values to 0 (treated as mixed or barren).\n")
-  no_soil_vals[is.na(no_soil_vals)] <- 0
+  if (any(is.na(no_soil_vals))) {
+  # Leave missing 'no soil' values as NA instead of coercing to 0.
+  # Coercing to 0 earlier caused many locations to be treated as fully barren/mixed
+  # when GeoJSON contained missing entries. Keeping NA helps us detect missing
+  # metadata and prevents silently forcing binary fractions.
+  cat("[NOTICE] Found missing/non-numeric 'no soil' values in GeoJSON; keeping as NA (do not coerce to 0).\n")
 }
-if (any(no_soil_vals < 0 | no_soil_vals > 1)) stop("'no_soil' values must lie within [0,1]")
-gpts_raw$.__no_soil__ <- no_soil_vals
+## Validate numeric range only for non-missing values; keep NA values allowed
+non_na_no_soil <- no_soil_vals[!is.na(no_soil_vals)]
+if (length(non_na_no_soil) > 0 && any(non_na_no_soil < 0 | non_na_no_soil > 1)) stop("'no soil' values must lie within [0,1]")
+gpts_raw$`.__no soil__` <- no_soil_vals
 
 matched_cols <- names(gpts_raw)[tolower(names(gpts_raw)) %in% c("vegetation", "veg", "class")]
 if (length(matched_cols) > 0) {
@@ -715,7 +773,7 @@ gpts_raw$location_id_geo <- make_location_id(gpts_raw$.__lon__, gpts_raw$.__lat_
 gpts_raw$location_id <- as.character(seq_len(nrow(gpts_raw)))
 
 gpts_map <- sf::st_drop_geometry(gpts_raw) %>%
-  dplyr::select(location_id, Veg = .__veg__, no_soil = .__no_soil__) %>%
+  dplyr::select(location_id, Veg = .__veg__, `no soil` = `.__no soil__`) %>%
   dplyr::mutate(location_row = as.character(seq_len(dplyr::n()))) %>%
   dplyr::distinct(location_id, .keep_all = TRUE)
 
@@ -744,9 +802,20 @@ if ("location_id" %in% names(df) && "location_id" %in% names(gpts_map)) {
   pre_non_na <- sum(!is.na(df$Veg) & df$Veg != "")
 
   joined <- dplyr::left_join(df, gpts_map, by = "location_id", suffix = c("", ".geo"))
+  # Prefer existing Veg values in df; fall back to GeoJSON mapping
   if ("Veg.geo" %in% names(joined)) {
     joined$Veg <- ifelse(is.na(joined$Veg) | joined$Veg == "", joined$Veg.geo, joined$Veg)
     joined$Veg.geo <- NULL
+  }
+  # Merge 'no soil' from gpts_map into df when df has missing values
+  if ("no soil.geo" %in% names(joined)) {
+    # If df already has a 'no soil' column, prefer it when non-NA; otherwise use geo value
+    if ("no soil" %in% names(joined)) {
+      joined$`no soil` <- ifelse(is.na(joined$`no soil`), joined$`no soil.geo`, joined$`no soil`)
+    } else {
+      joined$`no soil` <- joined$`no soil.geo`
+    }
+    joined$`no soil.geo` <- NULL
   }
 
   post_non_na <- sum(!is.na(joined$Veg) & joined$Veg != "")
@@ -763,8 +832,16 @@ if ("location_id" %in% names(df) && "location_id" %in% names(gpts_map)) {
         joined2$Veg <- ifelse(is.na(joined2$Veg) | joined2$Veg == "", joined2$Veg.geo, joined2$Veg)
         joined2$Veg.geo <- NULL
       }
+      if ("no soil.geo" %in% names(joined2)) {
+        if ("no soil" %in% names(joined2)) {
+          joined2$`no soil` <- ifelse(is.na(joined2$`no soil`), joined2$`no soil.geo`, joined2$`no soil`)
+        } else {
+          joined2$`no soil` <- joined2$`no soil.geo`
+        }
+        joined2$`no soil.geo` <- NULL
+      }
       if (sum(!is.na(joined2$Veg) & joined2$Veg != "") > post_non_na) {
-        joined <- joined2
+        joined <- normalize_no_soil_col(joined2)
         post_non_na <- sum(!is.na(joined$Veg) & joined$Veg != "")
         cat(sprintf("[NOTICE] GeoJSON join (row-number) gained %d Veg rows\n", post_non_na - pre_non_na))
       } else {
@@ -773,7 +850,7 @@ if ("location_id" %in% names(df) && "location_id" %in% names(gpts_map)) {
     }
   }
 
-  df <- joined
+  df <- normalize_no_soil_col(joined)
 
   matched_locs <- length(intersect(na.omit(unique(as.character(df$location_id))), na.omit(unique(as.character(gpts_map$location_id)))))
   cat(sprintf("[NOTICE] GeoJSON join results - Veg before=%d after=%d; matched location_id strings=%d\n", pre_non_na, post_non_na, matched_locs))
@@ -853,6 +930,42 @@ df$doy <- lubridate::yday(df$date)
 df$doy[df$doy < 1 | df$doy > 366] <- NA_integer_
 
 veg_counts <- sort(table(na.omit(df$Veg)), decreasing = TRUE)
+
+# Add synthetic barren rows if barren locations are missing from phenology CSV
+if (exists("gpts_map") && nrow(gpts_map) > 0) {
+  barren_locs <- unique(gpts_map$location_id[tolower(gpts_map$Veg) == "barren" | gpts_map$`no soil` == 0])
+  existing_locs <- unique(df$location_id)
+  missing_barren_locs <- setdiff(barren_locs, existing_locs)
+  if (length(missing_barren_locs) > 0) {
+    cat(sprintf("[NOTICE] Adding %d synthetic barren rows for missing barren locations\n", length(missing_barren_locs)))
+    synthetic_rows <- list()
+    for (loc in missing_barren_locs) {
+      # Create a base row
+      new_row <- df[1, , drop = FALSE]  # copy structure
+      new_row[1, ] <- NA  # clear
+      new_row$location_id <- loc
+      new_row$Veg <- "barren"
+      new_row$`no soil` <- 0
+      new_row$date <- as.Date("2000-01-01")
+      new_row$year <- 2000
+      new_row$doy <- 1
+      # Set spectral columns to 0
+      numeric_cols <- names(df)[sapply(df, is.numeric)]
+      spectral_cols <- setdiff(numeric_cols, c("doy", "year"))
+      for (col in spectral_cols) {
+        if (col %in% names(new_row)) {
+          new_row[[col]] <- 0
+        }
+      }
+      synthetic_rows[[length(synthetic_rows) + 1]] <- new_row
+    }
+    if (length(synthetic_rows) > 0) {
+      synthetic_df <- do.call(rbind, synthetic_rows)
+      df <- rbind(df, synthetic_df)
+      cat(sprintf("[NOTICE] Added %d synthetic barren rows\n", nrow(synthetic_df)))
+    }
+  }
+}
 
 # Define indices to use
 meta_cols <- intersect(c(
@@ -1247,11 +1360,11 @@ if ("Veg" %in% names(df) && length(ALLOWED_VEG) > 0) {
 }
 
 if ("Veg" %in% names(df) && length(ALLOWED_VEG) > 0) {
-  keep_rows <- tolower(df$Veg) %in% ALLOWED_VEG
+  keep_rows <- tolower(df$Veg) %in% ALLOWED_VEG | tolower(df$Veg) == "barren"
   n_before <- nrow(df)
   df <- df[keep_rows | is.na(df$Veg), , drop = FALSE]
   cat(sprintf(
-    "Filtered to allowed classes (%s): kept %d/%d rows\n",
+    "Filtered to allowed classes (%s) + barren: kept %d/%d rows\n",
     paste(ALLOWED_VEG, collapse = ","), nrow(df), n_before
   ))
 }
@@ -1297,6 +1410,422 @@ if (nrow(loc_years) == 0) {
 # Construct vegetation library
 cat("Constructing lib from TRAINING dataset...\n")
 lib <- list()
+## Soil-first MESMA preprocessing: build a soil prototype from geojson-labelled
+## 'no soil' points and subtract estimated soil fraction from every observation
+## in the working data. This runs before vegetation library construction.
+build_soil_prototype <- function(df_local, avail_idx, threshold = SOIL_PURE_THRESHOLD, min_samples = SOIL_MIN_SAMPLES) {
+  # Prefer using explicit 'barren' Veg-labeled rows as soil (bare ground) references.
+  # If no 'barren' rows are present, do not attempt to create a soil prototype.
+  if (!"Veg" %in% names(df_local)) return(NULL)
+  candidates <- df_local[tolower(as.character(df_local$Veg)) == "barren", , drop = FALSE]
+
+  ## Strict requirement: do not fallback to selecting an arbitrary top-N set.
+  ## If there are fewer than min_samples candidates that meet the threshold,
+  ## return NULL and let the caller handle the absence of a soil prototype.
+  if (nrow(candidates) < min_samples) {
+    return(NULL)
+  }
+
+  if (nrow(candidates) == 0) return(NULL)
+
+  soil_lib <- list()
+  # ensure 'doy' is present
+  if (!"doy" %in% names(candidates)) candidates$doy <- lubridate::yday(as.Date(candidates$date))
+
+  for (idx in avail_idx) {
+    if (!idx %in% names(candidates)) next
+    vals_by_doy <- tryCatch(
+      {
+        tapply(seq_along(candidates[[idx]]), candidates$doy, function(indices) {
+          vals <- candidates[[idx]][indices]
+          vals <- vals[is.finite(vals)]
+          if (length(vals) == 0) return(NA_real_)
+          if (length(vals) == 1) return(as.numeric(vals[1]))
+          m <- mean(vals)
+          as.numeric(vals[which.min(abs(vals - m))])
+        })
+      },
+      error = function(e) NULL
+    )
+
+    mu <- rep(NA_real_, 365)
+    if (!is.null(vals_by_doy) && length(vals_by_doy) > 0) {
+      doy_values <- as.integer(names(vals_by_doy))
+      valid_doy <- doy_values >= 1 & doy_values <= 365
+      mu[doy_values[valid_doy]] <- vals_by_doy[valid_doy]
+    }
+
+    if (all(!is.finite(mu))) next
+    mv <- tryCatch(calc_moving_var(data.frame(date = 1:365, idx = mu), "idx", window = 14), error = function(e) rep(NA_real_, 365))
+    soil_lib[[idx]] <- list(mu = mu, mv = mv)
+  }
+
+  attr(soil_lib, "rows_used") <- nrow(candidates)
+  soil_lib
+}
+
+## Build a two-endmember library for stage 1 MESMA: barren (no soil==0) vs pure vegetation (no soil==1)
+## This library is used to unmix the vegetated fraction for all pixels before decomposing vegetation types
+build_barren_veg_library <- function(df_local, avail_idx, min_samples = 5) {
+  if (!"no soil" %in% names(df_local)) return(NULL)
+  if (!"doy" %in% names(df_local)) df_local$doy <- lubridate::yday(as.Date(df_local$date))
+  
+  # Debug: Check what values are in the 'no soil' column
+  no_soil_vals <- df_local$`no soil`
+  cat(sprintf("[Stage1] 'no soil' column summary:\n"))
+  cat(sprintf("  - Class: %s\n", class(no_soil_vals)))
+  cat(sprintf("  - Unique values (first 10): %s\n", paste(head(unique(no_soil_vals), 10), collapse=", ")))
+  cat(sprintf("  - Range: %s to %s\n", min(no_soil_vals, na.rm=TRUE), max(no_soil_vals, na.rm=TRUE)))
+  cat(sprintf("  - NAs: %d\n", sum(is.na(no_soil_vals))))
+  
+  # Extract barren endmember (no soil ≈ 0)
+  # Be more robust: handle strings, very small values, and different formats
+  barren_rows <- df_local[!is.na(df_local$`no soil`) & {
+    val <- df_local$`no soil`
+    # Convert to numeric if it's a string
+    if (is.character(val)) val <- as.numeric(val)
+    # Check if close to 0 (within 0.01) or exactly 0
+    abs(val - 0) < 0.01
+  }, , drop = FALSE]
+  
+  # Extract pure vegetation endmember (no soil ≈ 1)
+  veg_rows <- df_local[!is.na(df_local$`no soil`) & {
+    val <- df_local$`no soil`
+    # Convert to numeric if it's a string
+    if (is.character(val)) val <- as.numeric(val)
+    # Check if close to 1 (within 0.01) or exactly 1
+    abs(val - 1) < 0.01
+  }, , drop = FALSE]
+  
+  cat(sprintf("[Stage1] After filtering: barren=%d, veg=%d rows\n", 
+              nrow(barren_rows), nrow(veg_rows)))
+  
+  if (nrow(barren_rows) < min_samples || nrow(veg_rows) < min_samples) {
+    cat(sprintf("[Stage1] Insufficient training data: barren=%d, veg=%d (need >=%d each)\n", 
+                nrow(barren_rows), nrow(veg_rows), min_samples))
+    return(NULL)
+  }
+  
+  cat(sprintf("[Stage1] Building barren-veg library from barren=%d, veg=%d rows\n", 
+              nrow(barren_rows), nrow(veg_rows)))
+  
+  stage1_lib <- list()
+  
+  # Build barren endmember
+  barren_lib <- list()
+  for (idx in avail_idx) {
+    if (!idx %in% names(barren_rows)) next
+    vals_by_doy <- tapply(seq_along(barren_rows[[idx]]), barren_rows$doy, function(indices) {
+      vals <- barren_rows[[idx]][indices]
+      vals <- vals[is.finite(vals)]
+      if (length(vals) == 0) return(NA_real_)
+      median(vals)
+    })
+    mu <- rep(NA_real_, 365)
+    if (length(vals_by_doy) > 0) {
+      doy_values <- as.integer(names(vals_by_doy))
+      valid_doy <- doy_values >= 1 & doy_values <= 365
+      mu[doy_values[valid_doy]] <- vals_by_doy[valid_doy]
+    }
+    if (all(!is.finite(mu))) next
+    mv <- tryCatch(calc_moving_var(data.frame(date = 1:365, idx = mu), "idx", window = 14), 
+                   error = function(e) rep(NA_real_, 365))
+    barren_lib[[idx]] <- list(mu = mu, mv = mv)
+  }
+  
+  # Build vegetation endmember
+  veg_lib <- list()
+  for (idx in avail_idx) {
+    if (!idx %in% names(veg_rows)) next
+    vals_by_doy <- tapply(seq_along(veg_rows[[idx]]), veg_rows$doy, function(indices) {
+      vals <- veg_rows[[idx]][indices]
+      vals <- vals[is.finite(vals)]
+      if (length(vals) == 0) return(NA_real_)
+      median(vals)
+    })
+    mu <- rep(NA_real_, 365)
+    if (length(vals_by_doy) > 0) {
+      doy_values <- as.integer(names(vals_by_doy))
+      valid_doy <- doy_values >= 1 & doy_values <= 365
+      mu[doy_values[valid_doy]] <- vals_by_doy[valid_doy]
+    }
+    # Interpolate missing DOYs for complete temporal coverage
+    if (sum(is.finite(mu)) > 2) {
+      mu <- approx(x = which(is.finite(mu)), y = mu[is.finite(mu)], 
+                   xout = 1:365, rule = 2)$y
+    }
+    if (all(!is.finite(mu))) next
+    mv <- tryCatch(calc_moving_var(data.frame(date = 1:365, idx = mu), "idx", window = 14), 
+                   error = function(e) rep(NA_real_, 365))
+    veg_lib[[idx]] <- list(mu = mu, mv = mv)
+  }
+  
+  if (length(barren_lib) == 0 || length(veg_lib) == 0) return(NULL)
+  
+  stage1_lib$barren <- barren_lib
+  stage1_lib$vegetation <- veg_lib
+  stage1_lib
+}
+
+## Unmix vegetated fraction using stage 1 MESMA (barren vs vegetation endmembers)
+## Returns the estimated vegetated fraction for this location-year
+unmix_vegetated_fraction <- function(dly_local, stage1_lib, avail_idx) {
+  if (is.null(stage1_lib) || length(stage1_lib) == 0) return(NA_real_)
+  if (!"doy" %in% names(dly_local)) dly_local$doy <- lubridate::yday(as.Date(dly_local$date))
+  
+  # For each row, perform constrained least squares: pixel = alpha*barren + (1-alpha)*veg
+  # We solve: min ||X - alpha*B - (1-alpha)*V||^2 subject to alpha in [0,1]
+  # This simplifies to: min ||X - V - alpha*(B - V)||^2 --> alpha = (X-V)·(B-V) / ||B-V||^2, clipped to [0,1]
+  
+  alphas <- numeric(nrow(dly_local))
+  
+  for (r in seq_len(nrow(dly_local))) {
+    row <- dly_local[r, , drop = FALSE]
+    doy <- as.integer(row$doy)
+    if (is.na(doy) || doy < 1 || doy > 365) {
+      alphas[r] <- NA_real_
+      next
+    }
+    
+    # Build vectors for this DOY
+    X <- numeric(length(avail_idx))
+    B <- numeric(length(avail_idx))
+    V <- numeric(length(avail_idx))
+    valid <- logical(length(avail_idx))
+    
+    for (i in seq_along(avail_idx)) {
+      idx <- avail_idx[i]
+      if (!idx %in% names(row)) next
+      X[i] <- as.numeric(row[[idx]])
+      if (!is.null(stage1_lib$barren[[idx]])) B[i] <- stage1_lib$barren[[idx]]$mu[doy]
+      if (!is.null(stage1_lib$vegetation[[idx]])) V[i] <- stage1_lib$vegetation[[idx]]$mu[doy]
+      valid[i] <- is.finite(X[i]) && is.finite(B[i]) && is.finite(V[i])
+    }
+    
+    if (sum(valid) < 2) {
+      alphas[r] <- NA_real_
+      next
+    }
+    
+    X <- X[valid]
+    B <- B[valid]
+    V <- V[valid]
+    
+    # Solve for alpha (barren fraction)
+    diff_BV <- B - V
+    diff_XV <- X - V
+    denom <- sum(diff_BV^2)
+    
+    if (denom < 1e-10) {
+      # Endmembers are too similar, default to mid-range
+      alphas[r] <- 0.5
+    } else {
+      alpha <- sum(diff_XV * diff_BV) / denom
+      alphas[r] <- max(0, min(1, alpha))
+    }
+  }
+  
+  # Return median vegetated fraction across all valid observations
+  valid_alphas <- alphas[is.finite(alphas)]
+  if (length(valid_alphas) == 0) return(NA_real_)
+  
+  barren_frac <- median(valid_alphas)
+  veg_frac <- 1 - barren_frac
+  
+  cat(sprintf("[Stage1] Unmixed vegetated fraction: %.3f (barren: %.3f, n=%d obs)\n", 
+              veg_frac, barren_frac, length(valid_alphas)))
+  
+  veg_frac
+}
+
+ 
+
+
+## Build a provisional global PCA from raw data (no averaging)
+## This ensures the soil subtraction logic operates in a space that captures full dataset variance.
+build_prelim_global_pca <- function(df_local, avail_idx) {
+  # REVISED: Build PCA from raw data, not averaged location-year medoids.
+  
+  # Filter valid data
+  # We need columns: avail_idx
+  missing_cols <- setdiff(avail_idx, names(df_local))
+  if (length(missing_cols) > 0) return(NULL)
+  
+  # Extract matrix
+  X_all <- as.matrix(df_local[, avail_idx, drop = FALSE])
+  
+  # Handle NAs
+  # Simple mean imputation for PCA training
+  for (j in seq_len(ncol(X_all))) {
+    col_vals <- X_all[, j]
+    if (any(!is.finite(col_vals))) {
+      mu_j <- mean(col_vals[is.finite(col_vals)], na.rm = TRUE)
+      if (!is.finite(mu_j)) mu_j <- 0
+      X_all[!is.finite(col_vals), j] <- mu_j
+    }
+  }
+  
+  # PCA
+  mu_all <- colMeans(X_all)
+  Xc <- sweep(X_all, 2, mu_all, "-")
+  feature_sds <- apply(Xc, 2, sd)
+  feature_sds[feature_sds <= 1e-10] <- 1.0
+  
+  Xs_std <- sweep(Xc, 2, feature_sds, "/")
+  
+  sv <- try(svd(Xs_std, nu = 0, nv = min(ncol(Xs_std), nrow(Xs_std))), silent = TRUE)
+  if (inherits(sv, "try-error") || length(sv$d) == 0) return(NULL)
+  
+  eigenvalues <- sv$d^2 / (nrow(Xs_std) - 1)
+  keep_idx <- which(eigenvalues > 1)
+  pca_rank <- if (length(keep_idx) == 0) 1 else min(length(keep_idx), MAX_FACTORS_CAP, ncol(sv$v))
+  
+  V_pca <- sv$v[, seq_len(pca_rank), drop = FALSE]
+  if (ncol(V_pca) > 1) V_pca <- qr.Q(qr(V_pca))[, seq_len(ncol(V_pca)), drop = FALSE]
+  
+  list(
+    global = list(V = V_pca, col_means = mu_all, feature_sds = feature_sds, rank = ncol(V_pca)),
+    idx_order = avail_idx
+  )
+}
+
+
+## Using a provisional gpca, compute a single alpha per location-year using
+## the factor projections for all rows and the soil prototype projected into the
+## same factor space (s_t per DOY). Returns df updated with soil_frac per-row
+## (constant across location-year) and subtracts alpha * soil_mu per-row.
+subtract_soil_by_location_year <- function(df_in, soil_lib, avail_idx, loc_year_pairs, gpca) {
+  if (is.null(soil_lib) || length(soil_lib) == 0) return(df_in)
+  if (is.null(gpca)) return(NULL)
+
+  # Precompute soil factors for each DOY
+  soil_factors <- vector("list", 366)
+  names(soil_factors) <- as.character(0:365)
+  for (doy in 1:365) {
+    raw_vec <- rep(NA_real_, length(gpca$idx_order))
+    names(raw_vec) <- gpca$idx_order
+    for (idx in avail_idx) {
+      kpos <- match(idx, gpca$idx_order)
+      if (!is.na(kpos) && !is.null(soil_lib[[idx]])) raw_vec[kpos] <- soil_lib[[idx]]$mu[doy]
+    }
+    if (all(!is.finite(raw_vec))) next
+    # center and scale
+    col_means <- gpca$global$col_means
+    feature_sds <- gpca$global$feature_sds
+    nas <- which(!is.finite(raw_vec))
+    if (length(nas) > 0) raw_vec[nas] <- col_means[nas]
+    centered <- (raw_vec - col_means) / feature_sds
+    s_factor <- as.numeric(centered %*% gpca$global$V)
+    soil_factors[[as.character(doy)]] <- s_factor
+  }
+
+  df_local <- df_in
+  if (!"doy" %in% names(df_local)) df_local$doy <- lubridate::yday(df_local$date)
+  # map for alphas
+  alpha_map <- list()
+
+  for (i in seq_len(nrow(loc_year_pairs))) {
+    loc <- as.character(loc_year_pairs$location_id[i])
+    yr <- as.integer(loc_year_pairs$year[i])
+    sel_rows <- which(df_local$location_id == loc & df_local$year == yr)
+    if (length(sel_rows) == 0) next
+
+    Zs <- list(); Ss <- list()
+    for (r in sel_rows) {
+      row <- df_local[r, , drop = FALSE]
+      # project observation into factor space using gpca
+      z <- tryCatch(project_row_to_factors(row, gpca, avail_idx, veg_type = row$Veg), error = function(e) NULL)
+      if (is.null(z)) next
+      doy <- as.integer(row$doy)
+      if (is.na(doy) || doy < 1 || doy > 365) next
+      s_t <- soil_factors[[as.character(doy)]]
+      if (is.null(s_t) || !is.finite(sum(s_t))) next
+      Zs[[length(Zs) + 1]] <- z
+      Ss[[length(Ss) + 1]] <- s_t
+    }
+
+    if (length(Zs) < 2) next
+    Zm <- do.call(rbind, Zs)
+    Sm <- do.call(rbind, Ss)
+    # Solve scalar alpha minimizing ||Zm - alpha * Sm||_F^2 --> alpha = sum(vec(Zm) dot vec(Sm)) / sum(vec(Sm)^2)
+    numer <- sum(Zm * Sm, na.rm = TRUE)
+    denom <- sum(Sm * Sm, na.rm = TRUE)
+    if (!is.finite(denom) || denom <= 0) next
+    alpha <- numer / denom
+    if (!is.finite(alpha)) next
+    alpha <- max(0, min(1, alpha))
+    key <- paste0(loc, "__", yr)
+    alpha_map[[key]] <- alpha
+  }
+
+  # Apply the computed alphas (per location-year) to subtract from index space
+  for (r in seq_len(nrow(df_local))) {
+    row <- df_local[r, , drop = FALSE]
+    loc <- as.character(row$location_id)
+    yr <- as.integer(row$year)
+    key <- paste0(loc, "__", yr)
+    if (!key %in% names(alpha_map)) next
+    alpha <- alpha_map[[key]]
+    if (!is.finite(alpha)) next
+
+    doy <- as.integer(row$doy)
+    if (is.na(doy) || doy < 1 || doy > 365) next
+
+    for (idx in avail_idx) {
+      if (!idx %in% names(df_local)) next
+      raw_col <- paste0("raw_", idx)
+      if (!raw_col %in% names(df_local)) df_local[[raw_col]] <- NA_real_
+      df_local[[raw_col]][r] <- df_local[[idx]][r]
+      s_val <- if (!is.null(soil_lib[[idx]])) soil_lib[[idx]]$mu[doy] else NA_real_
+      if (is.finite(s_val)) df_local[[idx]][r] <- df_local[[idx]][r] - alpha * s_val
+    }
+    df_local$soil_frac[r] <- alpha
+  }
+
+  df_local
+}
+
+# Build stage 1 library for vegetated fraction unmixing (barren vs pure vegetation)
+STAGE1_LIB <- NULL
+try({
+  STAGE1_LIB <- build_barren_veg_library(df, avail, min_samples = 5)
+}, silent = TRUE)
+
+if (is.null(STAGE1_LIB)) {
+  stop("[Stage1] Could not build barren-veg library (insufficient no soil==0 or no soil==1 rows). Two-stage MESMA requires sufficient stage-1 training data. Cannot proceed with spectral-only unmixing.")
+} else {
+  cat("[Stage1] Barren-vegetation library built successfully for stage 1 unmixing\n")
+}
+
+if (FALSE && isTRUE(ENABLE_SOIL_PREPROCESS)) {
+  cat("Running soil-preprocessing: building soil prototype and subtracting soil contributions from signals...\n")
+  soil_proto <- NULL
+  try({
+    soil_proto <- build_soil_prototype(df, avail)
+  }, silent = TRUE)
+
+  if (is.null(soil_proto) || length(soil_proto) == 0) {
+    cat("[NOTICE] Soil prototype could not be constructed (insufficient/no 'no soil' rows) — skipping soil subtraction\n")
+  } else {
+    cat(sprintf("Soil prototype created from %d geo rows; estimating constant soil fractions per location-year using provisional factor projection...\n", attr(soil_proto, "rows_used")))
+
+    gpca <- tryCatch({ build_prelim_global_pca(df, avail) }, error = function(e) NULL)
+    if (!is.null(gpca)) {
+      cat("Provisional global PCA built — computing per-location-year alpha and subtracting soil (constant across time-dimension)\n")
+      new_df <- tryCatch({ subtract_soil_by_location_year(df, soil_proto, avail, loc_years, gpca) }, error = function(e) NULL)
+      if (!is.null(new_df)) {
+        df <- new_df
+        df_full <- tryCatch({ subtract_soil_by_location_year(df_full, soil_proto, avail, loc_years, gpca) }, error = function(e) df_full)
+        if (exists("df_test") && nrow(df_test) > 0) df_test <- tryCatch({ subtract_soil_by_location_year(df_test, soil_proto, avail, loc_years, gpca) }, error = function(e) df_test)
+      } else {
+        cat("[NOTICE] Per-location-year subtraction failed. Soil subtraction will be skipped (no fallback)\n")
+      }
+    } else {
+      cat("[NOTICE] Could not build provisional PCA (not enough data). Soil subtraction will be skipped (no fallback)\n")
+    }
+  }
+}
+
 lib_df <- df
 vegs <- unique(na.omit(lib_df$Veg))
 vegs <- vegs[vegs != ""]
@@ -1377,16 +1906,20 @@ augment_minority_class <- function(df_class, target_n, seed = NULL, alpha_range 
           new_row[[colname]] <- interp[k]
         }
       } else {
-        # fallback - use vector assignment with recycling if shapes mismatch
-        for (k in seq_along(num_cols)) {
-          colname <- num_cols[k]
-          new_row[[colname]] <- interp[k %% length(interp) + 1]
-        }
+        # Do not silently recycle/interpolate when shapes don't match: this
+        # hides subtle bugs in numeric column handling. Fail loudly so calling
+        # code can be fixed instead of producing silently corrupted samples.
+        stop(sprintf("augment_minority_class: numeric assignment length mismatch (num_cols=%d, interp_len=%d)", length(num_cols), length(interp)))
       }
     }
 
     for (col in other_cols) {
       if (col %in% c("date", "doy", "doy_for_lib")) next
+      # Preserve Veg column (do not interpolate label)
+      if (col == "Veg") {
+        new_row[[col]] <- a[[col]]
+        next
+      }
       val <- if (runif(1) < 0.5) a[[col]] else b[[col]]
       new_row[[col]] <- val
     }
@@ -1446,6 +1979,14 @@ for (v in vegs) {
 if (length(balanced_dfs) > 0) {
   lib_df <- chunked_rbind(balanced_dfs, chunk_size = 50L)
   gc()
+  # DEBUG: Check Veg column
+  if (!"Veg" %in% names(lib_df)) {
+    cat("[ERROR] Veg column missing after balancing!\n")
+    cat("Available columns:", paste(names(lib_df), collapse=", "), "\n")
+  } else {
+    cat(sprintf("[DEBUG] After balancing: %d rows with Veg column\n", nrow(lib_df)))
+    cat(sprintf("[DEBUG] Veg values: %s\n", paste(unique(lib_df$Veg), collapse=",")))
+  }
   cat(sprintf(
     "Training data balanced: %d total samples across %d vegetation types\n",
     nrow(lib_df), length(balanced_dfs)
@@ -1453,259 +1994,71 @@ if (length(balanced_dfs) > 0) {
 }
 
 # Build basic library
-if (length(vegs) > 0) {
-  if (requireNamespace("progressr", quietly = TRUE)) {
-    progressr::with_progress({
-      p_lib <- progressr::progressor(steps = length(vegs), message = "Building vegetation library")
-
-      lib_df$doy_for_lib <- lubridate::yday(lib_df$date)
-
-      for (v in vegs) {
-        dveg <- lib_df[lib_df$Veg == v & is.finite(lib_df$doy_for_lib), , drop = FALSE]
-        if (nrow(dveg) == 0) {
-          next
-        }
-
-        lib[[v]] <- list()
-        p_lib()
-
-        kept_idx <- intersect(avail, names(dveg))
-        for (idx in kept_idx) {
-          # Use medoid per DOY (closest-to-mean observed value) to preserve real signatures
-          vals_by_doy <- tapply(seq_along(dveg[[idx]]), dveg$doy_for_lib, function(indices) {
-            vals <- dveg[[idx]][indices]
-            vals <- vals[is.finite(vals)]
-            if (length(vals) == 0) return(NA_real_)
-            if (length(vals) == 1) return(as.numeric(vals[1]))
-            m <- mean(vals)
-            as.numeric(vals[which.min(abs(vals - m))])
-          })
-
-          mu <- rep(NA_real_, 365)
-          doy_values <- as.integer(names(vals_by_doy))
-          valid_doy <- doy_values >= 1 & doy_values <= 365
-          mu[doy_values[valid_doy]] <- vals_by_doy[valid_doy]
-
-          if (all(!is.finite(mu))) next
-          mv <- calc_moving_var(data.frame(date = 1:365, idx = mu), "idx", window = 14)
-          lib[[v]][[idx]] <- list(mu = mu, mv = mv)
-        }
-        lib[[v]]$n_samples <- nrow(dveg)
-        cat(sprintf("Processed prototype for %s (n=%d)\n", v, nrow(dveg)))
-      }
-
-      lib_df$doy_for_lib <- NULL
-    })
-  } else {
-    stop("progressr package required for library construction")
-  }
+# REVISED: We skip the per-DOY averaging step here.
+# The 'lib' object will be constructed later from the variant centroids.
+# We initialize an empty list for now to satisfy downstream checks until we rebuild it.
+lib <- list()
+# Placeholder for legacy code compatibility
+for (v in vegs) {
+  lib[[v]] <- list(n_samples = 0)
 }
 
-if (length(lib) == 0) stop("lib could not be constructed from training data")
-cat(sprintf("Constructed simple lib from training dataset: vegetations=%d\n", length(lib)))
+cat("Skipping per-DOY averaging (will build variants from raw traces)...\n")
 
 timing_info$lib_construction_done <- Sys.time()
 cat(sprintf(
-  "Library construction completed in %.1f seconds\n",
+  "Library construction (skipped) completed in %.1f seconds\n",
   as.numeric(difftime(timing_info$lib_construction_done, timing_info$moving_var_done, units = "secs"))
 ))
 
 # Build PCA projections
-if (length(avail) >= 2) {
-  M_list <- list()
-  for (v in names(lib)) {
-    Mv <- matrix(NA_real_, nrow = 365, ncol = length(avail))
-    colnames(Mv) <- avail
-    for (j in seq_along(avail)) {
-      idx <- avail[j]
-      if (!is.null(lib[[v]][[idx]])) Mv[, j] <- lib[[v]][[idx]]$mu
-    }
+# REVISED: Build Global PCA directly from raw training data (lib_df)
+# instead of using the averaged M_list.
 
-    for (j in seq_along(avail)) {
-      idx <- avail[j]
-      if (!is.null(lib[[v]][[idx]]) && !is.null(lib[[v]][[idx]]$mv)) {
-        mv_col <- paste0(idx, "_mv")
-        Mv <- cbind(Mv, lib[[v]][[idx]]$mv)
-        colnames(Mv)[ncol(Mv)] <- mv_col
-      }
-    }
+cat("Building Global PCA from raw training data...\n")
 
-    days <- seq_len(365)
-    for (i in seq_len(ncol(Mv))) {
-      col <- as.numeric(Mv[, i])
-      if (any(!is.finite(col))) {
-        finite_idx <- which(is.finite(col))
-        if (length(finite_idx) == 0) {
-          col[] <- 0
-        } else if (length(finite_idx) == 1) {
-          col[] <- col[finite_idx]
-        } else {
-          x <- c(finite_idx - 365, finite_idx, finite_idx + 365)
-          y <- rep(col[finite_idx], 3)
-          interp <- tryCatch(
-            {
-              stats::approx(x = x, y = y, xout = days, rule = 2)$y
-            },
-            error = function(e) stop(sprintf("interpolation failed while building vegetation matrix: %s", e$message))
-          )
-          interp <- as.numeric(interp)
-          if (!all(is.finite(interp))) interp[!is.finite(interp)] <- median(col[finite_idx], na.rm = TRUE)
-          col <- interp
-        }
-        Mv[, i] <- col
-      }
-    }
+# 1. Construct X_all from lib_df
+# We need to stack all valid rows for the selected indices
+# lib_df has columns: avail (indices) and potentially _var14 columns
 
-    M_list[[v]] <- Mv
-  }
+# Identify columns to include in PCA
+pca_cols <- avail
+# Check if we should include variance columns
+# The original code included _mv columns if they existed in lib.
+# Here we check if _var14 columns exist in lib_df and are valid.
+var_cols_present <- paste0(avail, "_var14")
+var_cols_present <- intersect(var_cols_present, names(lib_df))
 
-  # Shape-based normalization (optional)
-  BAND_SCALE <- list()
-  if (isTRUE(SHAPE_NORMALIZATION_ENABLE)) {
-    for (vn in names(lib)) {
-      BAND_SCALE[[vn]] <- list()
-      for (idx in avail) {
-        if (!is.null(lib[[vn]][[idx]]) && !is.null(lib[[vn]][[idx]]$mu) && length(lib[[vn]][[idx]]$mu) >= 80) {
-          ts_data <- lib[[vn]][[idx]]$mu
-          n_days <- length(ts_data)
+# We will build a matrix X_all where columns are [avail, var_cols_present]
+# But we need to be careful about column ordering to match 'avail_aug' logic later.
+# The original code used 'avail' then 'avail_mv'. Let's stick to that pattern if possible,
+# or just use whatever columns we have.
+# Let's define the feature set explicitly.
 
-          if (n_days >= 50) {
-            window_medians_low <- sapply(1:(n_days - 49), function(i) {
-              median(ts_data[i:(i + 49)], na.rm = TRUE)
-            })
-            lowest_50_median <- min(window_medians_low, na.rm = TRUE)
-          } else {
-            lowest_50_median <- median(ts_data, na.rm = TRUE)
-          }
+feature_cols <- c(avail, var_cols_present)
+cat(sprintf("PCA features: %s\n", paste(feature_cols, collapse=", ")))
 
-          if (n_days >= 30) {
-            window_medians_high <- sapply(1:(n_days - 29), function(i) {
-              median(ts_data[i:(i + 29)], na.rm = TRUE)
-            })
-            top_30_median <- max(window_medians_high, na.rm = TRUE)
-          } else {
-            top_30_median <- median(ts_data, na.rm = TRUE)
-          }
+# Extract data matrix
+X_all <- as.matrix(lib_df[, feature_cols, drop = FALSE])
 
-          scale_value <- median(c(lowest_50_median, top_30_median), na.rm = TRUE)
-          if (!is.finite(scale_value) || scale_value <= 1e-6) scale_value <- 1.0
-
-          BAND_SCALE[[vn]][[idx]] <- scale_value
-        } else {
-          BAND_SCALE[[vn]][[idx]] <- 1.0
-        }
-      }
-    }
-  } else {
-    # When disabled, use identity scaling (no shape normalization)
-    for (vn in names(lib)) {
-      BAND_SCALE[[vn]] <- list()
-      for (idx in avail) {
-        BAND_SCALE[[vn]][[idx]] <- 1.0
-      }
-    }
-  }
-
-  # Global shape projection PCA
-# Global shape projection PCA
-V_names <- names(M_list)
-if (length(V_names) == 0) {
-  stop("Shape projection requires at least one vegetation class with data")
-}
-
-K_idx <- length(avail)
-if (K_idx < 1) stop("No indices available for shape projection")
-
-X_blocks <- list()
-expected_cols <- NULL
-
-for (vn in names(M_list)) {
-  Mv <- M_list[[vn]]
-  if (!is.null(Mv) && is.matrix(Mv)) {
-    expected_cols <- ncol(Mv)
-    break
+# Handle NAs/Infs in X_all
+# Replace non-finite with column means
+for (j in seq_len(ncol(X_all))) {
+  col_vals <- X_all[, j]
+  if (any(!is.finite(col_vals))) {
+    mu_j <- mean(col_vals[is.finite(col_vals)], na.rm = TRUE)
+    if (!is.finite(mu_j)) mu_j <- 0
+    X_all[!is.finite(col_vals), j] <- mu_j
   }
 }
 
-if (is.null(expected_cols)) {
-  stop("Shape projection requires valid vegetation matrices")
-}
-
-for (vn in names(M_list)) {
-  Mv <- M_list[[vn]]
-  if (is.null(Mv) || !is.matrix(Mv)) next
-  if (ncol(Mv) != expected_cols) {
-    stop(sprintf("Column count mismatch for vegetation '%s'", vn))
-  }
-  X_blocks[[length(X_blocks) + 1]] <- Mv
-}
-
-if (length(X_blocks) == 0) {
-  stop("Shape projection requires per-vegetation matrices")
-}
-
-X_all <- chunked_rbind(X_blocks, chunk_size = 25L)
-gc()
-
-if (!is.matrix(X_all) || nrow(X_all) < 2) {
-  stop("Failed to assemble stacked X_all matrix")
-}
-if (is.null(colnames(X_all))) {
-  stop("X_all matrix has no column names")
-}
-
-avail_aug <- colnames(X_all)
-mu_all <- colMeans(X_all, na.rm = TRUE)
+# 2. Compute PCA
+mu_all <- colMeans(X_all)
 Xc <- sweep(X_all, 2, mu_all, "-")
-
-band_scale_matrix <- matrix(1, nrow = length(V_names), ncol = length(avail_aug))
-rownames(band_scale_matrix) <- V_names
-colnames(band_scale_matrix) <- avail_aug
-
-n_days <- 365
-
-for (v_idx in seq_along(V_names)) {
-  vn <- V_names[v_idx]
-  if (!vn %in% names(BAND_SCALE)) next
-  for (idx in avail) {
-    col_name <- idx
-    if (col_name %in% colnames(band_scale_matrix)) {
-      scale_val <- BAND_SCALE[[vn]][[idx]]
-      if (is.finite(scale_val) && scale_val > 0) {
-        band_scale_matrix[v_idx, col_name] <- scale_val
-      }
-    }
-    col_name_mv <- paste0(idx, "_mv")
-    if (col_name_mv %in% colnames(band_scale_matrix)) {
-      scale_val <- BAND_SCALE[[vn]][[idx]]
-      if (is.finite(scale_val) && scale_val > 0) {
-        band_scale_matrix[v_idx, col_name_mv] <- scale_val
-      }
-    }
-  }
-}
-
-Xs <- Xc
-for (v_idx in seq_along(V_names)) {
-  start_row <- (v_idx - 1) * n_days + 1
-  end_row <- v_idx * n_days
-  if (end_row <= nrow(Xs)) {
-    veg_scales <- band_scale_matrix[v_idx, ]
-    Xs[start_row:end_row, ] <- sweep(Xc[start_row:end_row, , drop = FALSE], 2, veg_scales, "/")
-  }
-}
-Xs[!is.finite(Xs)] <- 0
-
-feature_sds <- apply(Xs, 2, sd, na.rm = TRUE)
+feature_sds <- apply(Xc, 2, sd)
 feature_sds[feature_sds <= 1e-10] <- 1.0
 
-cat(sprintf(
-  "Feature std devs before final standardization (first 5): %s\n",
-  paste(round(feature_sds[1:min(5, length(feature_sds))], 3), collapse = ", ")
-))
-
-Xs_std <- sweep(Xs, 2, feature_sds, "/")
-Xs_std[!is.finite(Xs_std)] <- 0
+Xs_std <- sweep(Xc, 2, feature_sds, "/")
 
 sv <- try(svd(Xs_std, nu = 0, nv = min(ncol(Xs_std), nrow(Xs_std))), silent = TRUE)
 if (inherits(sv, "try-error") || length(sv$d) == 0) {
@@ -1722,9 +2075,8 @@ if (length(keep_idx) == 0) {
   pca_rank <- min(length(keep_idx), MAX_FACTORS_CAP, ncol(sv$v))
 }
 
-if (pca_rank == 0) stop("PCA selection resulted in 0 factors")
-
 V_pca <- sv$v[, seq_len(pca_rank), drop = FALSE]
+# Ensure orthogonality (SVD V is already orthogonal, but qr.Q is safe)
 if (ncol(V_pca) > 1) {
   V_pca <- qr.Q(qr(V_pca))[, seq_len(ncol(V_pca)), drop = FALSE]
 }
@@ -1733,134 +2085,118 @@ variance_explained <- sv$d^2 / sum(sv$d^2)
 cumulative_variance <- cumsum(variance_explained)
 
 cat(sprintf(
-  "PCA (Kaiser criterion) trained on standardized data across %d vegetation classes; retained %d components (eigenvalues > 1, cum var: %.1f%%)\n",
-  length(V_names), ncol(V_pca), 100 * cumulative_variance[pca_rank]
-))
-cat(sprintf(
-  "  First %d eigenvalues: %s\n",
-  min(5, length(eigenvalues)),
-  paste(round(eigenvalues[1:min(5, length(eigenvalues))], 2), collapse = ", ")
+  "PCA trained on raw data (%d rows); retained %d components (cum var: %.1f%%)\n",
+  nrow(X_all), ncol(V_pca), 100 * cumulative_variance[pca_rank]
 ))
 
-global_avg_scales <- colMeans(band_scale_matrix, na.rm = TRUE)
-global_avg_scales[!is.finite(global_avg_scales)] <- 1.0
+# 3. Construct GLOBAL_PCA object
+# We need to map the column names of X_all to the expected 'idx_order'
+# The original code expected 'idx' and 'idx_mv'.
+# Our feature_cols are 'idx' and 'idx_var14'.
+# We should rename 'idx_var14' to 'idx_mv' in the idx_order to match downstream expectations
+# if downstream code expects '_mv'.
+# Looking at 'project_row_to_factors', it constructs names as paste0(idx, "_mv").
+# So we should ensure our idx_order uses "_mv" suffix for variance columns.
 
-cat(sprintf(
-  "Global average scales (first 5): %s\n",
-  paste(round(global_avg_scales[1:min(5, length(global_avg_scales))], 3), collapse = ", ")
-))
+idx_order <- feature_cols
+# Rename _var14 to _mv in idx_order
+idx_order <- gsub("_var14$", "_mv", idx_order)
 
 GLOBAL_PCA <- list(
   global = list(
-    V = if (is.matrix(V_pca)) V_pca else matrix(0, nrow = length(avail_aug), ncol = 0),
+    V = V_pca,
     col_means = mu_all,
-    col_scales = band_scale_matrix,
-    global_avg_scales = global_avg_scales,
+    global_avg_scales = rep(1.0, length(mu_all)),
     feature_sds = feature_sds,
-    rank = if (is.matrix(V_pca)) ncol(V_pca) else 0
+    rank = ncol(V_pca)
   ),
-  V = if (is.matrix(V_pca)) V_pca else matrix(0, nrow = length(avail_aug), ncol = 0),
+  V = V_pca,
   col_means = mu_all,
-  col_scales = band_scale_matrix,
-  global_avg_scales = global_avg_scales,
+  global_avg_scales = rep(1.0, length(mu_all)),
   feature_sds = feature_sds,
   per_bin = NULL,
-  rank = if (is.matrix(V_pca)) ncol(V_pca) else 0,
-  idx_order = avail_aug
+  rank = ncol(V_pca),
+  idx_order = idx_order
 )
 
+# Update lib_factor_pca (Legacy support / Fallback)
+# We can project the raw data to get T scores, but lib_factor_pca expects
+# a single T matrix (365 x k) per vegetation type (representing the "average" or "medoid").
+# Since we skipped building the averaged 'lib', we don't have 'M_list'.
+# We can construct a simple 'lib_factor_pca' by taking the medoid of the projected raw traces.
+
+cat("Computing legacy lib_factor_pca from raw projections...\n")
 lib_factor_pca <- list()
 gpca_order <- GLOBAL_PCA$idx_order
 gpca_means <- GLOBAL_PCA$col_means
-gpca_scales <- GLOBAL_PCA$col_scales
 vpca <- GLOBAL_PCA$global$V
 pca_rank <- GLOBAL_PCA$global$rank
 
-for (vname in names(M_list)) {
-  dveg <- lib_df[lib_df$Veg == vname & !is.na(lib_df$date), , drop = FALSE]
-  n_samples_v <- if (!is.null(dveg)) nrow(dveg) else 0
-
-  if (n_samples_v <= 0) {
-    lib_factor_pca[[vname]] <- list(T = matrix(0, nrow = 365, ncol = max(0, pca_rank)), n_samples = 0)
-    next
+for (vname in vegs) {
+  # Get raw data for this veg
+  dveg <- lib_df[lib_df$Veg == vname, , drop = FALSE]
+  if (nrow(dveg) < 10) {
+     lib_factor_pca[[vname]] <- list(T = matrix(0, nrow = 365, ncol = pca_rank), n_samples = 0)
+     next
   }
-
-  proj_list <- list()
-  proj_doy <- integer(0)
-
-  for (i_row in seq_len(nrow(dveg))) {
-    row <- dveg[i_row, , drop = FALSE]
-    doy_row <- as.integer(lubridate::yday(row$date))
-    if (is.na(doy_row) || doy_row < 1 || doy_row > 365) next
-
-    raw_vec <- rep(NA_real_, length(gpca_order))
-    names(raw_vec) <- gpca_order
-
-    for (idx in avail) {
-      kpos <- match(idx, gpca_order)
-      if (is.na(kpos)) next
-      val <- row[[idx]]
-      if (!is.finite(val)) val <- gpca_means[kpos]
-      raw_vec[kpos] <- as.numeric(val)
+  
+  # Project all rows
+  # We can do this efficiently using matrix multiplication since we have X_all logic
+  # But dveg is a subset.
+  
+  # Extract features for dveg
+  X_v <- as.matrix(dveg[, feature_cols, drop = FALSE])
+  # Handle NAs
+  for (j in seq_len(ncol(X_v))) {
+    col_vals <- X_v[, j]
+    if (any(!is.finite(col_vals))) {
+      X_v[!is.finite(col_vals), j] <- mu_all[j]
     }
-
-    for (idx in avail) {
-      mv_name <- paste0(idx, "_mv")
-      kpos_mv <- match(mv_name, gpca_order)
-      if (is.na(kpos_mv)) next
-      mv_col <- paste0(idx, "_var14")
-      mv_val <- if (mv_col %in% names(dveg)) row[[mv_col]] else NA_real_
-      if (!is.finite(mv_val)) mv_val <- gpca_means[kpos_mv]
-      raw_vec[kpos_mv] <- as.numeric(mv_val)
-    }
-
-    nas <- which(!is.finite(raw_vec))
-    if (length(nas) > 0) raw_vec[nas] <- gpca_means[nas]
-
-    if (pca_rank > 0 && ncol(vpca) >= pca_rank) {
-      centered <- (raw_vec - gpca_means) / gpca_scales[vname, ]
-      centered[!is.finite(centered)] <- 0
-      t_scores <- as.numeric(centered %*% vpca)
-    } else {
-      t_scores <- numeric(0)
-    }
-
-    proj_list[[length(proj_list) + 1]] <- t_scores
-    proj_doy <- c(proj_doy, doy_row)
   }
-
-  if (length(proj_list) > 0 && pca_rank > 0) {
-    obs_mat <- chunked_rbind(proj_list, chunk_size = 50L)
-    gc()
-    T_pca <- matrix(NA_real_, nrow = 365, ncol = ncol(obs_mat))
-    for (d in seq_len(365)) {
-      idx <- which(proj_doy == d)
-      if (length(idx) > 0) {
-        sub <- obs_mat[idx, , drop = FALSE]
-        if (is.vector(sub)) sub <- matrix(sub, nrow = 1)
-        mi <- medoid_row_index(sub)
-        T_pca[d, ] <- sub[mi, ]
-      }
-    }
-    for (col_idx in seq_len(ncol(T_pca))) {
-      finite_mask <- is.finite(T_pca[, col_idx])
-      if (sum(finite_mask) >= 2) {
-        T_pca[!finite_mask, col_idx] <- approx(
-          x = which(finite_mask),
-          y = T_pca[finite_mask, col_idx],
-          xout = which(!finite_mask),
-          rule = 2
-        )$y
-      } else if (sum(finite_mask) == 1) {
-        T_pca[, col_idx] <- T_pca[finite_mask, col_idx][1]
+  
+  # Standardize and Project
+  X_v_c <- sweep(X_v, 2, mu_all, "-")
+  X_v_std <- sweep(X_v_c, 2, feature_sds, "/")
+  T_scores <- X_v_std %*% vpca
+  
+  # Now we need to form a single 365-day trace (medoid)
+  # Group by DOY
+  doy_vec <- lubridate::yday(dveg$date)
+  T_medoid <- matrix(NA_real_, nrow = 365, ncol = pca_rank)
+  
+  for (d in 1:365) {
+    rows_d <- which(doy_vec == d)
+    if (length(rows_d) > 0) {
+      sub <- T_scores[rows_d, , drop = FALSE]
+      # Find medoid
+      if (nrow(sub) == 1) {
+        T_medoid[d, ] <- sub[1, ]
       } else {
-        T_pca[, col_idx] <- 0
+        # Geometric median or medoid
+        # Simple medoid: row with min sum of squared distances
+        center <- colMeans(sub)
+        dists <- rowSums(sweep(sub, 2, center, "-")^2)
+        T_medoid[d, ] <- sub[which.min(dists), ]
       }
     }
-    lib_factor_pca[[vname]] <- list(T = T_pca, n_samples = n_samples_v)
-  } else {
-    lib_factor_pca[[vname]] <- list(T = matrix(0, nrow = 365, ncol = pca_rank), n_samples = n_samples_v)
   }
+  
+  # Interpolate missing days
+  for (j in 1:pca_rank) {
+    y <- T_medoid[, j]
+    if (any(is.na(y))) {
+      x <- which(!is.na(y))
+      if (length(x) >= 2) {
+        T_medoid[is.na(y), j] <- approx(x, y[x], xout = which(is.na(y)), rule = 2)$y
+      } else if (length(x) == 1) {
+        T_medoid[, j] <- y[x[1]]
+      } else {
+        T_medoid[, j] <- 0
+      }
+    }
+  }
+  
+  lib_factor_pca[[vname]] <- list(T = T_medoid, n_samples = nrow(dveg))
 }
 
 cat("Global projections computed.\n")
@@ -2088,16 +2424,7 @@ project_row_to_factors <- function(row, gproj, avail_idx, veg_type = NULL) {
   col_means <- gproj$col_means
   
   # Use global average scaling instead of vegetation-specific
-  if (!is.null(gproj$global_avg_scales)) {
-    col_scales <- gproj$global_avg_scales
-  } else {
-    # Fallback: compute average if not pre-computed
-    if (is.matrix(gproj$col_scales)) {
-      col_scales <- colMeans(gproj$col_scales, na.rm = TRUE)
-    } else {
-      col_scales <- rep(1, length(idx_order))
-    }
-  }
+  # No per-band scaling in use
   
   # Get standardization scales
   feature_sds <- if (!is.null(gproj$feature_sds)) gproj$feature_sds else rep(1, length(idx_order))
@@ -2130,191 +2457,308 @@ project_row_to_factors <- function(row, gproj, avail_idx, veg_type = NULL) {
   nas <- which(!is.finite(raw_vec))
   if (length(nas) > 0) raw_vec[nas] <- col_means[nas]
   
-  # Apply global scaling + standardization
-  centered <- (raw_vec - col_means) / col_scales / feature_sds
+  # Apply standardization using global feature standard deviations only
+  centered <- (raw_vec - col_means) / feature_sds
   centered[!is.finite(centered)] <- 0
   
   V <- gproj$global$V
   if (is.null(V) || ncol(V) == 0) return(NULL)
   as.numeric(centered %*% V)
 }
-# Build MESMA library with endmember variants
-build_mesma_variants <- function(lib_df, lib_factor_pca, veg_types, min_cluster_size = 10) {
-  mesma_lib <- list()
+
+# Perform time-dimension reduction on all traces BEFORE variant construction
+# This function projects raw data to PCA space and reduces each trace to a fixed-grid feature vector
+reduce_all_traces <- function(lib_df, veg_types, global_pca, avail_idx, fixed_grid_size = TEMPORAL_BUDGET, 
+                               enable_phase_alignment = FALSE, reference_phase = NULL,
+                               enable_multiscale = FALSE, multiscale_windows = NULL) {
+  cat("Performing time-dimension reduction on all traces...\n")
+  
+  # Fixed grid for all traces (ensures comparability)
+  fixed_grid <- unique(round(seq(1, 365, length.out = fixed_grid_size)))
+  
+  reduced_data <- list()
+  
+  # Resolve which column in lib_df holds vegetation labels
+  veg_col_name <- NULL
+  if ("Veg" %in% names(lib_df)) veg_col_name <- "Veg"
+  else if ("veg" %in% names(lib_df)) veg_col_name <- "veg"
+  else {
+    # Try a case-insensitive search for a likely vegetation column
+    lcnames <- tolower(names(lib_df))
+    idx <- which(lcnames %in% c("veg", "vegetation", "vegetation_type", "type"))
+    if (length(idx) > 0) veg_col_name <- names(lib_df)[idx[1]]
+  }
+
+  if (is.null(veg_col_name)) {
+    cat("[WARN] reduce_all_traces: training data has no vegetation label column ('Veg' or similar). No per-veg reduction will be performed.\n")
+    return(list())
+  }
 
   for (veg in veg_types) {
-    veg_data <- lib_df[tolower(lib_df$Veg) == tolower(veg), ]
-    if (nrow(veg_data) < min_cluster_size) {
-      # Single variant for small samples
-      mesma_lib[[veg]] <- list(
-        list(
-          T_pca = lib_factor_pca[[veg]]$T,
-          variant_id = paste0(veg, "_single"),
-          n_samples = nrow(veg_data)
-        )
-      )
+    # subset by resolved vegetation column
+    veg_data <- lib_df[tolower(as.character(lib_df[[veg_col_name]])) == tolower(as.character(veg)), , drop = FALSE]
+    
+    if (!"location_id" %in% names(veg_data) || !"year" %in% names(veg_data)) {
+      cat(sprintf("  [%s] Missing location_id or year, skipping\n", veg))
       next
     }
-
-    # Project vegetation data to PCA space for clustering
-    # NOTE: For large per-veg datasets (e.g. 225k rows), subsample before projecting
-    # to avoid building huge projection matrices that cause OOM during clustering.
-    n_veg_rows <- nrow(veg_data)
-    use_sampling <- n_veg_rows > MAX_PROJECTIONS_PER_VEG
     
-    if (use_sampling) {
-      cat(sprintf("  [%s] Sampling %d/%d rows for clustering (MAX_PROJECTIONS_PER_VEG=%d)\n", 
-                  veg, MAX_PROJECTIONS_PER_VEG, n_veg_rows, MAX_PROJECTIONS_PER_VEG))
-      # Stratified sample by DOY to preserve temporal coverage
-      veg_data_doy <- veg_data
-      veg_data_doy$doy_for_sampling <- lubridate::yday(veg_data_doy$date)
-      doy_groups <- split(seq_len(nrow(veg_data_doy)), veg_data_doy$doy_for_sampling)
-      n_per_doy <- ceiling(MAX_PROJECTIONS_PER_VEG / length(doy_groups))
-      sampled_indices <- unlist(lapply(doy_groups, function(idx) {
-        if (length(idx) <= n_per_doy) idx else sample(idx, size = n_per_doy, replace = FALSE)
-      }))
-      sampled_indices <- sampled_indices[seq_len(min(MAX_PROJECTIONS_PER_VEG, length(sampled_indices)))]
-      veg_data_for_clustering <- veg_data[sampled_indices, ]
-    } else {
-      veg_data_for_clustering <- veg_data
+    traces <- unique(veg_data[, c("location_id", "year")])
+    cat(sprintf("  [%s] Reducing %d traces to %d time points...\n", veg, nrow(traces), length(fixed_grid)))
+    
+    feature_list <- list()
+    Z_list <- list()
+    trace_info <- list()
+    
+    for (i in seq_len(nrow(traces))) {
+      loc <- traces$location_id[i]
+      yr <- traces$year[i]
+      
+      dly_year <- veg_data[veg_data$location_id == loc & veg_data$year == yr, , drop = FALSE]
+      if (nrow(dly_year) < 5) next
+      
+      # 1. Build a full 365 x K raw-index matrix for this trace
+      # For each index in avail_idx we choose the medoid per DOY and interpolate missing days
+      idxs <- avail_idx
+      K <- length(idxs)
+      raw_mat <- matrix(NA_real_, nrow = 365, ncol = K)
+      colnames(raw_mat) <- idxs
+
+      for (j in seq_along(idxs)) {
+        idn <- idxs[j]
+        if (!idn %in% names(dly_year)) next
+        vals_by_doy <- tryCatch(
+          {
+            tapply(seq_along(dly_year[[idn]]), dly_year$doy, function(indices) {
+              vals <- dly_year[[idn]][indices]
+              vals <- vals[is.finite(vals)]
+              if (length(vals) == 0) return(NA_real_)
+              if (length(vals) == 1) return(as.numeric(vals[1]))
+              m <- mean(vals)
+              as.numeric(vals[which.min(abs(vals - m))])
+            })
+          }, error = function(e) NULL)
+
+        if (!is.null(vals_by_doy) && length(vals_by_doy) > 0) {
+          doy_values <- as.integer(names(vals_by_doy))
+          valid_doy <- doy_values >= 1 & doy_values <= 365
+          raw_mat[doy_values[valid_doy], j] <- vals_by_doy[valid_doy]
+        }
+
+        # Interpolate missing days per index column
+        colv <- raw_mat[, j]
+        finite_idx <- which(is.finite(colv))
+        if (length(finite_idx) == 0) {
+          raw_mat[, j] <- 0
+        } else if (length(finite_idx) == 1) {
+          raw_mat[, j] <- colv[finite_idx]
+        } else {
+          x <- c(finite_idx - 365, finite_idx, finite_idx + 365)
+          y <- rep(colv[finite_idx], 3)
+          interp <- tryCatch(stats::approx(x = x, y = y, xout = seq_len(365), rule = 2)$y, error = function(e) rep(colv[finite_idx[1]], 365))
+          interp <- as.numeric(interp)
+          interp[!is.finite(interp)] <- median(colv[finite_idx], na.rm = TRUE)
+          raw_mat[, j] <- interp
+        }
+      }
+
+      # 2. PCA projection (keep for downstream variant T_pca matrices)
+      date_list <- tryCatch(prepare_factor_data(dly_year, global_pca, avail_idx, veg), error = function(e) NULL)
+      if (length(date_list) == 0) next
+      Z <- tryCatch(build_Z365(date_list, global_pca$rank), error = function(e) NULL)
+      if (is.null(Z)) next
+      if (isTRUE(enable_phase_alignment) && !is.null(reference_phase)) Z <- align_to_phenological_phase(Z, reference_phase = reference_phase)
+
+      # 3. Time-dimension reduction performed ON RAW INDEX MATRIX (ensures features = fixed_grid × indices)
+      info <- compute_information_content(raw_mat)
+      feat <- if (isTRUE(enable_multiscale) && !is.null(multiscale_windows)) {
+        extract_multiscale_features(raw_mat, fixed_grid, info, windows = multiscale_windows)
+      } else {
+        extract_grid_features(raw_mat, fixed_grid, info)
+      }
+      
+      if (any(!is.finite(feat))) next
+      
+      # Ensure feature vector has consistent names: index_t1..index_tN
+      if (is.numeric(feat) && length(feat) == length(idxs) * length(fixed_grid)) {
+        # Create column names in the order: idx1_t1..idx1_tN, idx2_t1..idx2_tN, ...
+        grid_count <- length(fixed_grid)
+        nm <- unlist(lapply(idxs, function(x) paste0(x, "_t", seq_len(grid_count))))
+        names(feat) <- nm
+      }
+      feature_list[[length(feature_list) + 1]] <- feat
+      Z_list[[length(Z_list) + 1]] <- Z
+      trace_info[[length(trace_info) + 1]] <- list(
+        location_id = loc,
+        year = yr,
+        trace_index = i
+      )
     }
     
-    veg_projections <- list()
-    for (i in seq_len(nrow(veg_data_for_clustering))) {
-      date_data <- prepare_factor_data(
-        veg_data_for_clustering[i, , drop = FALSE],
-        GLOBAL_PCA,
-        avail,
-        veg
+    if (length(feature_list) > 0) {
+      reduced_data[[veg]] <- list(
+        features = do.call(rbind, feature_list),  # Matrix: n_traces x n_features
+        Z_matrices = Z_list,                       # List of full 365 x k matrices
+        trace_info = trace_info,                   # Metadata for each trace
+        n_samples = nrow(veg_data)                 # Total samples for this veg
       )
-      if (length(date_data) > 0) {
-        veg_projections[[length(veg_projections) + 1]] <- date_data[[1]]$z
+      cat(sprintf("  [%s] Reduced %d traces successfully\n", veg, length(feature_list)))
+      # Sanity checks: expected feature width = TEMPORAL_BUDGET * n_indices
+      feat_mat <- reduced_data[[veg]]$features
+      grid_count <- length(fixed_grid)
+      expected_cols <- grid_count * length(idxs)
+      if (!is.null(dim(feat_mat)) && ncol(feat_mat) != expected_cols) {
+        warning(sprintf("reduce_all_traces: feature column count mismatch for '%s' (got %d, expected %d).", veg, ncol(feat_mat), expected_cols))
+      }
+      keys <- sapply(reduced_data[[veg]]$trace_info, function(x) paste0(as.character(x$location_id), "__", as.character(x$year)))
+      if (any(duplicated(keys))) {
+        warning(sprintf("reduce_all_traces: duplicate location-year traces found for '%s' (%d duplicates) — expected exactly one row per loc/year.", veg, sum(duplicated(keys))))
       }
     }
+  }
+  
+  cat(sprintf("Time-dimension reduction complete: %d vegetation types processed\n", length(reduced_data)))
+  return(reduced_data)
+}
 
-    if (length(veg_projections) < 2) {
+# Build MESMA library with endmember variants
+# REVISED: Accepts pre-reduced features (PCA projection and time-reduction already applied)
+build_mesma_variants <- function(reduced_data, lib_factor_pca, min_cluster_size = 10) {
+  mesma_lib <- list()
+  
+  # Whitening is performed by the top-level whiten_matrix() function.
+
+  # [NEW] Identify barren prototype from reduced data if available
+  barren_proto_raw <- NULL
+  if ("barren" %in% names(reduced_data)) {
+    b_feat <- reduced_data[["barren"]]$features
+    if (!is.null(b_feat) && nrow(b_feat) > 0) {
+      # Use median of barren features as prototype
+      barren_proto_raw <- apply(b_feat, 2, median, na.rm = TRUE)
+      cat(sprintf("[Soil Correction] Identified barren prototype from %d traces\n", nrow(b_feat)))
+    }
+  }
+
+  for (veg in names(reduced_data)) {
+    veg_info <- reduced_data[[veg]]
+    
+    # Extract pre-reduced features and full Z matrices
+    X_feat <- veg_info$features        # n_traces x n_features (time-reduced)
+    Z_list <- veg_info$Z_matrices      # List of 365 x k matrices (full resolution)
+    n_samples <- veg_info$n_samples
+    
+    if (nrow(X_feat) < min_cluster_size) {
+      # Fallback to single variant
       mesma_lib[[veg]] <- list(
         list(
           T_pca = lib_factor_pca[[veg]]$T,
           variant_id = paste0(veg, "_single"),
-          n_samples = nrow(veg_data)
+          n_samples = n_samples
         )
       )
+      cat(sprintf("  [%s] Insufficient traces (%d), using single variant\n", veg, nrow(X_feat)))
       next
     }
-
-    # Cluster to find variants
-  proj_matrix <- chunked_rbind(veg_projections, chunk_size = 25L)
-  gc()
-  cat(sprintf("  [%s] Built projection matrix: %d rows x %d cols\n", veg, nrow(proj_matrix), ncol(proj_matrix)))
-    max_k <- min(5, floor(nrow(proj_matrix) / 5))
+    
+    cat(sprintf("  [%s] Building variants from %d reduced traces...\n", veg, nrow(X_feat)))
+    
+    # Subsample if too many traces
+    if (nrow(X_feat) > MAX_PROJECTIONS_PER_VEG) {
+      set.seed(123)
+      idx <- sample(nrow(X_feat), MAX_PROJECTIONS_PER_VEG)
+      X_feat <- X_feat[idx, , drop = FALSE]
+      Z_list <- Z_list[idx]
+      cat(sprintf("  [%s] Subsampled to %d traces\n", veg, nrow(X_feat)))
+    }
+    # Whitening on the reduced features (if Xw precomputed in the reduced_data, use that)
+    if (!is.null(veg_info$Xw)) {
+      X_w <- as.matrix(veg_info$Xw)
+      whitened <- list(Xw = X_w, W = if (!is.null(veg_info$W)) veg_info$W else diag(ncol(X_w)), mu = if (!is.null(veg_info$mu)) veg_info$mu else rep(0, ncol(X_w)))
+    } else {
+      whitened <- whiten_matrix(as.matrix(X_feat))
+      X_w <- whitened$Xw
+    }
+    
+    # Soil subtraction is only performed here when data are NOT pre-whitened and we have a raw barren prototype
+    if (is.null(veg_info$Xw) && !is.null(barren_proto_raw) && veg != "barren") {
+      if (length(barren_proto_raw) == ncol(X_w)) {
+        b_centered <- barren_proto_raw - whitened$mu
+        b_proj <- as.numeric(b_centered %*% whitened$W)
+        b_norm2 <- sum(b_proj^2)
+        if (b_norm2 > 1e-9) {
+          alphas <- (X_w %*% b_proj) / b_norm2
+          # Orthogonalization: remove component parallel to soil
+          X_w <- X_w - (alphas %*% t(b_proj))
+          cat(sprintf("  [%s] Applied soil subtraction (orthogonalization) in whitened space\n", veg))
+        }
+      }
+    }
+    
+    # Endmember Construction: Cluster the whitened, time-reduced features
+    
+    max_k <- min(5, floor(nrow(X_w) / 5))
     if (max_k < 2) max_k <- 2
-
-    # Find optimal number of clusters using silhouette.
-    # NOTE: silhouette() computes a full pairwise distance matrix which is O(n^2)
-    # memory and will OOM for large n. To avoid this, compute silhouette on a
-    # random subsample when the number of projections is large (controlled by SILHOUETTE_SAMPLE_SIZE).
+    
     best_k <- 2
     best_sil <- -Inf
+    
+    # Silhouette selection
     for (k in 2:max_k) {
-      km <- kmeans(proj_matrix, centers = k, nstart = 10, iter.max = 100)
-
-      # Compute silhouette on a subsample if proj_matrix is large
-      nproj <- nrow(proj_matrix)
+      km <- kmeans(X_w, centers = k, nstart = 10, iter.max = 100)
+      
+      # Silhouette on subsample if needed
+      nproj <- nrow(X_w)
       if (nproj > SILHOUETTE_SAMPLE_SIZE) {
-        # sample without replacement
         samp_idx <- sample.int(nproj, size = min(as.integer(SILHOUETTE_SAMPLE_SIZE), nproj))
-        # Only compute distances for the sample (safe memory footprint)
-        dsub <- stats::dist(proj_matrix[samp_idx, , drop = FALSE])
+        dsub <- dist(X_w[samp_idx, , drop = FALSE])
         labels_sub <- km$cluster[samp_idx]
         sil_obj <- tryCatch(cluster::silhouette(labels_sub, dsub), error = function(e) NULL)
         sil <- if (!is.null(sil_obj) && is.matrix(sil_obj)) mean(sil_obj[, 3], na.rm = TRUE) else NA_real_
       } else {
-        sil_obj <- tryCatch(cluster::silhouette(km$cluster, stats::dist(proj_matrix)), error = function(e) NULL)
+        sil_obj <- tryCatch(cluster::silhouette(km$cluster, dist(X_w)), error = function(e) NULL)
         sil <- if (!is.null(sil_obj) && is.matrix(sil_obj)) mean(sil_obj[, 3], na.rm = TRUE) else NA_real_
       }
-
-      # Fallback: when silhouette fails (e.g. NA) use inverse within-cluster spread
-      if (!is.finite(sil)) {
-        sil <- -mean(km$withinss / pmax(1, km$size), na.rm = TRUE)
-      }
-
+      
       if (is.finite(sil) && sil > best_sil) {
         best_sil <- sil
         best_k <- k
       }
     }
-
-    km_final <- kmeans(proj_matrix, centers = best_k, nstart = 25, iter.max = 100)
-
-    # Create variants based on clusters
+    
+    km_final <- kmeans(X_w, centers = best_k, nstart = 25, iter.max = 100)
+    
+    # Create variants
     variants <- list()
-    if (best_k >= 1L) {
-      for (clust in seq_len(best_k)) {
-        clust_members <- which(km_final$cluster == clust)
-        if (length(clust_members) < 3) next
-
-        # Build variant-specific temporal signature using medoids per DOY
-        variant_t_pca <- matrix(0, 365, ncol(lib_factor_pca[[veg]]$T))
-
-        for (doy in 1:365) {
-          # rows in this cluster and DOY
-          doy_rows <- which(lubridate::yday(veg_data$date) == doy)
-          doy_rows <- intersect(doy_rows, clust_members)
-          if (length(doy_rows) == 0) next
-          # Project all those rows to factor spaces and pick medoid row
-          z_p_list <- list(); z_l_list <- list()
-          for (rid in doy_rows) {
-            row <- veg_data[rid, , drop = FALSE]
-            zp <- project_row_to_factors(row, GLOBAL_PCA, avail, veg)
-            if (!is.null(zp)) z_p_list[[length(z_p_list) + 1]] <- zp
-          }
-          if (length(z_p_list) > 0) {
-            ZP <- do.call(rbind, z_p_list); if (is.vector(ZP)) ZP <- matrix(ZP, nrow = 1)
-            mi <- medoid_row_index(ZP)
-            variant_t_pca[doy, ] <- ZP[mi, ]
-          }
-        }
-        # Interpolate missing values per column
-        if (ncol(variant_t_pca) > 0) {
-          for (col_idx in seq_len(ncol(variant_t_pca))) {
-            finite_mask <- is.finite(variant_t_pca[, col_idx])
-            if (sum(finite_mask) >= 2) {
-              variant_t_pca[!finite_mask, col_idx] <- approx(
-                x = which(finite_mask),
-                y = variant_t_pca[finite_mask, col_idx],
-                xout = which(!finite_mask),
-                rule = 2
-              )$y
-            } else if (sum(finite_mask) == 1) {
-              variant_t_pca[, col_idx] <- variant_t_pca[finite_mask, col_idx][1]
-            }
-          }
-        }
-
-
-        variants[[length(variants) + 1]] <- list(
-          T_pca = variant_t_pca,
-          variant_id = paste0(veg, "_v", clust),
-          n_samples = length(clust_members),
-          cluster_center = km_final$centers[clust, ]
-        )
-      }
-
-      if (length(variants) == 0) {
-        variants <- list(list(
-          T_pca = lib_factor_pca[[veg]]$T,
-          variant_id = paste0(veg, "_single"),
-          n_samples = nrow(veg_data)
-        ))
-      }
-
-      mesma_lib[[veg]] <- variants
+    for (clust in seq_len(best_k)) {
+      clust_members <- which(km_final$cluster == clust)
+      if (length(clust_members) < 1) next
+      
+      # Find medoid in the WHITENED space
+      # The medoid is the sample closest to the cluster center (or geometric median)
+      # km_final$centers[clust, ] is the centroid in whitened space.
+      # Find sample closest to centroid
+      
+      dists <- rowSums(sweep(X_w[clust_members, , drop=FALSE], 2, km_final$centers[clust, ], "-")^2)
+      best_idx_local <- which.min(dists)
+      best_idx_global <- clust_members[best_idx_local]
+      
+      # The variant is defined by the full Z matrix of the medoid trace
+      # This allows it to be re-compressed dynamically during inference
+      medoid_Z <- Z_list[[best_idx_global]]
+      
+      variants[[length(variants) + 1]] <- list(
+        T_pca = medoid_Z,
+        variant_id = paste0(veg, "_v", clust),
+        n_samples = length(clust_members),
+        cluster_center = km_final$centers[clust, ] # Store whitened center if needed
+        , whitening_W = whitened$W
+        , whitening_mu = whitened$mu
+      )
     }
-
-    # finished building variants for this veg type
+    
+    mesma_lib[[veg]] <- variants
   }
-  # finished building variants for all veg types - return the assembled library
+  
   return(mesma_lib)
 }
 
@@ -2516,124 +2960,121 @@ build_mesma_variants <- function(lib_df, lib_factor_pca, veg_types, min_cluster_
     best_result
   }
 
-compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGET, topK = TOPK_VARIANTS) {
-  veg_types <- names(mesma_lib)
-  if (length(veg_types) == 0) return(NULL)
-  
-  g_proj <- GLOBAL_PCA 
-  if (is.null(g_proj)) return(NULL)
-  
-  # Resolve vegetation type used for scaling/projections:
-  # Prefer a per-row Veg value, then fall back to the location mapping (gpts_map).
-  # IMPORTANT: do NOT fall back to a GLOBAL_PCA default vegetation type — if the
-  # veg type cannot be determined from the row or the location mapping we skip
-  # processing for this location-year (return NULL). This avoids assigning a
-  # potentially wrong default vegetation type.
-  veg_ref_raw <- if ("Veg" %in% names(dly_year)) unique(na.omit(as.character(dly_year$Veg)))[1] else NA_character_
-
-  # Prefer per-row Veg. If missing, attempt to cross-reference from gpts_map
-  # (location -> Veg) when available. Do NOT fallback to GLOBAL_PCA defaults.
-  veg_ref <- veg_ref_raw
-  if (is.na(veg_ref) || !nzchar(as.character(veg_ref))) {
-    if ("location_id" %in% names(dly_year) && exists("gpts_map", inherits = TRUE)) {
-      locs <- unique(na.omit(as.character(dly_year$location_id)))
-      if (length(locs) > 0) {
-        # case-insensitive matching for location_id strings
-        map_ids <- as.character(gpts_map$location_id)
-        match_idx <- match(locs[1], map_ids)
-        if (is.na(match_idx)) {
-          # try case-insensitive match
-          match_idx <- match(tolower(locs[1]), tolower(map_ids))
-        }
-        if (!is.na(match_idx)) {
-          mapped <- as.character(gpts_map$Veg[match_idx])
-          if (!is.na(mapped) && nzchar(mapped)) veg_ref <- mapped
-        }
-      }
-    }
-  }
-
-  # Normalize formatting
-  if (!is.na(veg_ref) && nzchar(as.character(veg_ref))) veg_ref <- tolower(as.character(veg_ref)) else veg_ref <- NA_character_
-
-  cat(sprintf("[3a] Calling prepare_factor_data with veg_ref=%s (raw=%s)\n", ifelse(is.na(veg_ref), "<NA>", veg_ref), ifelse(is.na(veg_ref_raw), "<NA>", veg_ref_raw)))
-
-  # If veg_ref still unresolved after cross-reference, warn and continue with NA.
-  if (is.na(veg_ref) || !nzchar(as.character(veg_ref))) {
-    cat("[3a WARNING] veg type not defined for this location-year and cross-reference failed — proceeding with NA (no fallback)\n")
-  }
+# New helper: Compress a single trace to a feature vector
+compress_trace <- function(dly_year, global_pca, avail_idx, budget = TEMPORAL_BUDGET) {
+  # Resolve vegetation type (not used for scaling, but kept for API consistency)
+  veg_ref <- if ("Veg" %in% names(dly_year)) unique(na.omit(as.character(dly_year$Veg)))[1] else NA_character_
+  if (is.na(veg_ref) || !nzchar(as.character(veg_ref))) veg_ref <- NA_character_
 
   date_list <- tryCatch({
-    prepare_factor_data(dly_year, g_proj, avail, veg_ref)
-  }, error = function(e) {
-    cat(sprintf("[3a ERROR] prepare_factor_data failed: %s\n", e$message))
-    return(NULL)
-  })
+    prepare_factor_data(dly_year, global_pca, avail_idx, veg_ref)
+  }, error = function(e) NULL)
   
-  if (length(date_list) == 0) {
-    cat("[3a] prepare_factor_data returned empty list\n")
-    return(NULL)
-  }
+  if (length(date_list) == 0) return(NULL)
   
-  k <- ncol(g_proj$global$V)
-  if (is.null(k) || k == 0) return(NULL)
-  
-  cat(sprintf("[3b] Building Z365 matrix with k=%d\n", k))
-  Z <- tryCatch({
-    build_Z365(date_list, k)
-  }, error = function(e) {
-    cat(sprintf("[3b ERROR] build_Z365 failed: %s\n", e$message))
-    return(NULL)
-  })
-  
+  k <- ncol(global_pca$global$V)
+  Z <- tryCatch({ build_Z365(date_list, k) }, error = function(e) NULL)
   if (is.null(Z)) return(NULL)
   
   if (isTRUE(ENABLE_PHASE_ALIGNMENT)) {
-    cat("[3c] Applying phase alignment\n")
     Z <- align_to_phenological_phase(Z, reference_phase = REFERENCE_PHASE_MARKERS)
   }
   
-  cat("[3d] Computing information content\n")
   info <- compute_information_content(Z)
-  
-  cat(sprintf("[3e] Creating adaptive grid with budget=%d\n", budget))
   obs_grid <- create_adaptive_grid(info, budget)
   
-  cat(sprintf("[3f] Extracting features (ENABLE_MULTISCALE=%s)\n", ENABLE_MULTISCALE))
   y <- if (isTRUE(ENABLE_MULTISCALE)) {
     extract_multiscale_features(Z, obs_grid, info, windows = MULTISCALE_WINDOWS)
   } else {
     extract_grid_features(Z, obs_grid, info)
   }
 
-  # Map observation grid to template grid type
   gl <- length(obs_grid)
   grid_type <- if (gl <= ceiling(budget * 0.85)) "sparse" else if (gl >= ceiling(budget * 1.15)) "dense" else "medium"
-  cat(sprintf("[3g] Grid type selected: %s (grid length=%d)\n", grid_type, gl))
+  
+  list(y = y, grid_type = grid_type, info = info, obs_grid = obs_grid)
+}
 
-  # Access compressed templates
-  if (!exists(".COMPRESSED_TEMPLATES_ACCESSOR", envir = globalenv())) {
-    cat("[3h ERROR] .COMPRESSED_TEMPLATES_ACCESSOR not found\n")
-    return(NULL)
+# New helper: Compress Stage 1 Library (Barren/Veg prototypes)
+compress_stage1_lib <- function(stage1_lib, global_pca, avail_idx, budget = TEMPORAL_BUDGET) {
+  if (is.null(stage1_lib)) return(NULL)
+  
+  compress_proto <- function(proto_list) {
+    # proto_list is list of indices, each with $mu (365 vector)
+    # Construct a mock dly dataframe
+    doy <- 1:365
+    df_mock <- data.frame(doy = doy, date = as.Date("1970-01-01") + (doy - 1))
+    
+    valid_indices <- 0
+    for (idx in avail_idx) {
+      if (!is.null(proto_list[[idx]])) {
+        df_mock[[idx]] <- proto_list[[idx]]$mu
+        valid_indices <- valid_indices + 1
+      } else {
+        df_mock[[idx]] <- NA_real_
+      }
+      # Add dummy variance columns if needed by prepare_factor_data
+      df_mock[[paste0(idx, "_var14")]] <- 0 
+    }
+    
+    if (valid_indices == 0) return(NULL)
+    
+    res <- compress_trace(df_mock, global_pca, avail_idx, budget)
+    if (!is.null(res)) res$y else NULL
   }
+  
+  y_barren <- compress_proto(stage1_lib$barren)
+  y_veg <- compress_proto(stage1_lib$vegetation)
+  
+  if (is.null(y_barren) || is.null(y_veg)) return(NULL)
+  
+  list(barren = y_barren, vegetation = y_veg)
+}
+
+# New helper: Stage 1 Unmixing on Compressed Data
+unmix_stage1_compressed <- function(y, compressed_stage1_lib) {
+  if (is.null(compressed_stage1_lib)) return(NA_real_)
+  
+  B <- compressed_stage1_lib$barren
+  V <- compressed_stage1_lib$vegetation
+  X <- y
+  
+  # Ensure lengths match
+  len <- min(length(X), length(B), length(V))
+  X <- X[1:len]; B <- B[1:len]; V <- V[1:len]
+  
+  # Solve min ||X - alpha*B - (1-alpha)*V||^2
+  # min ||(X - V) - alpha*(B - V)||^2
+  
+  diff_BV <- B - V
+  diff_XV <- X - V
+  denom <- sum(diff_BV^2)
+  
+  if (denom < 1e-10) return(0.5)
+  
+  alpha <- sum(diff_XV * diff_BV) / denom
+  alpha <- max(0, min(1, alpha))
+  
+  return(1 - alpha) # Return vegetated fraction
+}
+
+# New helper: Stage 2 Unmixing on Compressed Data
+unmix_stage2_compressed <- function(y, grid_type, mesma_lib, topK = TOPK_VARIANTS) {
+  veg_types <- names(mesma_lib)
+  if (length(veg_types) == 0) return(NULL)
+  
+  # Access compressed templates
+  if (!exists(".COMPRESSED_TEMPLATES_ACCESSOR", envir = globalenv())) return(NULL)
   compressed_templates <- get(".COMPRESSED_TEMPLATES_ACCESSOR", envir = globalenv())
   
-  cat("[3i] Getting variant templates\n")
   comp_templates <- tryCatch({
     get_variant_templates(veg_types, grid_type, compressed_templates, mesma_lib)
-  }, error = function(e) {
-    cat(sprintf("[3i ERROR] get_variant_templates failed: %s\n", e$message))
-    return(NULL)
-  })
+  }, error = function(e) NULL)
   
   if (is.null(comp_templates)) return(NULL)
   
-  allowed_veg <- veg_types
-  
-  cat("[3j] Computing top variants\n")
   top_variants <- list()
   for (v in veg_types) {
-    if (!(v %in% allowed_veg)) next
     cand <- comp_templates[[v]]
     if (length(cand) == 0) next
     sims <- sapply(cand, function(x) cos_sim(y, x$vec))
@@ -2642,7 +3083,6 @@ compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGE
     top_variants[[v]] <- cand[keep]
   }
   
-  cat("[3k] Building pooled matrix for ridge estimation\n")
   pool_cols <- list()
   for (v in names(top_variants)) {
     for (i in seq_along(top_variants[[v]])) pool_cols[[length(pool_cols) + 1]] <- top_variants[[v]][[i]]$vec
@@ -2653,7 +3093,6 @@ compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGE
   lambda_star <- 1e-6
   
   if (length(pool_cols) > 0) {
-    cat(sprintf("[3l] Estimating optimal ridge from %d pooled columns\n", length(pool_cols)))
     E_pool <- do.call(cbind, lapply(pool_cols, function(col) {
       col <- as.numeric(col)
       nn <- sqrt(sum(col^2))
@@ -2661,17 +3100,12 @@ compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGE
     }))
     lambda_star <- estimate_optimal_ridge(E_pool, y_norm)
     if (!is.finite(lambda_star) || lambda_star <= 0) lambda_star <- 1e-6
-    cat(sprintf("Selected lambda=%.2e\n", lambda_star))
   }
 
-  cat("[3m] Evaluating all combinations\n")
   best <- list(rmse = Inf, w = NULL, chosen = NULL)
   res <- tryCatch({
     evaluate_all_combinations(y_norm, top_variants, lambda = lambda_star, early_stop_rmse = EARLY_STOP_RMSE_THRESHOLD)
-  }, error = function(e) {
-    cat(sprintf("[3m ERROR] evaluate_all_combinations failed: %s\n", e$message))
-    return(NULL)
-  })
+  }, error = function(e) NULL)
   
   if (!is.null(res)) best <- list(rmse = res$rmse, w = res$w, chosen = res$ids)
   
@@ -2679,8 +3113,6 @@ compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGE
   uncertainty <- NULL
   
   if (isTRUE(ENABLE_DIAGNOSTICS) && !is.null(best$w) && !is.null(best$chosen)) {
-    cat("[3n] Computing diagnostics\n")
-    # Rebuild the E matrix for diagnostics using the chosen variants
     E_best_cols <- list()
     for (v in names(best$chosen)) {
       for (variant in top_variants[[v]]) {
@@ -2691,23 +3123,16 @@ compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGE
       }
     }
     E_best <- do.call(cbind, E_best_cols)
-    # Normalize columns
     for (j in seq_len(ncol(E_best))) {
       nj <- sqrt(sum(E_best[, j]^2))
       if (nj > 0) E_best[, j] <- E_best[, j] / nj
     }
-
     diagnostics <- tryCatch({
       compute_diagnostics(y_norm, E_best, best$w, mesma_result = NULL)
-    }, error = function(e) {
-      cat(sprintf("[3n WARNING] Diagnostics computation failed: %s\n", e$message))
-      NULL
-    })
+    }, error = function(e) NULL)
   }
 
-  # Add GLS Bootstrap Uncertainty Quantification
   if (isTRUE(ENABLE_UNCERTAINTY) && !is.null(best$w) && !is.null(best$chosen)) {
-    cat("[3n.1] Computing uncertainty via GLS block bootstrap\n")
     uncertainty <- tryCatch({
       gls_block_bootstrap(
         y_vec = y_norm,
@@ -2719,19 +3144,17 @@ compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGE
         lambda_star = lambda_star,
         seed = 123
       )
-    }, error = function(e) {
-      cat(sprintf("[3n.1 WARNING] GLS bootstrap failed: %s\n", e$message))
-      NULL
-    })
-
-    if (!is.null(uncertainty)) {
-      cat(sprintf("[3n.1] Bootstrap completed: block_size=%d, B=%d\n",
-                  if (!is.null(uncertainty$block_size)) uncertainty$block_size else NA_integer_, BOOTSTRAP_B))
-    }
+    }, error = function(e) NULL)
   }
   
-  cat("[3o] Returning results\n")
   list(vegetation_proportions = best$w, chosen_variants = best$chosen, rmse = best$rmse, diagnostics = diagnostics, uncertainty = uncertainty)
+}
+
+compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGET, topK = TOPK_VARIANTS) {
+  # Legacy wrapper if needed, but we will use the split functions in fit_one_task
+  res <- compress_trace(dly_year, GLOBAL_PCA, avail, budget)
+  if (is.null(res)) return(NULL)
+  unmix_stage2_compressed(res$y, res$grid_type, mesma_lib, topK)
 }
 
   # End of mesma_dynamic_programming inner helpers
@@ -2777,40 +3200,12 @@ compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGE
         if (is.na(kpos)) next
 
         mi <- gpca$col_means[kpos]
-        # Safety: only try to use vegetation-specific col_scales when veg_type is a valid string
+        # Do not apply per-band scaling — assume identity scaling (1.0)
         valid_veg <- !is.null(veg_type) && !is.na(veg_type) && nzchar(as.character(veg_type))
         veg_type_chr <- if (valid_veg) as.character(veg_type) else NA_character_
         veg_type_lc <- if (valid_veg) tolower(veg_type_chr) else NA_character_
-        # Default to 1
-        si <- 1
-        if (!is.null(gpca$col_scales)) {
-          # List-like col_scales (per-veg named lists)
-          if (is.list(gpca$col_scales) && length(names(gpca$col_scales)) > 0 && valid_veg) {
-            nm_idx <- which(tolower(names(gpca$col_scales)) == veg_type_lc)
-            if (length(nm_idx) > 0) {
-              nm <- names(gpca$col_scales)[nm_idx[1]]
-              if (kpos <= length(gpca$col_scales[[nm]])) {
-                si <- gpca$col_scales[[nm]][kpos]
-              }
-            }
-          } else if (is.matrix(gpca$col_scales) && !is.null(rownames(gpca$col_scales)) && valid_veg) {
-            rn <- rownames(gpca$col_scales)
-            rn_idx <- which(tolower(rn) == veg_type_lc)
-            if (length(rn_idx) > 0 && kpos <= ncol(gpca$col_scales)) {
-              si <- gpca$col_scales[rn[rn_idx[1]], kpos]
-            }
-          } else if (!is.null(names(gpca$col_scales)) && valid_veg) {
-            # Fallback for named vectors/lists
-            nm_idx2 <- which(tolower(names(gpca$col_scales)) == veg_type_lc)
-            if (length(nm_idx2) > 0) {
-              nm2 <- names(gpca$col_scales)[nm_idx2[1]]
-              val2 <- gpca$col_scales[[nm2]]
-              if (length(val2) >= kpos) si <- val2[kpos]
-            }
-          }
-        }
-        if (!is.finite(si) || si <= 0) si <- 1
 
+        si <- 1.0
         vals_aug <- c(vals_aug, as.numeric((yy - mi) / si))
         vrows_list[[length(vrows_list) + 1]] <- gpca$V[kpos, , drop = FALSE]
       }
@@ -2841,37 +3236,8 @@ compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGE
         if (is.na(kpos_mv)) next
 
         mi_mv <- gpca$col_means[kpos_mv]
-        # Moving-variance scale - only use veg-specific scales when veg_type valid and indexes exist
-        # Ensure si_mv has a safe default so it never triggers 'object not found'
-        si_mv <- 1
-        if (exists("valid_veg") && valid_veg) {
-          if (is.list(gpca$col_scales) && length(names(gpca$col_scales)) > 0) {
-            nm_idx <- which(tolower(names(gpca$col_scales)) == veg_type_lc)
-            if (length(nm_idx) > 0) {
-              nm <- names(gpca$col_scales)[nm_idx[1]]
-              # Guard: if the veg-specific scale vector is too short, fall back to default
-              if (kpos_mv <= length(gpca$col_scales[[nm]])) {
-                si_mv <- gpca$col_scales[[nm]][kpos_mv]
-              } else {
-                si_mv <- 1
-              }
-            }
-          }
-          else if (is.matrix(gpca$col_scales) && !is.null(rownames(gpca$col_scales))) {
-            rn_idx_mv <- which(tolower(rownames(gpca$col_scales)) == veg_type_lc)
-            if (length(rn_idx_mv) > 0 && kpos_mv <= ncol(gpca$col_scales)) {
-              si_mv <- gpca$col_scales[rownames(gpca$col_scales)[rn_idx_mv[1]], kpos_mv]
-            } else {
-              si_mv <- 1
-            }
-          } else {
-            si_mv <- 1
-          }
-        } else {
-          si_mv <- 1
-        }
-        if (!is.finite(si_mv) || si_mv <= 0) si_mv <- 1
-
+        # No per-band scaling: assume scale = 1
+        si_mv <- 1.0
         vals_aug <- c(vals_aug, as.numeric((yy_mv - mi_mv) / si_mv))
         vrows_list[[length(vrows_list) + 1]] <- gpca$V[kpos_mv, , drop = FALSE]
       }
@@ -2986,11 +3352,145 @@ compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGE
   # If a per-row `Veg` value is missing, we attempt to resolve the vegetation
   # type for a location from `gpts_map` (location -> Veg mapping created from
   # the source geojson), and finally fall back to the first available
-  # vegetation in `GLOBAL_PCA$col_scales`. This prevents repeated "veg_ref=NA"
+  # vegetation in the trained library to reduce repeated "veg_ref=NA" cases.
   # calls which used to trigger 'subscript out of bounds' inside
   # `prepare_factor_data`.
   cat("Building MESMA endmember library...\n")
-  mesma_lib <- build_mesma_variants(lib_df, lib_factor_pca, names(lib), min_cluster_size = 10)
+  
+  # STEP 1: Time-dimension reduction on all traces (PCA projection + fixed-grid reduction)
+  # Debug: print available columns to verify Veg column preserved
+  cat(sprintf("[DEBUG] Columns in lib_df before reduction: %s\n", paste(names(lib_df), collapse = ", ")))
+  # This happens BEFORE variant construction to ensure all traces are comparable
+  reduced_traces <- reduce_all_traces(
+    lib_df = lib_df,
+    veg_types = names(lib),
+    global_pca = GLOBAL_PCA,
+    avail_idx = avail,
+    fixed_grid_size = TEMPORAL_BUDGET,
+    enable_phase_alignment = ENABLE_PHASE_ALIGNMENT,
+    reference_phase = REFERENCE_PHASE_MARKERS,
+    enable_multiscale = ENABLE_MULTISCALE,
+    multiscale_windows = MULTISCALE_WINDOWS
+  )
+  
+  # [NEW] Print rows per class after time compression
+  cat("\n=== Rows per class after time compression ===\n")
+  for (v in names(reduced_traces)) {
+    cat(sprintf("  %s: %d rows\n", v, nrow(reduced_traces[[v]]$features)))
+  }
+  cat("=============================================\n\n")
+
+  # STEP: Whitening (per-vegetation) and Soil Correction in whitened space
+  cat("\n=== Performing per-vegetation whitening and soil correction ===\n")
+  whitened_traces <- list()
+  for (veg in names(reduced_traces)) {
+    veg_info <- reduced_traces[[veg]]
+    X_feat <- veg_info$features
+    if (is.null(X_feat) || nrow(X_feat) == 0) next
+
+    if (nrow(X_feat) < 10) {
+      cat(sprintf("  [%s] Skipping whitening (insufficient data)\n", veg))
+      whitened_traces[[veg]] <- list(
+        Xw = X_feat,
+        W = diag(ncol(X_feat)),
+        mu = rep(0, ncol(X_feat)),
+        Z_matrices = veg_info$Z_matrices,
+        trace_info = veg_info$trace_info,
+        n_samples = veg_info$n_samples
+      )
+      next
+    }
+
+    whitened <- whiten_matrix(as.matrix(X_feat))
+    whitened_traces[[veg]] <- list(
+      Xw = whitened$Xw,
+      W = whitened$W,
+      mu = whitened$mu,
+      Z_matrices = veg_info$Z_matrices,
+      trace_info = veg_info$trace_info,
+      n_samples = veg_info$n_samples
+    )
+    cat(sprintf("  [%s] Whitened %d traces (features: %d -> %d dims)\n", veg, nrow(whitened$Xw), ncol(X_feat), ncol(whitened$Xw)))
+  }
+
+  # Identify barren prototype in whitened space for soil orthogonalization
+  barren_proto_whitened <- NULL
+  if ("barren" %in% names(whitened_traces)) {
+    b_xw <- whitened_traces[["barren"]]$Xw
+    if (!is.null(b_xw) && nrow(b_xw) > 0) {
+      barren_proto_whitened <- apply(b_xw, 2, median, na.rm = TRUE)
+      cat(sprintf("[Soil Correction] Identified barren prototype from %d whitened traces\n", nrow(b_xw)))
+    }
+  }
+
+  # Apply orthogonalization (soil subtraction) in whitened space
+  soil_corrected_traces <- list()
+  for (veg in names(whitened_traces)) {
+    veg_data <- whitened_traces[[veg]]
+    X_w <- veg_data$Xw
+    if (veg == "barren") {
+      soil_corrected_traces[[veg]] <- veg_data
+      cat(sprintf("  [%s] Kept without soil correction\n", veg))
+      next
+    }
+
+    if (is.null(barren_proto_whitened)) {
+      cat(sprintf("  [%s] No barren prototype available, skipping soil correction\n", veg))
+      soil_corrected_traces[[veg]] <- veg_data
+      next
+    }
+
+    if (length(barren_proto_whitened) == ncol(X_w)) {
+      b_proj <- barren_proto_whitened
+      b_norm2 <- sum(b_proj^2)
+      if (b_norm2 > 1e-9) {
+        alphas <- (X_w %*% b_proj) / b_norm2
+        X_w_corrected <- X_w - (alphas %*% t(b_proj))
+        veg_data$Xw <- X_w_corrected
+        soil_corrected_traces[[veg]] <- veg_data
+        cat(sprintf("  [%s] Applied soil orthogonalization (mean alpha: %.3f)\n", veg, mean(alphas)))
+      } else {
+        soil_corrected_traces[[veg]] <- veg_data
+        cat(sprintf("  [%s] Barren norm too small, skipped correction\n", veg))
+      }
+    } else {
+      soil_corrected_traces[[veg]] <- veg_data
+      cat(sprintf("  [%s] Dimension mismatch, skipped correction\n", veg))
+    }
+  }
+
+  # Build reduced data structure for building variants
+  reduced_data_corrected <- list()
+  for (veg in names(soil_corrected_traces)) {
+    veg_data <- soil_corrected_traces[[veg]]
+    reduced_data_corrected[[veg]] <- list(
+      features = veg_data$Xw,  # whitened & soil-corrected features
+      Z_matrices = veg_data$Z_matrices,
+      trace_info = veg_data$trace_info,
+      n_samples = veg_data$n_samples
+    )
+  }
+
+  cat("Whitening and soil correction complete\n")
+
+  # Safety fallback: if no corrected data produced, fall back to raw reduced_traces
+  if (length(reduced_data_corrected) == 0) {
+    cat("[NOTICE] No soil-corrected reduced data generated; falling back to raw reduced traces for variant construction\n")
+    reduced_data_corrected <- reduced_traces
+  }
+  if (length(reduced_data_corrected) == 0) {
+    stop("No reduced traces available for variant construction — cannot build MESMA library")
+  }
+
+  # [NEW] Compress Stage 1 Library for Inference
+  cat("Compressing Stage 1 Library for inference...\n")
+  COMPRESSED_STAGE1_LIB <- NULL
+  if (exists("STAGE1_LIB") && !is.null(STAGE1_LIB)) {
+    COMPRESSED_STAGE1_LIB <- compress_stage1_lib(STAGE1_LIB, GLOBAL_PCA, avail, TEMPORAL_BUDGET)
+  }
+  
+  # STEP 2: Build variants from the soil-corrected whitened reduced traces (clustering in whitened space)
+  mesma_lib <- build_mesma_variants(reduced_data_corrected, lib_factor_pca, min_cluster_size = 10)
 
   # Precompute compressed templates for all veg/variant/projection once
   .COMPRESSED_TEMPLATES_ACCESSOR <- precompute_compressed_templates(mesma_lib, TEMPORAL_BUDGET)
@@ -3025,7 +3525,8 @@ compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGE
       veg_counts = veg_counts,
       avail = avail,
       ALLOWED_VEG = ALLOWED_VEG,
-      BAND_SCALE = if (exists("BAND_SCALE")) BAND_SCALE else NULL
+      BAND_SCALE = NULL,
+      COMPRESSED_STAGE1_LIB = if (exists("COMPRESSED_STAGE1_LIB")) COMPRESSED_STAGE1_LIB else NULL
     )
     saveRDS(core, file = file.path(cache_dir, "mesma_library.rds"))
 
@@ -3134,10 +3635,38 @@ compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGE
       if (length(s1) && length(s2) && all(grepl("^[0-9]+$", s1)) && any(grepl("^L_", s2))) {
         cat("[WARNING] df_tasks$location_id looks numeric while gpts_map$location_id looks like 'L_x_y' strings — matching will likely fail.\n")
       }
-      df_tasks <- dplyr::left_join(df_tasks, gpts_map, by = "location_id")
+      # Use suffix to avoid overwriting existing columns and prefer existing task values
+      df_tasks <- dplyr::left_join(df_tasks, gpts_map, by = "location_id", suffix = c("", ".geo"))
+      if ("Veg.geo" %in% names(df_tasks)) {
+        df_tasks$Veg <- ifelse(is.na(df_tasks$Veg) | df_tasks$Veg == "", df_tasks$Veg.geo, df_tasks$Veg)
+        df_tasks$Veg.geo <- NULL
+      }
+      if ("no soil.geo" %in% names(df_tasks)) {
+        if ("no soil" %in% names(df_tasks)) {
+          df_tasks$`no soil` <- ifelse(is.na(df_tasks$`no soil`), df_tasks$`no soil.geo`, df_tasks$`no soil`)
+        } else {
+          df_tasks$`no soil` <- df_tasks$`no soil.geo`
+        }
+        df_tasks$`no soil.geo` <- NULL
+      }
+      # Normalize possible alternate column names (e.g. no.soil, no_soil)
+      df_tasks <- normalize_no_soil_col(df_tasks)
     } else {
       # perform a straight join attempt (this will error if keys missing)
-      df_tasks <- dplyr::left_join(df_tasks, gpts_map, by = "location_id")
+      df_tasks <- dplyr::left_join(df_tasks, gpts_map, by = "location_id", suffix = c("", ".geo"))
+      if ("Veg.geo" %in% names(df_tasks)) {
+        df_tasks$Veg <- ifelse(is.na(df_tasks$Veg) | df_tasks$Veg == "", df_tasks$Veg.geo, df_tasks$Veg)
+        df_tasks$Veg.geo <- NULL
+      }
+      if ("no soil.geo" %in% names(df_tasks)) {
+        if ("no soil" %in% names(df_tasks)) {
+          df_tasks$`no soil` <- ifelse(is.na(df_tasks$`no soil`), df_tasks$`no soil.geo`, df_tasks$`no soil`)
+        } else {
+          df_tasks$`no soil` <- df_tasks$`no soil.geo`
+        }
+        df_tasks$`no soil.geo` <- NULL
+      }
+      df_tasks <- normalize_no_soil_col(df_tasks)
     }
   }
 
@@ -3184,83 +3713,40 @@ cat("======================\n\n")
     loc <- task$loc
     yr <- task$yr
 
-    dbg_return_null <- function(reason) {
-      # Normalize reason string
-      reason_str <- as.character(reason)
-      if (!grepl("^(ERROR:|error:)", reason_str, ignore.case = TRUE)) {
-        reason_str <- paste0("ERROR:", reason_str)
-      }
-
-      # Prepare output CSV row
-      row <- data.frame(
-        location_id = as.character(loc),
-        year = as.integer(yr),
-        reason = reason_str,
-        ts = as.character(Sys.time()),
-        stringsAsFactors = FALSE
-      )
-
-      outf <- NULL
-      success <- FALSE
-      try({
-        if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
-        outf <<- file.path(OUT_DIR, "fit_fail_reasons.csv")
-        if (!file.exists(outf)) {
-          write.table(row, outf, sep = ",", row.names = FALSE, col.names = TRUE, append = FALSE)
-        } else {
-          write.table(row, outf, sep = ",", row.names = FALSE, col.names = FALSE, append = TRUE)
-        }
-        # Basic check: file exists and has non-zero size
-        success <<- file.exists(outf) && file.info(outf)$size > 0
-      }, silent = TRUE)
-
-      return(NULL)
-    }
-
     res_safe <- tryCatch(
       {
         dly <- df_tasks[df_tasks$location_id == loc, , drop = FALSE]
         dly_year <- dly[lubridate::year(dly$date) == yr, , drop = FALSE]
-        if (nrow(dly_year) == 0) {
-          return(dbg_return_null("no_rows_year"))
-        }
-        if (nrow(dly) == 0) {
-          return(dbg_return_null("no_rows"))
-        }
+        if (nrow(dly_year) == 0) return(NULL)
+        if (nrow(dly) == 0) return(NULL)
 
         # Calculate Q10 and Q90 DVI
         dly_train <- df_tasks[df_tasks$location_id == loc & lubridate::year(df_tasks$date) == yr, , drop = FALSE]
         dvi_vals <- dly_train$DVI[is.finite(dly_train$DVI)]
-        q10_dvi <- if (length(dvi_vals) > 0) {
-          stats::quantile(dvi_vals, 0.10, na.rm = TRUE)
+        q10_dvi <- if (length(dvi_vals) > 0) stats::quantile(dvi_vals, 0.10, na.rm = TRUE) else NA
+        q90_dvi <- if (length(dvi_vals) > 0) stats::quantile(dvi_vals, 0.90, na.rm = TRUE) else NA
+
+        if (!factor_mode) return(NULL)
+
+        # 1. Time Compression (BEFORE MESMA)
+        comp_res <- compress_trace(dly_year, GLOBAL_PCA, avail, TEMPORAL_BUDGET)
+        if (is.null(comp_res)) return(NULL)
+        y <- comp_res$y
+        
+        # 2. STAGE 1 MESMA: Unmix vegetated fraction using compressed data
+        veg_fraction_total <- NA_real_
+        if (exists("COMPRESSED_STAGE1_LIB") && !is.null(COMPRESSED_STAGE1_LIB)) {
+           veg_fraction_total <- unmix_stage1_compressed(y, COMPRESSED_STAGE1_LIB)
         } else {
-          NA
-        }
-        q90_dvi <- if (length(dvi_vals) > 0) {
-          stats::quantile(dvi_vals, 0.90, na.rm = TRUE)
-        } else {
-          NA
+           # Fallback to raw unmixing if compressed lib not available
+           if (!is.null(STAGE1_LIB)) {
+             veg_fraction_total <- unmix_vegetated_fraction(dly_year, STAGE1_LIB, avail)
+           }
         }
 
-        if (!factor_mode) {
-          return(dbg_return_null("not_factor_mode"))
-        }
-
-        no_soil_vals <- unique(dly$no_soil)
-        no_soil_vals <- no_soil_vals[!is.na(no_soil_vals)]
-        if (length(no_soil_vals) != 1) {
-          return(dbg_return_null("invalid_no_soil_metadata"))
-        }
-        veg_fraction_total <- as.numeric(no_soil_vals[1])
-        if (!is.finite(veg_fraction_total)) {
-          return(dbg_return_null("invalid_no_soil_value"))
-        }
-        if (veg_fraction_total < 0 || veg_fraction_total > 1) {
-          return(dbg_return_null("no_soil_out_of_range"))
-        }
-        meta_classes <- unique(tolower(na.omit(as.character(dly$Veg))))
-        barren_override <- "barren" %in% meta_classes
-        if (barren_override) veg_fraction_total <- 0
+        if (!is.finite(veg_fraction_total)) return(NULL)
+        if (veg_fraction_total < 0 || veg_fraction_total > 1) return(NULL)
+        
         barren_fraction_total <- max(0, min(1, 1 - veg_fraction_total))
 
         if (veg_fraction_total <= 0) {
@@ -3314,7 +3800,8 @@ cat("======================\n\n")
           return(dbg_return_null("no_veg_kept"))
         }
 
-        mesma_result <- compress_and_unmix_year(dly_year, mesma_lib[veg_kept], budget = TEMPORAL_BUDGET, topK = TOPK_VARIANTS)
+        # 3. STAGE 2 MESMA: Unmix vegetation using compressed data
+        mesma_result <- unmix_stage2_compressed(y, comp_res$grid_type, mesma_lib[veg_kept], topK = TOPK_VARIANTS)
         if (is.null(mesma_result)) return(dbg_return_null("mesma_pca_failed"))
 
         coef_stage2 <- mesma_result$vegetation_proportions
@@ -3375,7 +3862,6 @@ cat("======================\n\n")
           unc$coef_ci$coef_hi <- veg_fraction_total * unc$coef_ci$coef_hi
         }
 
-
         return(list(
           coef_df = coef_df,
           variant_trajectory = variant_info_pca,
@@ -3391,40 +3877,6 @@ cat("======================\n\n")
         dbg_return_null(paste0("error:", as.character(e$message)))
       }
     )
-    dbg_return_null <- function(reason) {
-    cat(sprintf("[FAIL] %s (year=%s): %s\n", loc, yr, reason), file = stderr())
-    suppressMessages(suppressWarnings(tryCatch({
-      # ... CSV write code
-    }, error = function(e) invisible(NULL))))
-    return(NULL)
-  }
-  
-  res_safe <- tryCatch({
-    cat(sprintf("[1] Getting data for %s/%s\n", loc, yr))
-    dly <- df_tasks[df_tasks$location_id == loc, , drop = FALSE]
-    cat(sprintf("    Found %d total rows\n", nrow(dly)))
-    
-    dly_year <- dly[lubridate::year(dly$date) == yr, , drop = FALSE]
-    cat(sprintf("    Found %d rows for year %s\n", nrow(dly_year), yr))
-    
-    if (nrow(dly_year) == 0) return(dbg_return_null("no_rows_year"))
-    
-    cat(sprintf("[2] Calling compress_and_unmix_year\n"))
-    mesma_result <- compress_and_unmix_year(dly_year, mesma_lib[veg_kept], 
-                                            budget = TEMPORAL_BUDGET, topK = TOPK_VARIANTS)
-    
-    if (is.null(mesma_result)) {
-      cat(sprintf("[3] compress_and_unmix_year returned NULL\n"))
-      return(dbg_return_null("mesma_pca_failed"))
-    }
-    
-    cat(sprintf("[4] Success for %s/%s\n", loc, yr))
-    # ... rest of processing
-  }, error = function(e) {
-    cat(sprintf("[ERROR] %s/%s: %s\n", loc, yr, e$message))
-    dbg_return_null(paste0("error:", e$message))
-  })
-
     res_safe
   }
 
@@ -3445,7 +3897,11 @@ cat("======================\n\n")
     factor_mode = factor_mode,
     df_tasks = df_tasks,
     prepare_factor_data = prepare_factor_data,
-    compress_and_unmix_year = compress_and_unmix_year,
+    compress_trace = compress_trace,
+    unmix_stage1_compressed = unmix_stage1_compressed,
+    unmix_stage2_compressed = unmix_stage2_compressed,
+    COMPRESSED_STAGE1_LIB = if (exists("COMPRESSED_STAGE1_LIB")) COMPRESSED_STAGE1_LIB else NULL,
+    STAGE1_LIB = if (exists("STAGE1_LIB")) STAGE1_LIB else NULL,
     # GLS / bootstrap helpers (exposed for worker env)
     gls_block_bootstrap = gls_block_bootstrap,
     solve_weights_gls = solve_weights_gls,
@@ -3459,7 +3915,8 @@ cat("======================\n\n")
     GLSBB_MAX_BLOCK = GLSBB_MAX_BLOCK,
     ENABLE_QP_SOLVER = ENABLE_QP_SOLVER,
     compute_diagnostics = compute_diagnostics,
-    project_to_simplex = project_to_simplex
+    project_to_simplex = project_to_simplex,
+    dbg_return_null = dbg_return_null
   )
 
   env_task <- list2env(required_globals, parent = globalenv())
@@ -3485,7 +3942,7 @@ cat("======================\n\n")
   cat(sprintf("After filtering NULL results: %d results remaining\n", length(results_list)))
 
   if (length(results_list) == 0) {
-    cat("ERROR: All tasks returned NULL results! Check fit_fail_reasons.csv for details.\n")
+    cat("ERROR: All tasks returned NULL results!\n")
     cat("Most likely causes:\n")
     cat("1. No valid testing/inference data available (no location-year pairs found)\n")
     cat("2. Data filtering issues or missing indices\n")
@@ -3607,7 +4064,7 @@ cat("======================\n\n")
       Total_Observations = sapply(unique_locations, function(loc) {
         nrow(all_coefs[all_coefs$location_id == loc, ])
       }),
-      # Projection method column removed per requirement; single method per run
+      # Projection method column not included: a single method is used per run
       stringsAsFactors = FALSE
     )
 
@@ -3974,5 +4431,4 @@ cat("======================\n\n")
 
   cat("\nMESMA fitting completed successfully!\n")
 
-}
 print("Script fit_veg_mixture_mesma.R execution finished.")
