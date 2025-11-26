@@ -142,6 +142,64 @@ Relevant configuration parameters in `fit_veg_mixture_mesma.R`:
 - `ALLOWED_VEG`: Vegetation types for stage 2 decomposition (automatically includes "barren")
 - Filtering now preserves barren rows: `tolower(df$Veg) %in% ALLOWED_VEG | tolower(df$Veg) == "barren"`
 
+## Uncertainty Estimation (Bootstrap)
+
+This implementation now supports uncertainty estimation that propagates both Stage 1 (barren vs vegetation) and Stage 2 (vegetation decomposition) through a nested bootstrap when compressed Stage 1 libraries are available.
+
+- By default, the script performs a Stage 2-only bootstrap for vegetation proportions (fixed Stage 1), because we only resampled residuals from the Stage 2 fit and recomputed weights.
+- When `COMPRESSED_STAGE1_LIB` exists, the script runs a nested two-stage bootstrap that resamples Stage 2 residuals in compressed space and recomputes both Stage 1 vegetated fractions and Stage 2 weights for each bootstrap replicate (`nested_two_stage_bootstrap`).
+- When `COMPRESSED_STAGE1_LIB` exists, the script runs a nested two-stage bootstrap that resamples Stage 2 residuals in compressed space and recomputes both Stage 1 vegetated fractions and Stage 2 weights for each bootstrap replicate (`nested_two_stage_bootstrap`).
+  - Important: If the nested bootstrap fails for any reason, there is NO fallback to the old Stage 2-only bootstrap. `uncertainty` will be set to `NULL` and a warning will be logged. This avoids silently mixing two different bootstrap approaches that represent different statistical assumptions.
+- The nested bootstrap returns CIs for final vegetation coefficients (already scaled by the vegetated fraction), and also supplies a CI for the vegetated fraction itself (`veg_frac_ci`).
+
+## L1 Regularization (Lasso) option
+
+You can optionally enable Lasso (L1) regularization for Stage 2 to bias toward sparser solutions (fewer active vegetation types):
+
+```r
+# Run unmixing with Lasso penalty - this performs L1 regularization on vegetation fractions
+mesma_result <- unmix_stage2_compressed(
+  y = y_vec,
+  grid_type = comp_res$grid_type,
+  mesma_lib = mesma_lib[veg_kept],
+  topK = TOPK_VARIANTS,
+  penalty = "lasso",
+  lasso_lambda = NULL # if NULL, glmnet::cv.glmnet selects lambda via CV
+)
+```
+
+Note: Lasso requires the `glmnet` package to be installed. If it is not available, the solver falls back to the ridge/simplex approach.
+
+### Lambda tuning and visualization
+
+You can inspect the lambda tradeoff between fit quality and solution sparsity:
+
+```r
+library(glmnet)
+lambda_grid <- 10^seq(-3, 1, length.out = 20)
+results <- lapply(lambda_grid, function(lam) {
+  fit <- fit_lasso_mesma(y_norm, E_pool, lambda = lam, sum_to_one = TRUE)
+  c(rmse = fit$rmse, n_active = sum(fit$w > 0.01))
+})
+df <- do.call(rbind, results)
+df <- data.frame(lambda = lambda_grid, rmse = df[, "rmse"], n_active = df[, "n_active"]) 
+library(ggplot2)
+ggplot(df, aes(x = n_active, y = rmse)) + geom_point() + geom_line() + labs(x = "Number of Active Vegetation Types", y = "RMSE", title = "Pareto Front: Complexity vs Fit Quality")
+```
+
+### Hybrid Monte Carlo Propagation (recommended)
+
+When both bootstraps are available (Stage 1's `veg_frac_boot` and Stage 2's `w_boot`), the script now performs a Monte Carlo propagation step that draws random samples from both bootstrap distributions and multiplies them to get a sample of the final coefficients. This yields percentile-based CI estimates for the final scaled vegetation coefficients that incorporate uncertainty from both stages and their covariance.
+
+- Stage 1 bootstrap: `stage1_block_bootstrap(y, compressed_stage1_lib, B)` returns `veg_frac_boot` and `veg_frac_ci`.
+- Stage 2 bootstrap: `gls_block_bootstrap(y, ...)` returns `w_boot` and `w_boot_raw` matrices along with `coef_ci` and other diagnostics.
+- Propagation: `propagate_uncertainty_monte_carlo(veg_frac_boot, w_boot, n_samples = 1000)` draws random pairs from both distributions and computes combined CIs from the empirical distribution of the products.
+
+Behavior:
+- If Stage 1 compressed library is available the script will attempt to compute `stage1_block_bootstrap` and `gls_block_bootstrap` and then perform MC propagation. If the nested bootstrap (which recomputes both stages) fails, there is NO fallback to the old single-stage bootstrap. In contrast, if `COMPRESSED_STAGE1_LIB` is not present the script keeps the Stage 2-only bootstrap behavior.
+
+You may toggle variant-switching during Stage 2 bootstrapping with the global variables `VARIANT_SWITCH_BOOTSTRAP` (default `FALSE`) and `VARIANT_SWITCH_RE_CENTER` (default `TRUE`).
+
 ## Example Workflow
 
 ```r

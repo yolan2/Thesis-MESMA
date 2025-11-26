@@ -14,12 +14,13 @@ fit_cost_mkl <- function(obs, weight, t_row) {
   sum(residuals^2)
 }
 
-# Set up progressr handlers for ETA display (use single-line text handler)
 if (requireNamespace("progressr", quietly = TRUE)) {
-  # Use the txt handler to avoid multi-line progress chatter.
-  # Width adapts to console or uses 60 characters as default for neat display.
-  width <- tryCatch(getOption("width", 60), error = function(e) 60)
-  progressr::handlers(progressr::handler_txt(width = min(max(as.integer(width), 40), 120)))
+  # Use the progress handler (simple text-based progress bar)
+  progressr::handlers(progressr::handler_progress(
+    format   = ":spin :current/:total [:bar] :percent in :elapsed ETA: :eta",
+    width    = 60,
+    complete = "="
+  ))
 }
 
 # Canonical optimal indices (required - no fallback alternatives)
@@ -116,6 +117,17 @@ calc_moving_var <- function(df, index_name, window = 14, span_loess = 0.1, min_o
     # Map back to original dates
     res_for_rows <- rv[pos_map]
     as.numeric(res_for_rows)
+  }
+
+  # Convenience wrapper that returns diagnostics for Lasso fit, similar to the user's suggestion
+  fit_lasso_mesma <- function(y_vec, E_matrix, lambda = NULL, sum_to_one = TRUE, constraint_weight = 1e3, non_negative = TRUE) {
+    if (!is.matrix(E_matrix) || nrow(E_matrix) != length(y_vec)) stop("fit_lasso_mesma: E_matrix must be an n x p matrix and y_vec length must match n")
+    if (!requireNamespace("glmnet", quietly = TRUE)) stop("fit_lasso_mesma: 'glmnet' package required but not installed")
+    w <- solve_weights_lasso(E_matrix, y_vec, lambda = lambda, sum_to_one = sum_to_one, non_negative = non_negative, constraint_weight = constraint_weight)
+    # compute RMSE
+    y_fitted <- as.numeric(E_matrix %*% w)
+    rmse <- sqrt(mean((y_vec - y_fitted)^2, na.rm = TRUE))
+    list(w = w, rmse = rmse, lambda = ifelse(is.null(lambda), NA, lambda), n_active = sum(w > 0.01))
   }
 
   if ("location_id" %in% names(df)) {
@@ -239,6 +251,9 @@ BOOTSTRAP_B <- 200L
 BOOT_MIN_REPS_PER_VEG <- 10L
 MIN_OBS_FOR_BOOT <- 5L
 ENABLE_UNCERTAINTY <- TRUE
+# Bootstrap variant-switching control: keep variants fixed by default (recommended).
+VARIANT_SWITCH_BOOTSTRAP <- FALSE
+VARIANT_SWITCH_RE_CENTER <- TRUE
 GLSBB_MIN_BLOCK <- 5L
 GLSBB_MAX_BLOCK <- 60L
 
@@ -470,8 +485,8 @@ chunked_rbind <- function(lst, chunk_size = 50L) {
 dbg_return_null <- function(reason = NULL) {
   if (!is.null(reason)) cat(sprintf("[DEBUG] abort: %s\n", as.character(reason)))
   coef_df <- data.frame(location_id = NA_character_, year = NA_integer_, Veg = NA_character_, coef = NA_real_, rmse = NA_real_, stringsAsFactors = FALSE)
-  coef_df$coef_lo <- NA_real_
-  coef_df$coef_hi <- NA_real_
+  coef_df$coef_025 <- NA_real_
+  coef_df$coef_975 <- NA_real_
   diag_df <- data.frame(location_id = NA_character_, year = NA_integer_, vegetated_fraction = NA_real_, barren_fraction = NA_real_, stringsAsFactors = FALSE)
   list(
     coef_df = coef_df,
@@ -684,8 +699,22 @@ cos_sim <- function(a, b) {
 # Helper: parallel map
 .run_map <- function(X, FUN) {
   f_FUN <- FUN
-  # Use txt handler explicitly for the local run to avoid multi-line spamming
-  if (requireNamespace("progressr", quietly = TRUE)) progressr::handlers("txt")
+  # Use a simple text handler explicitly for the local run to avoid multi-line spamming.
+  # Some progressr versions do not export a handler by the short name "txt"; gracefully fall back.
+  if (requireNamespace("progressr", quietly = TRUE)) {
+    tryCatch({
+      # Prefer directly using handler_txt if available
+      if (exists("handler_txt", envir = asNamespace("progressr"), inherits = FALSE)) {
+        progressr::handlers(progressr::handler_txt())
+      } else {
+        # Try selecting by name; if it fails, fall back to handler_progress
+        tryCatch({ progressr::handlers("txt") }, error = function(e) { progressr::handlers(progressr::handler_progress()) })
+      }
+    }, error = function(e) {
+      # final fallback: use the default handler_progress
+      tryCatch(progressr::handlers(progressr::handler_progress()), error = function(e) NULL)
+    })
+  }
 
   if (!PARALLEL_ENABLE) {
     if (!requireNamespace("progressr", quietly = TRUE)) {
@@ -2301,7 +2330,52 @@ estimate_block_size <- function(resid_series, min_block = GLSBB_MIN_BLOCK, max_b
   as.integer(b)
 }
 
-solve_weights_gls <- function(E, y, lambda = 1e-6, sum_to_one = TRUE, non_negative = TRUE) {
+## Bootstrap for Stage 1 (vegetated fraction) on compressed traces
+stage1_block_bootstrap <- function(y_vec, compressed_stage1_lib, B = BOOTSTRAP_B, seed = 123) {
+  if (is.null(y_vec) || is.null(compressed_stage1_lib)) return(NULL)
+  set.seed(seed)
+
+  B_vec <- compressed_stage1_lib$barren
+  V_vec <- compressed_stage1_lib$vegetation
+  len <- min(length(y_vec), length(B_vec), length(V_vec))
+  y <- y_vec[1:len]; Bv <- B_vec[1:len]; Vv <- V_vec[1:len]
+
+  # Compute alpha and predicted y (Stage 1 model)
+  diff_BV <- Bv - Vv
+  diff_XV <- y - Vv
+  denom <- sum(diff_BV^2)
+  if (denom < 1e-10) return(NULL)
+  alpha <- sum(diff_XV * diff_BV) / denom
+  alpha <- max(0, min(1, alpha))
+  veg_frac_hat <- 1 - alpha
+  y_pred <- alpha * Bv + (1 - alpha) * Vv
+  r <- y - y_pred
+
+  bsz <- estimate_block_size(r)
+  n <- length(y)
+
+  veg_frac_boot <- rep(NA_real_, B)
+  starts <- seq_len(n)
+  for (b in seq_len(B)) {
+    idx <- integer(0)
+    while (length(idx) < n) {
+      s <- sample(starts, 1)
+      block <- ((s - 1) + seq_len(bsz) - 1) %% n + 1
+      idx <- c(idx, block)
+    }
+    idx <- idx[seq_len(n)]
+    r_b <- r[idx]
+    yb <- y_pred + r_b
+    veg_frac_b <- tryCatch(unmix_stage1_compressed(yb, compressed_stage1_lib), error = function(e) NA_real_)
+    veg_frac_boot[b] <- veg_frac_b
+  }
+
+  veg_frac_boot <- veg_frac_boot[is.finite(veg_frac_boot)]
+  veg_frac_ci <- if (length(veg_frac_boot) >= 10) as.numeric(stats::quantile(veg_frac_boot, c(0.025, 0.975), na.rm = TRUE)) else c(NA_real_, NA_real_)
+  list(veg_frac_boot = veg_frac_boot, veg_frac_ci = veg_frac_ci, veg_frac_hat = veg_frac_hat, n = length(veg_frac_boot), block_size = bsz)
+}
+
+solve_weights_gls <- function(E, y, lambda = 1e-6, sum_to_one = TRUE, non_negative = TRUE, penalty = c("ridge", "lasso")) {
   # Estimate HAC covariance of residuals under OLS fit, then do GLS via whitening
   n <- length(y); p <- ncol(E)
   if (!is.matrix(E) || nrow(E) != n || p < 1) return(solve_weights_simplex(E, y, ridge = lambda))
@@ -2325,14 +2399,27 @@ solve_weights_gls <- function(E, y, lambda = 1e-6, sum_to_one = TRUE, non_negati
   cinv <- tryCatch(chol(Sigma), error = function(e) stop(sprintf("solve_weights_gls: Cholesky failed on Sigma: %s", e$message)))
   A <- backsolve(cinv, cbind(y, E), transpose = TRUE)
   y_w <- A[,1]; E_w <- A[,-1, drop = FALSE]
+  penalty <- match.arg(penalty)
   # Constrained solve in whitened space
   if (isTRUE(ENABLE_QP_SOLVER) && requireNamespace("quadprog", quietly = TRUE)) {
     return(solve_weights_constrained(E_w, y_w, lambda = lambda, sum_to_one = sum_to_one, non_negative = non_negative))
   }
+  if (identical(penalty, "lasso")) {
+    return(solve_weights_lasso(E_w, y_w, lambda = lambda, sum_to_one = sum_to_one, non_negative = non_negative))
+  }
   solve_weights_simplex(E_w, y_w, ridge = lambda)
 }
 
-gls_block_bootstrap <- function(y_vec, comp_templates, top_variants, chosen_ids, w_hat, B = BOOTSTRAP_B, lambda_star = 1e-6, seed = 123) {
+gls_block_bootstrap <- function(y_vec, comp_templates, top_variants, chosen_ids, w_hat, B = BOOTSTRAP_B, lambda_star = 1e-6, seed = 123, variant_switch = FALSE, re_center = TRUE, penalty = c("ridge", "lasso"), lasso_lambda = NULL) {
+  # Block bootstrap for GLS-weight uncertainty estimation.
+  # By default (variant_switch = FALSE), the bootstrap keeps the fitted model fixed
+  # (the same selected endmembers) and only perturbs observations via circular block bootstrap
+  # of residuals. This ensures the bootstrap is assessing uncertainty for the same model.
+  # If variant_switch = TRUE the function will reselect per-veg variants during each
+  # iteration; if re_center = TRUE the bootstrap coefficient distribution will be
+  # re-centered around the original point estimate to avoid the point estimate falling
+  # outside the computed bootstrap CIs (a consequence of model changes between
+  # iterations).
   # Returns list with coef_ci (data.frame), rmse_ci (numeric vector), variant_freq (data.frame)
   if (length(y_vec) < 5) return(NULL)
   set.seed(seed)
@@ -2357,6 +2444,8 @@ gls_block_bootstrap <- function(y_vec, comp_templates, top_variants, chosen_ids,
   starts <- seq_len(n)
   res_mat <- matrix(NA_real_, nrow = n, ncol = B)
   coef_mat <- matrix(NA_real_, nrow = length(vegs), ncol = B, dimnames = list(vegs, NULL))
+  # Keep a copy of raw bootstrap weights (before optional re-centering)
+  w_boot_raw <- matrix(NA_real_, nrow = length(vegs), ncol = B, dimnames = list(vegs, NULL))
   rmse_vec <- rep(NA_real_, B)
   dom_counts <- lapply(vegs, function(.) list())
   names(dom_counts) <- vegs
@@ -2373,27 +2462,45 @@ gls_block_bootstrap <- function(y_vec, comp_templates, top_variants, chosen_ids,
     r_b <- r[idx]
     # Perturb y: y* = E_best w_hat + r_b
     yb <- as.numeric(E_best %*% as.numeric(w_hat)) + r_b
-    # Variant reselection: pick top per-veg by cosine, then solve GLS
-    chosen_b <- list(); cols_b <- list()
-    for (v in vegs) {
-      cand <- comp_templates[[v]]
-      sims <- sapply(cand, function(x) cos_sim(yb, x$vec))
-      i_best <- which.max(sims)
-      chosen_b[[v]] <- cand[[i_best]]$id
-      cols_b[[length(cols_b) + 1]] <- cand[[i_best]]$vec
+    if (isTRUE(variant_switch)) {
+      # Variant reselection on perturbed yb: pick top per-veg by cosine, then solve GLS
+      chosen_b <- list(); cols_b <- list()
+      for (v in vegs) {
+        cand <- comp_templates[[v]]
+        sims <- sapply(cand, function(x) cos_sim(yb, x$vec))
+        i_best <- which.max(sims)
+        chosen_b[[v]] <- cand[[i_best]]$id
+        cols_b[[length(cols_b) + 1]] <- cand[[i_best]]$vec
+      }
+      E_b <- do.call(cbind, cols_b)
+      for (j in seq_len(ncol(E_b))) { nj <- sqrt(sum(E_b[, j]^2)); if (nj > 0) E_b[, j] <- E_b[, j] / nj }
+      lambda_use <- if (identical(penalty, "lasso") && !is.null(lasso_lambda)) lasso_lambda else lambda_star
+      w_b <- tryCatch(solve_weights_gls(E_b, yb, lambda = lambda_use, sum_to_one = TRUE, non_negative = TRUE, penalty = penalty), error = function(e) stop(sprintf("gls_block_bootstrap: GLS solve failed during bootstrap: %s", e$message)))
+    } else {
+      # Fixed: use E_best (the original endmembers) for ALL bootstrap iterations
+      E_b <- E_best
+      chosen_b <- chosen_ids
+      lambda_use <- if (identical(penalty, "lasso") && !is.null(lasso_lambda)) lasso_lambda else lambda_star
+      w_b <- tryCatch(solve_weights_gls(E_b, yb, lambda = lambda_use, sum_to_one = TRUE, non_negative = TRUE, penalty = penalty), error = function(e) stop(sprintf("gls_block_bootstrap: GLS solve failed during bootstrap (fixed variants): %s", e$message)))
     }
-    E_b <- do.call(cbind, cols_b)
-    for (j in seq_len(ncol(E_b))) { nj <- sqrt(sum(E_b[, j]^2)); if (nj > 0) E_b[, j] <- E_b[, j] / nj }
-    w_b <- tryCatch(solve_weights_gls(E_b, yb, lambda = lambda_star, sum_to_one = TRUE, non_negative = TRUE), error = function(e) stop(sprintf("gls_block_bootstrap: GLS solve failed during bootstrap: %s", e$message)))
-    coef_mat[, b] <- as.numeric(w_b)
+    # If a solver returns a vector of different length than expected, put NA
+    wb_num <- as.numeric(w_b)
+    if (length(wb_num) == nrow(coef_mat)) {
+      coef_mat[, b] <- wb_num
+    } else {
+      coef_mat[, b] <- rep(NA_real_, nrow(coef_mat))
+    }
+    w_boot_raw[, b] <- coef_mat[, b]
     pred_b <- as.numeric(E_b %*% w_b)
     rmse_vec[b] <- sqrt(mean((yb - pred_b)^2))
     # Track variant dominance
-    for (v in vegs) {
-      key <- chosen_b[[v]]
-      prev <- dom_counts[[v]][[key]]
-      if (is.null(prev)) prev <- 0
-      dom_counts[[v]][[key]] <- prev + 1
+    if (isTRUE(variant_switch)) {
+      for (v in vegs) {
+        key <- chosen_b[[v]]
+        prev <- dom_counts[[v]][[key]]
+        if (is.null(prev)) prev <- 0
+        dom_counts[[v]][[key]] <- prev + 1
+      }
     }
   }
   # Compute CIs (2.5/97.5) for coefficients and RMSE
@@ -2403,19 +2510,153 @@ gls_block_bootstrap <- function(y_vec, comp_templates, top_variants, chosen_ids,
     if (length(x) >= 10) { ci <- stats::quantile(x, c(0.025, 0.975), na.rm = TRUE); ci_low[i] <- ci[1]; ci_high[i] <- ci[2] }
   }
   rmse_ci <- if (sum(is.finite(rmse_vec)) >= 10) as.numeric(stats::quantile(rmse_vec, c(0.025, 0.975), na.rm = TRUE)) else c(NA_real_, NA_real_)
-  coef_ci_df <- data.frame(Veg = vegs, coef_lo = ci_low, coef_hi = ci_high, stringsAsFactors = FALSE)
+  coef_ci_df <- data.frame(Veg = vegs, coef_025 = ci_low, coef_975 = ci_high, stringsAsFactors = FALSE)
   # Variant frequencies
-  var_rows <- chunked_rbind(lapply(names(dom_counts), function(v) {
+  var_rows <- NULL
+  if (isTRUE(variant_switch)) {
+    var_rows <- chunked_rbind(lapply(names(dom_counts), function(v) {
     freqs <- dom_counts[[v]]
     if (length(freqs) == 0) return(NULL)
     data.frame(Veg = v, Variant = names(freqs), Freq = as.numeric(unlist(freqs)), stringsAsFactors = FALSE)
   }))
-  if (!is.null(var_rows) && nrow(var_rows) > 0) {
+    if (!is.null(var_rows) && nrow(var_rows) > 0) {
     var_rows <- var_rows %>% dplyr::group_by(.data$Veg, .data$Variant) %>% dplyr::summarize(N = sum(.data$Freq), .groups = "drop")
     var_rows$Percent <- 100 * var_rows$N / sum(var_rows$N)
   }
-  list(coef_ci = coef_ci_df, rmse_ci = rmse_ci, variant_freq = var_rows, block_size = bsz)
+  }
+  
+  # If variant switching was used and re-centering requested, adjust the bootstrap distribution
+  if (isTRUE(variant_switch) && isTRUE(re_center)) {
+    # Shift each vegetation's bootstrap coefficients so that their mean equals w_hat
+    for (i in seq_along(vegs)) {
+      xi <- coef_mat[i, ]
+      finite_mask <- is.finite(xi)
+      if (sum(finite_mask) >= 3) {
+        m <- mean(xi[finite_mask], na.rm = TRUE)
+        shift <- as.numeric(w_hat[i] - m)
+        coef_mat[i, finite_mask] <- coef_mat[i, finite_mask] + shift
+      }
+    }
+    # Recompute the CIs from the re-centered distribution
+    ci_low <- ci_high <- rep(NA_real_, length(vegs)); names(ci_low) <- vegs; names(ci_high) <- vegs
+    for (i in seq_along(vegs)) {
+      x <- coef_mat[i, ]; x <- x[is.finite(x)]
+      if (length(x) >= 10) { ci <- stats::quantile(x, c(0.025, 0.975), na.rm = TRUE); ci_low[i] <- ci[1]; ci_high[i] <- ci[2] }
+    }
+  }
+  # Provide raw and optionally centered bootstrap samples to allow Monte Carlo propagation
+  list(coef_ci = coef_ci_df, rmse_ci = rmse_ci, variant_freq = var_rows, block_size = bsz,
+       w_boot = coef_mat, # possibly re-centered bootstrap weights
+       w_boot_raw = w_boot_raw)
 }
+
+## Nested two-stage bootstrap: propagate Stage 1 (barren vs vegetation fraction) uncertainty
+# into the final vegetation coefficients by resampling residuals in compressed space and
+# recomputing both Stage 1 and Stage 2 on each perturbed observation.
+nested_two_stage_bootstrap <- function(y_vec, compressed_stage1_lib, comp_templates, top_variants, chosen_ids, w_hat, B = BOOTSTRAP_B, lambda_star = 1e-6, seed = 123, variant_switch = FALSE, re_center = TRUE, penalty = c("ridge", "lasso"), lasso_lambda = NULL) {
+  if (is.null(y_vec) || length(y_vec) < 5) return(NULL)
+  if (is.null(compressed_stage1_lib)) return(NULL)
+  set.seed(seed)
+
+  # Build E_best (fixed endmembers) from chosen_ids unless variant_switch requested
+  vegs <- names(top_variants)
+  cols <- list()
+  for (v in vegs) {
+    cid <- chosen_ids[[v]]
+    vec <- NULL
+    for (cand in comp_templates[[v]]) { if (!is.null(cand$id) && cand$id == cid) { vec <- cand$vec; break } }
+    if (is.null(vec)) return(NULL)
+    cols[[length(cols) + 1]] <- as.numeric(vec)
+  }
+  E_best <- do.call(cbind, cols)
+  for (j in seq_len(ncol(E_best))) { nj <- sqrt(sum(E_best[, j]^2)); if (nj > 0) E_best[, j] <- E_best[, j] / nj }
+
+  # Compute residuals from the stage 2 point fit
+  r <- as.numeric(y_vec - E_best %*% as.numeric(w_hat))
+  bsz <- estimate_block_size(r)
+  n <- length(y_vec)
+
+  coef_final_mat <- matrix(NA_real_, nrow = length(vegs), ncol = B, dimnames = list(vegs, NULL))
+  veg_frac_vec <- rep(NA_real_, B)
+  rmse_vec <- rep(NA_real_, B)
+  # optionally collect stage2 raw bootstrap weights for compatibility with MC approach
+  stage2_w_boot_raw <- matrix(NA_real_, nrow = length(vegs), ncol = B, dimnames = list(vegs, NULL))
+
+  # Perform outer loop bootstrap: resample residuals and recompute both stages
+  starts <- seq_len(n)
+  for (b in seq_len(B)) {
+    # Circular block bootstrap of residuals
+    idx <- integer(0)
+    while (length(idx) < n) {
+      s <- sample(starts, 1)
+      block <- ((s - 1) + seq_len(bsz) - 1) %% n + 1
+      idx <- c(idx, block)
+    }
+    idx <- idx[seq_len(n)]
+    r_b <- r[idx]
+
+    # Perturb y
+    yb <- as.numeric(E_best %*% as.numeric(w_hat)) + r_b
+
+    # Stage 1: estimate vegetated fraction from compressed stage1 lib (using the perturbed yb)
+    veg_frac_b <- tryCatch(unmix_stage1_compressed(yb, compressed_stage1_lib), error = function(e) NA_real_)
+    if (!is.finite(veg_frac_b)) veg_frac_b <- NA_real_
+    veg_frac_vec[b] <- veg_frac_b
+
+    # Stage 2: fit weights on the same E_best (fixed endmembers) using yb
+    lambda_use <- if (identical(penalty, "lasso") && !is.null(lasso_lambda)) lasso_lambda else lambda_star
+    w_b <- tryCatch(solve_weights_gls(E_best, yb, lambda = lambda_use, sum_to_one = TRUE, non_negative = TRUE, penalty = penalty), error = function(e) NA_real_)
+    w_b_num <- as.numeric(w_b)
+    if (length(w_b_num) == nrow(coef_final_mat)) {
+      stage2_w_boot_raw[, b] <- w_b_num
+    }
+    if (length(w_b_num) == nrow(coef_final_mat)) {
+      coef_final_mat[, b] <- w_b_num * veg_frac_b
+    } else {
+      coef_final_mat[, b] <- rep(NA_real_, nrow(coef_final_mat))
+    }
+    # Pred and RMSE for information
+    pred_b <- as.numeric(E_best %*% w_b)
+    rmse_vec[b] <- if (is.finite(pred_b)) sqrt(mean((yb - pred_b)^2, na.rm = TRUE)) else NA_real_
+  }
+
+  # Compute final CIs on the product (veg fraction * stage 2 coefficients)
+  ci_low <- ci_high <- rep(NA_real_, length(vegs)); names(ci_low) <- vegs; names(ci_high) <- vegs
+  for (i in seq_along(vegs)) {
+    x <- coef_final_mat[i, ]; x <- x[is.finite(x)]
+    if (length(x) >= 10) { ci <- stats::quantile(x, c(0.025, 0.975), na.rm = TRUE); ci_low[i] <- ci[1]; ci_high[i] <- ci[2] }
+  }
+
+  veg_frac_ci <- if (sum(is.finite(veg_frac_vec)) >= 10) as.numeric(stats::quantile(veg_frac_vec, c(0.025, 0.975), na.rm = TRUE)) else c(NA_real_, NA_real_)
+
+  coef_ci_df <- data.frame(Veg = vegs, coef_025 = ci_low, coef_975 = ci_high, stringsAsFactors = FALSE)
+  list(coef_ci = coef_ci_df, veg_frac_ci = veg_frac_ci, rmse_ci = if (sum(is.finite(rmse_vec)) >= 10) as.numeric(stats::quantile(rmse_vec, c(0.025, 0.975), na.rm = TRUE)) else c(NA_real_, NA_real_), block_size = bsz, w_boot_raw = stage2_w_boot_raw)
+}
+
+  propagate_uncertainty_monte_carlo <- function(
+    veg_frac_boot,      # Vector of Stage 1 bootstrap samples
+    w_boot_matrix,      # Matrix: rows = veg types, cols = Stage 2 bootstrap samples
+    n_samples = 1000
+  ) {
+    if (is.null(veg_frac_boot) || is.null(w_boot_matrix)) return(NULL)
+    n_veg_types <- nrow(w_boot_matrix)
+    n_stage1 <- length(veg_frac_boot)
+    n_stage2 <- ncol(w_boot_matrix)
+    if (n_veg_types == 0 || n_stage1 == 0 || n_stage2 == 0) return(NULL)
+
+    # Storage for combined samples
+    combined_samples <- matrix(NA_real_, nrow = n_veg_types, ncol = n_samples)
+    for (i in seq_len(n_samples)) {
+      veg_frac_sample <- sample(veg_frac_boot, size = 1)
+      stage2_idx <- sample(seq_len(n_stage2), size = 1)
+      w_sample <- w_boot_matrix[, stage2_idx]
+      combined_samples[, i] <- veg_frac_sample * w_sample
+    }
+
+    ci_lo <- apply(combined_samples, 1, stats::quantile, probs = 0.025, na.rm = TRUE)
+    ci_hi <- apply(combined_samples, 1, stats::quantile, probs = 0.975, na.rm = TRUE)
+    list(combined_samples = combined_samples, ci_lo = ci_lo, ci_hi = ci_hi)
+  }
 
 # Helper: project a single row's raw indices to factor space (PCA)
 project_row_to_factors <- function(row, gproj, avail_idx, veg_type = NULL) {
@@ -2774,6 +3015,64 @@ build_mesma_variants <- function(reduced_data, lib_factor_pca, min_cluster_size 
     project_to_simplex(w)
   }
 
+  # Lasso solver using glmnet: optional sum-to-one by augmentation and non-negativity via lower.limits
+  solve_weights_lasso <- function(E, y, lambda = NULL, sum_to_one = TRUE, non_negative = TRUE, constraint_weight = 1e3) {
+    # E: n x p matrix, rows = observations/bands, cols = variables/endmembers
+    if (!is.matrix(E) || nrow(E) != length(y) || ncol(E) < 1) return(solve_weights_simplex(E, y, ridge = ifelse(is.null(lambda), 1e-6, lambda)))
+    if (!requireNamespace("glmnet", quietly = TRUE)) {
+      warning("solve_weights_lasso: package 'glmnet' not available; falling back to ridge simplex")
+      return(solve_weights_simplex(E, y, ridge = ifelse(is.null(lambda), 1e-6, lambda)))
+    }
+    # Augment with sum-to-one constraint if requested
+    E_aug <- E; y_aug <- y
+    if (isTRUE(sum_to_one)) {
+      n_bands <- nrow(E_aug); p <- ncol(E_aug)
+      E_aug <- rbind(E_aug, rep(1, p))
+      y_aug <- c(y_aug, 1)
+      # Weight the equality constraint strongly; large value ensures near equality
+      E_aug[n_bands + 1, ] <- E_aug[n_bands + 1, ] * constraint_weight
+      y_aug[n_bands + 1] <- y_aug[n_bands + 1] * constraint_weight
+    }
+
+    # Fit Lasso
+    # glmnet expects a matrix with rows = observations, cols = predictors (E_aug is n x p)
+    x <- as.matrix(E_aug); yv <- as.numeric(y_aug)
+    if (is.null(lambda)) {
+      # cross-validate to find lambda
+      cv_fit <- tryCatch(
+        glmnet::cv.glmnet(x = x, y = yv, alpha = 1, lower.limits = ifelse(isTRUE(non_negative), 0, -Inf), intercept = FALSE, standardize = FALSE),
+        error = function(e) NULL
+      )
+      if (!is.null(cv_fit)) lambda_opt <- cv_fit$lambda.min else lambda_opt <- 1e-6
+    } else lambda_opt <- lambda
+
+    fit <- tryCatch(
+      glmnet::glmnet(x = x, y = yv, alpha = 1, lambda = lambda_opt, lower.limits = ifelse(isTRUE(non_negative), 0, -Inf), intercept = FALSE, standardize = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) return(solve_weights_simplex(E, y, ridge = ifelse(is.null(lambda), 1e-6, lambda)))
+
+    # Extract coefficients: glmnet::coef returns a sparse matrix with intercept as first entry if present
+    coefs <- as.numeric(stats::coef(fit, s = lambda_opt))
+    if (length(coefs) == ncol(E_aug) + 1) coefs <- coefs[-1] # remove intercept if present
+    # If we augmented E (sum_to_one), the coefficients correspond to original p columns
+    if (length(coefs) > ncol(E)) coefs <- coefs[seq_len(ncol(E))]
+    w <- as.numeric(coefs)
+    if (any(!is.finite(w))) w[!is.finite(w)] <- 0
+    # Normalize to sum to one if requested (repair if constraint wasn't perfect)
+    if (isTRUE(sum_to_one)) {
+      s <- sum(w)
+      if (s <= 0 || !is.finite(s)) {
+        # fall back to simplex
+        return(solve_weights_simplex(E, y, ridge = ifelse(is.null(lambda), 1e-6, lambda)))
+      }
+      w <- w / s
+    }
+    # Ensure non-negativity
+    if (isTRUE(non_negative)) w[w < 0] <- 0
+    w
+  }
+
   # Quadratic programming solver with constraints: sum(w)=1, w>=0
   solve_weights_constrained <- function(E, y, lambda = 1e-6, sum_to_one = TRUE, non_negative = TRUE) {
     p <- ncol(E)
@@ -2873,7 +3172,7 @@ build_mesma_variants <- function(reduced_data, lib_factor_pca, min_cluster_size 
   }
 
   # Vectorized evaluation of combinations with chunking
-  evaluate_all_combinations <- function(y, templates, lambda, early_stop_rmse = EARLY_STOP_RMSE_THRESHOLD) {
+  evaluate_all_combinations <- function(y, templates, lambda, early_stop_rmse = EARLY_STOP_RMSE_THRESHOLD, penalty = c("ridge", "lasso"), lasso_lambda = NULL) {
     veg_names <- names(templates)
     n_veg <- length(veg_names)
     if (n_veg == 0) return(NULL)
@@ -2937,10 +3236,14 @@ build_mesma_variants <- function(reduced_data, lib_factor_pca, min_cluster_size 
         }
         E <- do.call(cbind, cols)
         for (j in seq_len(ncol(E))) { nj <- sqrt(sum(E[, j]^2)); if (nj > 0) E[, j] <- E[, j] / nj }
-        w <- if (isTRUE(ENABLE_QP_SOLVER) && requireNamespace("quadprog", quietly = TRUE)) {
-          solve_weights_constrained(E, y, lambda = lambda, sum_to_one = TRUE, non_negative = TRUE)
+        # Choose solver: QP constrained (quadprog) or Lasso (glmnet) or simple ridge-simplex
+        penalty <- match.arg(penalty)
+        if (isTRUE(ENABLE_QP_SOLVER) && requireNamespace("quadprog", quietly = TRUE)) {
+          w <- solve_weights_constrained(E, y, lambda = lambda, sum_to_one = TRUE, non_negative = TRUE)
+        } else if (identical(penalty, "lasso") && requireNamespace("glmnet", quietly = TRUE)) {
+          w <- solve_weights_lasso(E, y, lambda = lasso_lambda, sum_to_one = TRUE, non_negative = TRUE)
         } else {
-          solve_weights_simplex(E, y, ridge = lambda)
+          w <- solve_weights_simplex(E, y, ridge = lambda)
         }
         pred <- as.numeric(E %*% w)
         rmse <- sqrt(mean((y - pred)^2))
@@ -3059,7 +3362,7 @@ unmix_stage1_compressed <- function(y, compressed_stage1_lib) {
 }
 
 # New helper: Stage 2 Unmixing on Compressed Data
-unmix_stage2_compressed <- function(y, grid_type, mesma_lib, topK = TOPK_VARIANTS) {
+unmix_stage2_compressed <- function(y, grid_type, mesma_lib, topK = TOPK_VARIANTS, penalty = c("ridge", "lasso"), lasso_lambda = NULL) {
   veg_types <- names(mesma_lib)
   if (length(veg_types) == 0) return(NULL)
   
@@ -3104,7 +3407,7 @@ unmix_stage2_compressed <- function(y, grid_type, mesma_lib, topK = TOPK_VARIANT
 
   best <- list(rmse = Inf, w = NULL, chosen = NULL)
   res <- tryCatch({
-    evaluate_all_combinations(y_norm, top_variants, lambda = lambda_star, early_stop_rmse = EARLY_STOP_RMSE_THRESHOLD)
+    evaluate_all_combinations(y_norm, top_variants, lambda = lambda_star, early_stop_rmse = EARLY_STOP_RMSE_THRESHOLD, penalty = penalty, lasso_lambda = lasso_lambda)
   }, error = function(e) NULL)
   
   if (!is.null(res)) best <- list(rmse = res$rmse, w = res$w, chosen = res$ids)
@@ -3133,28 +3436,58 @@ unmix_stage2_compressed <- function(y, grid_type, mesma_lib, topK = TOPK_VARIANT
   }
 
   if (isTRUE(ENABLE_UNCERTAINTY) && !is.null(best$w) && !is.null(best$chosen)) {
-    uncertainty <- tryCatch({
-      gls_block_bootstrap(
-        y_vec = y_norm,
-        comp_templates = comp_templates,
-        top_variants = top_variants,
-        chosen_ids = best$chosen,
-        w_hat = best$w,
-        B = BOOTSTRAP_B,
-        lambda_star = lambda_star,
-        seed = 123
-      )
-    }, error = function(e) NULL)
+    if (exists("COMPRESSED_STAGE1_LIB", envir = globalenv()) && !is.null(get("COMPRESSED_STAGE1_LIB", envir = globalenv()))) {
+      cat("[UNCERTAINTY] Nested two-stage bootstrap (propagating stage 1 uncertainty)\n")
+      compressed_stage1_lib <- get("COMPRESSED_STAGE1_LIB", envir = globalenv())
+      uncertainty <- tryCatch({
+        nested_two_stage_bootstrap(
+          y_vec = y_norm,
+          compressed_stage1_lib = compressed_stage1_lib,
+          comp_templates = comp_templates,
+          top_variants = top_variants,
+          chosen_ids = best$chosen,
+          w_hat = best$w,
+          B = BOOTSTRAP_B,
+          lambda_star = lambda_star,
+          seed = 123,
+          variant_switch = VARIANT_SWITCH_BOOTSTRAP,
+          re_center = VARIANT_SWITCH_RE_CENTER,
+          penalty = penalty,
+          lasso_lambda = lasso_lambda
+        )
+      }, error = function(e) {
+        # Do not fallback: if nested two-stage bootstrap fails, do not reuse the old stage2-only method.
+        warning(sprintf("[UNCERTAINTY] nested_two_stage_bootstrap failed: %s; leaving uncertainty as NULL (no fallback)", as.character(e$message)))
+        NULL
+      })
+    } else {
+      uncertainty <- tryCatch({
+        gls_block_bootstrap(
+          y_vec = y_norm,
+          comp_templates = comp_templates,
+          top_variants = top_variants,
+          chosen_ids = best$chosen,
+          w_hat = best$w,
+          B = BOOTSTRAP_B,
+          lambda_star = lambda_star,
+          seed = 123,
+          variant_switch = VARIANT_SWITCH_BOOTSTRAP,
+          re_center = VARIANT_SWITCH_RE_CENTER,
+          penalty = penalty,
+          lasso_lambda = lasso_lambda
+        )
+      }, error = function(e) NULL)
+    }
   }
   
   list(vegetation_proportions = best$w, chosen_variants = best$chosen, rmse = best$rmse, diagnostics = diagnostics, uncertainty = uncertainty)
 }
 
-compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGET, topK = TOPK_VARIANTS) {
+compress_and_unmix_year <- function(dly_year, mesma_lib, budget = TEMPORAL_BUDGET, topK = TOPK_VARIANTS, penalty = c("ridge", "lasso"), lasso_lambda = NULL) {
   # Legacy wrapper if needed, but we will use the split functions in fit_one_task
   res <- compress_trace(dly_year, GLOBAL_PCA, avail, budget)
   if (is.null(res)) return(NULL)
-  unmix_stage2_compressed(res$y, res$grid_type, mesma_lib, topK)
+  unmix_stage2_compressed(res$y, res$grid_type, mesma_lib, topK, penalty = penalty, lasso_lambda = lasso_lambda)
 }
 
   # End of mesma_dynamic_programming inner helpers
@@ -3735,8 +4068,16 @@ cat("======================\n\n")
         
         # 2. STAGE 1 MESMA: Unmix vegetated fraction using compressed data
         veg_fraction_total <- NA_real_
+        stage1_boot <- NULL
         if (exists("COMPRESSED_STAGE1_LIB") && !is.null(COMPRESSED_STAGE1_LIB)) {
            veg_fraction_total <- unmix_stage1_compressed(y, COMPRESSED_STAGE1_LIB)
+           # Stage 1 bootstrap samples (veg_frac_boot)
+           stage1_boot <- tryCatch({
+             stage1_block_bootstrap(y, COMPRESSED_STAGE1_LIB, B = BOOTSTRAP_B, seed = 123)
+           }, error = function(e) {
+             warning(sprintf("[UNCERTAINTY] stage1_block_bootstrap failed: %s; skipping Stage1 uncertainty", as.character(e$message)))
+             NULL
+           })
         } else {
            # Fallback to raw unmixing if compressed lib not available
            if (!is.null(STAGE1_LIB)) {
@@ -3758,8 +4099,9 @@ cat("======================\n\n")
             rmse = NA_real_,
             stringsAsFactors = FALSE
           )
-          coef_df$coef_lo <- NA_real_
-          coef_df$coef_hi <- NA_real_
+          coef_df$coef_025 <- NA_real_
+          coef_df$coef_975 <- NA_real_
+          coef_df$interval <- NA_real_
           diag_df <- data.frame(
             location_id = loc,
             year = yr,
@@ -3813,16 +4155,24 @@ cat("======================\n\n")
           rmse = mesma_result$rmse,
           stringsAsFactors = FALSE
         )
-        coef_df$coef_lo <- NA_real_
-        coef_df$coef_hi <- NA_real_
+        coef_df$coef_025 <- NA_real_
+        coef_df$coef_975 <- NA_real_
         if (!is.null(mesma_result$uncertainty) && !is.null(mesma_result$uncertainty$coef_ci)) {
           ci_tbl <- mesma_result$uncertainty$coef_ci
+          # If nested bootstrap was used, coef_ci already reflects the final coefficient
+          # (product of veg_fraction * stage2 weights) and should NOT be multiplied again.
+          is_nested <- !is.null(mesma_result$uncertainty$veg_frac_ci)
           for (i in seq_len(nrow(coef_df))) {
             vname <- coef_df$Veg[i]
             row_ci <- ci_tbl[ci_tbl$Veg == vname, , drop = FALSE]
             if (nrow(row_ci) == 1) {
-              coef_df$coef_lo[i] <- veg_fraction_total * row_ci$coef_lo[1]
-              coef_df$coef_hi[i] <- veg_fraction_total * row_ci$coef_hi[1]
+              if (is_nested) {
+                coef_df$coef_025[i] <- row_ci$coef_025[1]
+                coef_df$coef_975[i] <- row_ci$coef_975[1]
+              } else {
+                coef_df$coef_025[i] <- veg_fraction_total * row_ci$coef_025[1]
+                coef_df$coef_975[i] <- veg_fraction_total * row_ci$coef_975[1]
+              }
             }
           }
         }
@@ -3841,6 +4191,14 @@ cat("======================\n\n")
         }
         diag_df$vegetated_fraction <- veg_fraction_total
         diag_df$barren_fraction <- barren_fraction_total
+        # If we have a Stage 1 bootstrap result, show its CI
+        if (!is.null(stage1_boot) && !is.null(stage1_boot$veg_frac_ci)) {
+          diag_df$vegetated_frac_lo <- stage1_boot$veg_frac_ci[1]
+          diag_df$vegetated_frac_hi <- stage1_boot$veg_frac_ci[2]
+        } else if (!is.null(unc) && !is.null(unc$veg_frac_ci)) {
+          diag_df$vegetated_frac_lo <- unc$veg_frac_ci[1]
+          diag_df$vegetated_frac_hi <- unc$veg_frac_ci[2]
+        }
 
         if (barren_fraction_total > 0) {
           barren_row <- data.frame(
@@ -3851,16 +4209,62 @@ cat("======================\n\n")
             rmse = mesma_result$rmse,
             stringsAsFactors = FALSE
           )
-          barren_row$coef_lo <- NA_real_
-          barren_row$coef_hi <- NA_real_
+          barren_row$coef_025 <- NA_real_
+          barren_row$coef_975 <- NA_real_
           coef_df <- rbind(coef_df, barren_row)
         }
 
         unc <- mesma_result$uncertainty
         if (!is.null(unc) && !is.null(unc$coef_ci)) {
-          unc$coef_ci$coef_lo <- veg_fraction_total * unc$coef_ci$coef_lo
-          unc$coef_ci$coef_hi <- veg_fraction_total * unc$coef_ci$coef_hi
+          is_nested_unc <- !is.null(unc$veg_frac_ci)
+          if (!is_nested_unc) {
+            # Stage 2-only uncertainty: coef_ci refers to stage2 weights, so multiply by overall vegetated fraction
+            unc$coef_ci$coef_025 <- veg_fraction_total * unc$coef_ci$coef_025
+            unc$coef_ci$coef_975 <- veg_fraction_total * unc$coef_ci$coef_975
+          }
+          # If is_nested_unc then coef_ci already contains final coefficients
         }
+
+        # Monte Carlo propagation: combine stage 1 veg_frac bootstrap and stage 2 weight bootstrap, if available
+        if (isTRUE(ENABLE_UNCERTAINTY) && !is.null(stage1_boot) && !is.null(stage1_boot$veg_frac_boot) && !is.null(unc)) {
+          w_mat <- NULL
+          if (!is.null(unc$w_boot_raw) && is.matrix(unc$w_boot_raw)) w_mat <- unc$w_boot_raw
+          else if (!is.null(unc$w_boot) && is.matrix(unc$w_boot)) w_mat <- unc$w_boot
+          if (!is.null(w_mat) && is.matrix(w_mat) && nrow(w_mat) > 0 && ncol(w_mat) > 0) {
+            # Align rows to coef_df (non-barren veg rows)
+            veg_rows <- coef_df$Veg[coef_df$Veg != "barren"]
+            mat_rownames <- rownames(w_mat)
+            if (!is.null(mat_rownames)) {
+              idx_map <- match(veg_rows, mat_rownames)
+              # If any missing, fall back to order provided
+              if (all(!is.na(idx_map))) {
+                w_mat_sub <- w_mat[idx_map, , drop = FALSE]
+              } else {
+                w_mat_sub <- w_mat
+              }
+            } else {
+              w_mat_sub <- w_mat
+            }
+            propagated <- tryCatch({
+              propagate_uncertainty_monte_carlo(stage1_boot$veg_frac_boot, w_mat_sub, n_samples = 1000)
+            }, error = function(e) NULL)
+            if (!is.null(propagated) && !is.null(propagated$ci_lo) && !is.null(propagated$ci_hi)) {
+              # Put results back into coef_df for non-barren veg rows
+              non_barren_idx <- which(coef_df$Veg != "barren")
+              if (length(non_barren_idx) == length(propagated$ci_lo)) {
+                coef_df$coef_025[non_barren_idx] <- propagated$ci_lo
+                coef_df$coef_975[non_barren_idx] <- propagated$ci_hi
+                # Attach combined samples to uncertainty for later inspection
+                unc$combined_samples <- propagated$combined_samples
+                unc$combined_ci_lo <- propagated$ci_lo
+                unc$combined_ci_hi <- propagated$ci_hi
+              }
+            }
+          }
+        }
+
+        # Add 95% CI interval to coef_df (difference between upper and lower CI bounds)
+        coef_df$interval <- ifelse(is.finite(coef_df$coef_975) & is.finite(coef_df$coef_025), coef_df$coef_975 - coef_df$coef_025, NA_real_)
 
         return(list(
           coef_df = coef_df,
@@ -3908,6 +4312,8 @@ cat("======================\n\n")
     estimate_block_size = estimate_block_size,
     solve_weights_constrained = solve_weights_constrained,
     solve_weights_simplex = solve_weights_simplex,
+    solve_weights_lasso = solve_weights_lasso,
+    fit_lasso_mesma = fit_lasso_mesma,
     cos_sim = cos_sim,
     BOOTSTRAP_B = BOOTSTRAP_B,
     ENABLE_UNCERTAINTY = ENABLE_UNCERTAINTY,
@@ -4036,6 +4442,10 @@ cat("======================\n\n")
       }
     }
     all_coefs <- dplyr::left_join(all_coefs, true_veg_map, by = "location_id")
+    # Ensure CI columns exist and compute interval (upper - lower) for each row
+    if (!"coef_025" %in% names(all_coefs)) all_coefs$coef_025 <- NA_real_
+    if (!"coef_975" %in% names(all_coefs)) all_coefs$coef_975 <- NA_real_
+    all_coefs$interval <- ifelse(is.finite(all_coefs$coef_975) & is.finite(all_coefs$coef_025), all_coefs$coef_975 - all_coefs$coef_025, NA_real_)
 
     # Create Excel file with all locations as separate sheets
     cat("Creating single Excel file with all location results...\n")
@@ -4092,7 +4502,7 @@ cat("======================\n\n")
       ci <- res$uncertainty$coef_ci
       if (!is.null(ci) && nrow(ci) > 0) {
         ci$location_id <- loc; ci$year <- yr
-        unc_coef_rows[[length(unc_coef_rows) + 1]] <- ci[, c("location_id","year","Veg","coef_lo","coef_hi"), drop = FALSE]
+        unc_coef_rows[[length(unc_coef_rows) + 1]] <- ci[, c("location_id","year","Veg","coef_025","coef_975"), drop = FALSE]
       }
       vr <- res$uncertainty$variant_freq
       if (!is.null(vr) && nrow(vr) > 0) {
@@ -4117,11 +4527,7 @@ cat("======================\n\n")
       start_row <- 1
       openxlsx::writeData(wb, "Uncertainty", data.frame(Setting = c("ENABLE_UNCERTAINTY","BOOTSTRAP_B"), Value = c(ENABLE_UNCERTAINTY, BOOTSTRAP_B)), startRow = start_row, startCol = 1)
       start_row <- start_row + 3
-      if (!is.null(all_unc_coef)) {
-        openxlsx::writeData(wb, "Uncertainty", "Coefficient CIs (2.5%/97.5%)", startRow = start_row, startCol = 1)
-        openxlsx::writeData(wb, "Uncertainty", all_unc_coef, startRow = start_row + 1, startCol = 1)
-        start_row <- start_row + nrow(all_unc_coef) + 3
-      }
+      # Coefficient CI table suppressed: coefficients CIs are now included in the COEFFICIENTS sheet as columns
       if (!is.null(all_unc_rmse)) {
         openxlsx::writeData(wb, "Uncertainty", "RMSE CI (2.5%/97.5%)", startRow = start_row, startCol = 1)
         openxlsx::writeData(wb, "Uncertainty", all_unc_rmse, startRow = start_row + 1, startCol = 1)
@@ -4275,18 +4681,7 @@ cat("======================\n\n")
           }
 
           # If uncertainty coefficients exist, write them next
-          if (exists("all_unc_coef") && !is.null(all_unc_coef)) {
-            loc_unc_coef <- all_unc_coef[all_unc_coef$location_id == loc_id, , drop = FALSE]
-            if (nrow(loc_unc_coef) > 0) {
-              openxlsx::writeData(wb, sheet_name, "COEFFICIENT CIs (2.5%/97.5%)",
-                startRow = current_row, startCol = 1
-              )
-              openxlsx::writeData(wb, sheet_name, loc_unc_coef,
-                startRow = current_row + 1, startCol = 1
-              )
-              current_row <- current_row + nrow(loc_unc_coef) + 3
-            }
-          }
+          # COEFFICIENT CI table suppressed: CI bounds have been integrated into the COEFFICIENTS sheet as columns
 
           # Add MESMA PCA variant trajectory summary
           if (!is.null(loc_variants_pca) && nrow(loc_variants_pca) > 0) {
