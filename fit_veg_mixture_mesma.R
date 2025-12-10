@@ -6365,12 +6365,14 @@ if (isTRUE(TESTING_MODE)) {
       
       if (!is.null(df_inf)) {
          cat(sprintf("Loaded %d rows from inference file.\n", nrow(df_inf)))
-         if ("location_id" %in% names(df_inf)) {
-            cat(sprintf("Found %d unique inference location IDs.\n", length(unique(df_inf$location_id))))
-            # Append 'a' to inference location_IDs to ensure uniqueness
-            df_inf$location_id <- paste0(as.character(df_inf$location_id), "a")
-            cat(sprintf("Appended 'a' to inference location_IDs for uniqueness. New unique count: %d\n", length(unique(df_inf$location_id))))
-         } else {
+        if ("location_id" %in% names(df_inf)) {
+          cat(sprintf("Found %d unique inference location IDs.\n", length(unique(df_inf$location_id))))
+          # Preserve original inference IDs for later de-dup/overlap checks
+          df_inf$location_id_orig <- as.character(df_inf$location_id)
+          # Append 'a' to inference location_IDs to ensure uniqueness in output
+          df_inf$location_id <- paste0(df_inf$location_id_orig, "a")
+          cat(sprintf("Appended 'a' to inference location_IDs for uniqueness. New unique count: %d\n", length(unique(df_inf$location_id))))
+        } else {
             cat("WARNING: 'location_id' column missing from inference file.\n")
          }
       }
@@ -6487,6 +6489,23 @@ if (isTRUE(TESTING_MODE)) {
       if (!"year" %in% names(df_tasks_inference) && "date" %in% names(df_tasks_inference)) df_tasks_inference$year <- lubridate::year(df_tasks_inference$date)
       if (!"pheno_year" %in% names(df_tasks_inference) && "date" %in% names(df_tasks_inference)) df_tasks_inference$pheno_year <- assign_pheno_year(df_tasks_inference$date)
       n_infer_loc_years <- nrow(unique(df_tasks_inference[c("location_id", "pheno_year")]))
+      # If training data exists, remove any location-year pairs from inference that overlap training
+      if (exists("df_train") && !is.null(df_train) && nrow(df_train) > 0) {
+        if (!"year" %in% names(df_train) && "date" %in% names(df_train)) df_train$year <- lubridate::year(df_train$date)
+        # Ensure train loc-year pairs exist and are properly typed
+        df_train_pairs <- df_train %>% dplyr::select(location_id, year) %>% dplyr::distinct()
+        df_train_pairs$location_id <- as.character(df_train_pairs$location_id)
+        # Use original inference IDs (before the 'a' append) to match training IDs
+        if ("location_id_orig" %in% names(df_tasks_inference)) {
+          before_overlap <- nrow(df_tasks_inference)
+          df_tasks_inference <- df_tasks_inference %>% dplyr::anti_join(df_train_pairs, by = c("location_id_orig" = "location_id", "year" = "year"))
+          after_overlap <- nrow(df_tasks_inference)
+          removed_overlap <- before_overlap - after_overlap
+          if (removed_overlap > 0) cat(sprintf("[NOTICE] Removed %d inference rows that overlap with training location-years.\n", removed_overlap))
+          # Recompute counts after removal
+          n_infer_loc_years <- nrow(unique(df_tasks_inference[c("location_id", "pheno_year")]))
+        }
+      }
       if (exists("df_train") && !is.null(df_train) && nrow(df_train) > 0) {
         if (!"year" %in% names(df_train) && "date" %in% names(df_train)) df_train$year <- lubridate::year(df_train$date)
         if (!"pheno_year" %in% names(df_train) && "date" %in% names(df_train)) df_train$pheno_year <- assign_pheno_year(df_train$date)
@@ -6508,7 +6527,8 @@ if (isTRUE(TESTING_MODE)) {
     }
   }
   # Capture inference location IDs for separate output
-  inference_location_ids <- if (!is.null(df_inf) && nrow(df_inf) > 0 && "location_id" %in% names(df_inf)) unique(df_inf$location_id) else character(0)
+  # Capture inference location IDs for separate output
+  inference_location_ids <- if (exists("df_tasks_inference") && !is.null(df_tasks_inference) && nrow(df_tasks_inference) > 0 && "location_id" %in% names(df_tasks_inference)) unique(df_tasks_inference$location_id) else character(0)
   # No limit on inference locations
 } else {
   cat("Skipping inference data loading (SKIP_INFERENCE = TRUE).\n")

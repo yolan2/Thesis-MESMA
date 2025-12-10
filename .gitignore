@@ -16,4 +16,11 @@ venv.*
 .Rhistory
 .RData
 .Rproj.user/
-
+.png
+.csv
+.rds
+.Ruserdata
+.Rbuildignore
+.Rproj
+.Rhistory
+.bak
