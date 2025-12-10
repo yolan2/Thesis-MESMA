@@ -24,6 +24,12 @@ suppressPackageStartupMessages({
   library(rlang)
 })
 
+# Helper: phenological year (March 1-based)
+assign_pheno_year <- function(d) {
+  d <- as.Date(d)
+  ifelse(is.na(d), NA_integer_, ifelse(lubridate::month(d) >= 3, lubridate::year(d), lubridate::year(d) - 1))
+}
+
 # Stabilization constants for index calculations
 EPS_IDX_DENOM <- 1e-6
 
@@ -122,7 +128,7 @@ params <- get_msavi_params(df)
 MSAVI_SOIL <- params$soil; MSAVI_VEG <- params$veg
 cat(sprintf("Using MSAVI_SOIL=%.3f, MSAVI_VEG=%.3f (visualize)\n", MSAVI_SOIL, MSAVI_VEG))
 if("MSAVI" %in% names(df) && "date" %in% names(df)) {
-  df <- df %>% dplyr::mutate(.tmp_year = lubridate::year(date))
+  df <- df %>% dplyr::mutate(.tmp_year = assign_pheno_year(date))
   fvc_by <- df %>% dplyr::group_by(location_id, .tmp_year) %>% dplyr::summarise(ms_peak = suppressWarnings(max(MSAVI, na.rm = TRUE)), .groups='drop') %>%
     dplyr::mutate(FVC_est = {denom <- (MSAVI_VEG - MSAVI_SOIL); ifelse(is.finite(ms_peak) & denom > 1e-6, pmax(0, pmin(1, ((ms_peak - MSAVI_SOIL)/denom)^2)), NA_real_)})
   df <- df %>% dplyr::left_join(fvc_by, by = c("location_id",".tmp_year"))

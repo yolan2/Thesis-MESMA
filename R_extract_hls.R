@@ -5,31 +5,27 @@
 # `fit_veg_mixture_weighted.R`.
 
 opts <- list()
+# Path to a single combined CSV containing all incremental predictions and indices.
+# If present, this file will be used and the per-location directory scanning will be skipped.
+opts$input_file <- Sys.getenv('PHENO_INPUT_FILE', unset = 'C:/MAP/incremental_results.csv')
 opts$pred_dir <- Sys.getenv('ESTARFM_PRED_DIR', unset = 'C:/MAP/estarfm_results_gee')
 opts$out_dir <- Sys.getenv('PHENO_OUT_DIR', unset = 'phenology_results')
 dir.create(opts$out_dir, recursive = TRUE, showWarnings = FALSE)
 
-# Only accept predictor output files with the exact pattern:
-# location_<id>_timeseries.csv (one file per location with all years)
-files_all <- list.files(path = opts$pred_dir, pattern = '\\.(csv|CSV)$', recursive = TRUE, full.names = TRUE)
-files <- files_all[grepl('location_\\d+_timeseries\\.csv$', basename(files_all), perl=TRUE)]
-if(length(files) == 0) stop(sprintf('No predictor-style per-location timeseries CSVs found under %s. Run the predictor to generate files named like location_<id>_timeseries.csv', opts$pred_dir))
 
-message(sprintf('Found %d location CSV files - reading...', length(files)))
 library(data.table)
-dt_list <- vector('list', length(files))
-for(i in seq_along(files)){
-  f <- files[i]
-  dt <- tryCatch(fread(f), error = function(e) stop(sprintf('Failed reading %s: %s', f, e$message)))
-  # normalize column names
+
+# If a single combined input CSV exists, use it directly; otherwise scan for a
+# directory containing per-location timeseries CSVs as before.
+if (file.exists(opts$input_file)) {
+  message(sprintf('Found combined input CSV: %s - reading...', opts$input_file))
+  dt <- tryCatch(fread(opts$input_file), error = function(e) stop(sprintf('Failed reading input file %s: %s', opts$input_file, e$message)))
   setnames(dt, tolower(names(dt)))
-  # The predictor produces a per-location timeseries CSV with all years. Ensure the
-  # file contains at least 2 observations (preferably more); fail loudly if
-  # the file looks like a legacy single-observation export.
-  if(nrow(dt) < 2) stop(sprintf('File %s appears to contain fewer than 2 observations. The extractor requires per-location timeseries files (multiple rows).', f))
-  dt_list[[i]] <- dt
+  # For combined file, at least 2 rows is required
+  if (nrow(dt) < 2) stop(sprintf('Input CSV %s contains fewer than 2 rows; need at least two observations', opts$input_file))
+} else {
+  stop(sprintf('No combined input CSV found at %s. This extractor now requires a single combined incremental CSV; set the environment variable PHENO_INPUT_FILE to point to it (default: %s).', opts$input_file, opts$input_file))
 }
-dt <- rbindlist(dt_list, fill = TRUE)
 
 # Ensure date column exists and is Date
 if(!'prediction_date' %in% names(dt) && 'date' %in% names(dt)) dt[, prediction_date := date]
@@ -39,11 +35,6 @@ if(any(is.na(dt$date))) stop('Some prediction_date values could not be parsed as
 dt[, year := year(date)]
 dt[, doy := as.integer(strftime(date, '%j'))]
 
-# Create a standardized location_id matching the fit script's expectation:
-# "L_<lon>_<lat>" rounded to 4 decimals (so geojson mapping will match)
-if(!('lat' %in% names(dt) && 'lon' %in% names(dt))) stop('Per-location CSVs must include lat and lon columns')
-dt[, location_id := sprintf('L_%0.4f_%0.4f', round(lon,4), round(lat,4))]
-
 # Ensure expected band columns exist; fail loudly if not
 expected_bands <- c('band_blue','band_green','band_red','band_nir','band_swir1','band_swir2')
 missing_bands <- setdiff(expected_bands, names(dt))
@@ -51,6 +42,8 @@ if(length(missing_bands) > 0) stop(sprintf('Missing required band columns: %s', 
 
 # Convert to numeric and coerce NA if non-numeric
 for(b in expected_bands) set(dt, j = b, value = as.numeric(dt[[b]]))
+
+#
 
 # Rename band columns to remove 'band_' prefix for consistency
 setnames(dt, 
@@ -63,7 +56,7 @@ with(dt, {
   DVI <- nir - red
   OSAVI <- (nir - red) / (nir + red + 0.16)
   MCARI <- ((red - green) - 0.2*(red - blue)) * (red / (green + eps))
-  CRI <- (1/(green + eps)) - (1/(red + eps))
+  #CRI <- (1/(green + eps)) - (1/(red + eps))
   PRI <- (green - red) / (green + red + eps)
   NIRv <- nir * ((nir - red) / (nir + red + eps))
   PSRI <- (red - blue) / (nir + eps)
@@ -72,11 +65,31 @@ with(dt, {
   TCG <- (green - red) / (green + red + eps)  # Tasseled Cap Greenness approximation
   MNDWI <- (green - swir1) / (green + swir1 + eps)
   DUSTI <- (red - blue) / (red + blue + eps)
+  
+  # --- New Indices (Linearity & Soil/Moisture) ---
+  # NDVI: Normalized Difference Vegetation Index
+  NDVI <- (nir - red) / (nir + red + eps)
+  
+  # MSAVI2: Modified Soil Adjusted Vegetation Index 2
+  # Minimizes soil background influence
+  MSAVI2 <- (2 * nir + 1 - sqrt(pmax(0, (2 * nir + 1)^2 - 8 * (nir - red)))) / 2
+  
+  # NDMI: Normalized Difference Moisture Index
+  NDMI <- (nir - swir1) / (nir + swir1 + eps)
+  
+  # TCB: Tasseled Cap Brightness (Landsat 8 coefficients)
+  # 0.3029*Blue + 0.2786*Green + 0.4733*Red + 0.5599*NIR + 0.508*SWIR1 + 0.1872*SWIR2
+  TCB <- 0.3029 * blue + 0.2786 * green + 0.4733 * red + 0.5599 * nir + 0.508 * swir1 + 0.1872 * swir2
+  
+  # GVI: Green Vegetation Index (Tasseled Cap Greenness - Linear Combination)
+  # -0.2941*Blue - 0.243*Green - 0.5424*Red + 0.7276*NIR + 0.0713*SWIR1 - 0.1608*SWIR2
+  GVI <- -0.2941 * blue - 0.243 * green - 0.5424 * red + 0.7276 * nir + 0.0713 * swir1 - 0.1608 * swir2
+
   # Attach computed indices
   dt[, DVI := DVI]
   dt[, OSAVI := OSAVI]
   dt[, MCARI := MCARI]
-  dt[, CRI := CRI]
+  #dt[, CRI := CRI]
   dt[, PRI := PRI]
   dt[, NIRv := NIRv]
   dt[, PSRI := PSRI]
@@ -85,6 +98,11 @@ with(dt, {
   dt[, TCG := TCG]
   dt[, MNDWI := MNDWI]
   dt[, DUSTI := DUSTI]
+  dt[, NDVI := NDVI]
+  dt[, MSAVI2 := MSAVI2]
+  dt[, NDMI := NDMI]
+  dt[, TCB := TCB]
+  dt[, GVI := GVI]
 })
 
 # Apply transformations to improve linearity
@@ -93,7 +111,8 @@ dt[, NIRv := NIRv * 1.3]  # Using midpoint of recommended range
 
 # Validate we produced all OPTIMAL_INDICES expected by the fitter
 OPTIMAL_INDICES <- c(
-  'DVI','OSAVI','MCARI','CRI','PRI','NIRv','PSRI','NBR','TCW','TCG','MNDWI'
+  'DVI','OSAVI','MCARI','PRI','NIRv','PSRI','NBR','TCW','TCG','MNDWI',
+  'NDVI', 'MSAVI2', 'NDMI', 'TCB', 'GVI'
 )
 # DUSTI is intentionally not in OPTIMAL_INDICES, it is for filtering only
 missing_idx <- setdiff(OPTIMAL_INDICES, names(dt))
@@ -102,7 +121,7 @@ if(length(missing_idx) > 0) stop(sprintf('Extractor did not produce required ind
 # --- DUSTI filtering: remove observations with high DUSTI values ---
 if("DUSTI" %in% names(dt)) {
   # Define a threshold for DUSTI. This might need tuning.
-  DUSTI_THRESHOLD <- 0.1 
+  DUSTI_THRESHOLD <- 0.5 
   n_before <- nrow(dt)
   dt <- dt[dt$DUSTI <= DUSTI_THRESHOLD, ]
   n_after <- nrow(dt)
@@ -111,9 +130,14 @@ if("DUSTI" %in% names(dt)) {
   }
 }
 
-# --- Spline-based outlier detection: remove extreme values using moving splines ---
-# Apply spline outlier detection to all spectral indices per location-year combination
-if(all(c("DVI", "date", "doy") %in% names(dt))) {
+# --- Spline-based outlier detection: removed by default ---
+# Configuration toggle: outlier detection
+# Set to TRUE to re-enable spline-based outlier filtering
+ENABLE_OUTLIER_DETECTION <- FALSE
+if (!isTRUE(ENABLE_OUTLIER_DETECTION)) {
+  cat("Spline-based outlier detection disabled by configuration (ENABLE_OUTLIER_DETECTION = FALSE)\n")
+}
+if (isTRUE(ENABLE_OUTLIER_DETECTION) && all(c("DVI", "date", "doy") %in% names(dt))) {
   # Define the detect_spline_outliers function
   detect_spline_outliers <- function(values, doys, window_size = 45, outlier_threshold = 4.0) {
     if(length(values) < 10 || length(unique(doys)) < 5) {
@@ -202,86 +226,8 @@ if(all(c("DVI", "date", "doy") %in% names(dt))) {
   
   # Clean up temporary column
   dt[, outlier_mask := NULL]
-}
-
-# --- Dynamic baseline computation and subtraction ---
-# Apply baseline correction to normalize spectral indices per location-year
-if(all(c("DVI", "date", "doy") %in% names(dt))) {
-  # Process each location-year combination
-  loc_years <- unique(dt[, .(location_id, year)])
-  
-  for(i in seq_len(nrow(loc_years))) {
-    loc <- loc_years$location_id[i]
-    yr <- loc_years$year[i]
-    
-    # Subset data for this location-year
-    idx_rows <- dt$location_id == loc & dt$year == yr
-    loc_yr_data <- dt[idx_rows, ]
-    
-    if(nrow(loc_yr_data) < 30) {
-      cat(sprintf("Warning: Insufficient data for baseline computation in %s_%d: only %d observations (minimum 30 required)\n", 
-                  loc, yr, nrow(loc_yr_data)))
-      next
-    }
-    
-    # Sort by day of year
-    loc_yr_data <- loc_yr_data[order(loc_yr_data$doy), ]
-    
-    # Find the lowest continuous 30-day period
-    window_size <- 30
-    n_windows <- nrow(loc_yr_data) - window_size + 1
-    
-    if(n_windows > 0) {
-      window_medians <- rep(NA_real_, n_windows)
-      
-      for(w in 1:n_windows) {
-        window_data <- loc_yr_data[w:(w + window_size - 1), ]
-        window_dvi <- window_data$DVI[is.finite(window_data$DVI)]
-        if(length(window_dvi) >= 10) {  # Require at least 10 valid observations
-          window_medians[w] <- median(window_dvi, na.rm = TRUE)
-        }
-      }
-      
-      # Find window with lowest median MSAVI
-      if(any(is.finite(window_medians))) {
-        best_window_idx <- which.min(window_medians)
-        baseline_period <- loc_yr_data[best_window_idx:(best_window_idx + window_size - 1), ]
-        
-        # Calculate baseline as median of DVI in this 30-day period
-        baseline_median <- median(baseline_period$DVI[is.finite(baseline_period$DVI)], na.rm = TRUE)
-        
-        if(is.finite(baseline_median)) {
-          # Apply baseline subtraction to all spectral indices
-          for(idx in OPTIMAL_INDICES) {
-            if(idx %in% names(dt)) {
-              sub_vals <- dt[[idx]][idx_rows]
-              # Use median from the 20-day baseline period
-              baseline_vals <- baseline_period[[idx]]
-              base_med <- suppressWarnings(median(baseline_vals[is.finite(baseline_vals)], na.rm = TRUE))
-              
-              if(is.finite(base_med)) {
-                dt[[idx]][idx_rows] <- sub_vals - base_med
-              } else {
-                cat(sprintf("Warning: Could not compute baseline for index %s in %s_%d\n", idx, loc, yr))
-              }
-            }
-          }
-          
-          # Diagnostic output
-          cat(sprintf("Baseline for %s_%d: 30-day window starting DOY %d, baseline=%.4f\n", 
-                      loc, yr, baseline_period$doy[1], baseline_median))
-        } else {
-          cat(sprintf("Warning: Baseline computation failed for %s_%d: computed baseline is not finite\n", loc, yr))
-        }
-      } else {
-        cat(sprintf("Warning: Failed to find valid 30-day baseline window for %s_%d: no windows with sufficient observations\n", loc, yr))
-      }
-    } else {
-      cat(sprintf("Warning: Failed to find valid 30-day baseline window for %s_%d: insufficient finite DVI values\n", loc, yr))
-    }
-  }
-  
-  cat("Baseline normalization completed.\n")
+} else {
+  # outlier detection skipped (disabled by configuration)
 }
 
 # Minimal metadata expected by the fit script

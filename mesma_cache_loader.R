@@ -42,21 +42,19 @@ rload_mesma_cache <- function(cache_dir = file.path(OUT_DIR, "mesma_cache")) {
   lib_data <- readRDS(lib_path)
   cache$lib <- lib_data$lib
   cache$mesma_lib <- lib_data$mesma_lib
-  cache$lib_factor_pca <- lib_data$lib_factor_pca
-  cache$lib_factor_lda <- lib_data$lib_factor_lda
+  cache$raw_lib_templates <- lib_data$raw_lib_templates
   cache$veg_counts <- lib_data$veg_counts
   cache$avail <- lib_data$avail
   cache$ALLOWED_VEG <- lib_data$ALLOWED_VEG
   cache$BAND_SCALE <- lib_data$BAND_SCALE
   cache$COMPRESSED_STAGE1_LIB <- lib_data$COMPRESSED_STAGE1_LIB
 
-  # Load projections
-  proj_path <- file.path(cache_dir, "projection_matrices.rds")
-  if (!file.exists(proj_path)) stop("projection_matrices.rds not found in cache")
-  proj_data <- readRDS(proj_path)
-  cache$GLOBAL_PCA <- proj_data$GLOBAL_PCA
-  cache$GLOBAL_LDA <- proj_data$GLOBAL_LDA
-  cache$pca_rank <- proj_data$pca_rank
+  # Load raw templates (365 x K matrices)
+  raw_path <- file.path(cache_dir, "raw_templates.rds")
+  if (file.exists(raw_path)) {
+    raw_data <- readRDS(raw_path)
+    cache$raw_lib_templates <- raw_data$raw_lib_templates
+  }
 
   # Load compressed templates (optional)
   templates_path <- file.path(cache_dir, "compressed_templates.rds")

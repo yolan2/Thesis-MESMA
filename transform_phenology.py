@@ -122,7 +122,7 @@ class PhenologyTransformer:
         df["OSAVI"] = (df["nir"] - df["red"]) / (df["nir"] + df["red"] + 0.16)
         # MCARI: ((R - G) - 0.2*(R - B)) * (R / (G + eps))
         df["MCARI"] = ((df["red"] - df["green"]) - 0.2 * (df["red"] - df["blue"])) * (df["red"] / (df["green"] + eps))
-        df["CRI"] = (1.0 / (df["green"] + eps)) - (1.0 / (df["red"] + eps))
+        #df["CRI"] = (1.0 / (df["green"] + eps)) - (1.0 / (df["red"] + eps))
         df["PRI"] = (df["green"] - df["red"]) / (df["green"] + df["red"] + eps)
         df["NIRv"] = df["nir"] * ((df["nir"] - df["red"]) / (df["nir"] + df["red"] + eps))
         df["PSRI"] = (df["red"] - df["blue"]) / (df["nir"] + eps)
@@ -132,9 +132,23 @@ class PhenologyTransformer:
         df["MNDWI"] = (df["green"] - df["swir1"]) / (df["green"] + df["swir1"] + eps)
         df["DUSTI"] = (df["red"] - df["blue"]) / (df["red"] + df["blue"] + eps)
 
-        # MSAVI: stable formulation
+        # MSAVI: stable formulation (MSAVI2)
         # MSAVI = (2*N + 1 - sqrt((2N + 1)^2 - 8(N - R))) / 2
         df["MSAVI"] = (2 * df["nir"] + 1 - np.sqrt(np.maximum(0.0, (2 * df["nir"] + 1) ** 2 - 8 * (df["nir"] - df["red"])))) / 2
+        df["MSAVI2"] = df["MSAVI"]
+
+        # --- New Indices ---
+        # NDVI
+        df["NDVI"] = (df["nir"] - df["red"]) / (df["nir"] + df["red"] + eps)
+        
+        # NDMI
+        df["NDMI"] = (df["nir"] - df["swir1"]) / (df["nir"] + df["swir1"] + eps)
+        
+        # TCB (Tasseled Cap Brightness - Landsat 8)
+        df["TCB"] = 0.3029 * df["blue"] + 0.2786 * df["green"] + 0.4733 * df["red"] + 0.5599 * df["nir"] + 0.508 * df["swir1"] + 0.1872 * df["swir2"]
+        
+        # GVI (Tasseled Cap Greenness - Linear)
+        df["GVI"] = -0.2941 * df["blue"] - 0.243 * df["green"] - 0.5424 * df["red"] + 0.7276 * df["nir"] + 0.0713 * df["swir1"] - 0.1608 * df["swir2"]
 
         # Apply small correction to NIRv (as in your snippet)
         df["NIRv"] = df["NIRv"] * 1.3
@@ -148,11 +162,15 @@ class PhenologyTransformer:
             print(f"✓ Applied DUSTI filter: removed {n_before - n_after} observations with DUSTI > {dusti_threshold}")
 
         # Outlier detection per (location_id, year) using MAD-based robust filtering
+        # Disabled by default: do not remove observations based on per-year outlier detection
+        ENABLE_OUTLIER_DETECTION = False
+        if not ENABLE_OUTLIER_DETECTION:
+            print("Outlier detection disabled by configuration (ENABLE_OUTLIER_DETECTION = False)")
+        
         optimal_indices = [
             "DVI",
             "OSAVI",
             "MCARI",
-            "CRI",
             "PRI",
             "NIRv",
             "PSRI",
@@ -160,6 +178,11 @@ class PhenologyTransformer:
             "TCW",
             "TCG",
             "MNDWI",
+            "NDVI",
+            "MSAVI2",
+            "NDMI",
+            "TCB",
+            "GVI",
         ]
 
         def outlier_detection(group: pd.DataFrame) -> pd.DataFrame:
@@ -180,23 +203,27 @@ class PhenologyTransformer:
             return group[mask]
 
         # Group and run outlier detection in parallel for speed
-        groups = list(df.groupby(["location_id", "year"]))
-        if len(groups) > 0:
-            workers = get_optimal_workers("mixed")
-            results = []
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {executor.submit(outlier_detection, grp.copy()): key for key, grp in groups}
-                for f in as_completed(futures):
-                    try:
-                        res = f.result()
-                        if res is not None and len(res) > 0:
-                            results.append(res)
-                    except Exception as exc:
-                        key = futures[f]
-                        print(f"⚠ Outlier filtering failed for {key}: {exc}")
+        if ENABLE_OUTLIER_DETECTION:
+            groups = list(df.groupby(["location_id", "year"]))
+            if len(groups) > 0:
+                workers = get_optimal_workers("mixed")
+                results = []
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = {executor.submit(outlier_detection, grp.copy()): key for key, grp in groups}
+                    for f in as_completed(futures):
+                        try:
+                            res = f.result()
+                            if res is not None and len(res) > 0:
+                                results.append(res)
+                        except Exception as exc:
+                            key = futures[f]
+                            print(f"⚠ Outlier filtering failed for {key}: {exc}")
 
-            if len(results) > 0:
-                df = pd.concat(results).reset_index(drop=True)
+                if len(results) > 0:
+                    df = pd.concat(results).reset_index(drop=True)
+        else:
+            # Outlier detection disabled: keep all rows
+            pass
 
         # Add required metadata columns
         # Choose the best available lon/lat source columns for imagery/target values

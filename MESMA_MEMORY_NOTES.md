@@ -23,3 +23,5 @@ New preprocessing step (soil-first MESMA):
 Important: there is no per-row soil-subtraction fallback. If the provisional PCA cannot be built (insufficient data) or the per-location-year alpha estimator fails, the script will skip soil subtraction rather than try a per-row subtraction.
 
 This helps removing soil contamination from vegetation endmember extraction and preserves the time-dimension reduction (PCA) downstream.
+
+Plotting note: Plots that overlay vegetation and barren/soil fractions (e.g. the global coverage plots) now compute an adaptive scaling factor so that barren and vegetation series are displayed on the same figure but with separate primary and secondary y-axes. This avoids hard-coded scale values and makes the visualization readable when barren and vegetation are on very different ranges.
