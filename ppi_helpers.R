@@ -1,8 +1,6 @@
 ## Centralized PPI helpers for consistent calculation across scripts
 ## Provides: PPI_DVI_SOIL, calculate_solar_zenith, ppi, add_ppi_columns
 
-PPI_DVI_SOIL <- 0.09  # Use the same default as january_averages.R
-
 calculate_solar_zenith <- function(lat, doy, hour = 10.5) {
   lat_rad <- lat * pi / 180
   dec_rad <- 23.45 * sin(2 * pi * (284 + doy) / 365) * pi / 180
@@ -11,14 +9,14 @@ calculate_solar_zenith <- function(lat, doy, hour = 10.5) {
   acos(pmin(pmax(cos_z, -1), 1))
 }
 
-ppi <- function(dvi, zenith.angle, M = max(dvi) + 0.005, dvi.soil = PPI_DVI_SOIL, G = 0.5){
+ppi <- function(dvi, zenith.angle, M = max(dvi) + 0.005, G = 0.5){
   stopifnot(!anyNA(dvi), !anyNA(zenith.angle))
   if(any(zenith.angle > pi)) warning("zenith.angle must be in radians, but is most probably in degrees")
   d_c <- 0.0336 + 0.0477/cos(zenith.angle)
   Q_E <- d_c + (1 - d_c) * G / cos(zenith.angle)
   K <- 1/(4*Q_E) * (1 + M)/(1 - M)
 
-  denom <- M - dvi.soil
+  denom <- M
   numer <- M - dvi
   ratio <- numer / denom
   invalid_denom <- (denom <= 1e-6)
@@ -69,7 +67,7 @@ add_ppi_columns <- function(df, lat) {
   peak_df$PPI <- NA_real_
   ppi_idx <- complete.cases(peak_df$DVI_max, peak_df$zenith.angle)
   if (any(ppi_idx)) {
-    peak_df$PPI[ppi_idx] <- ppi(dvi = peak_df$DVI_max[ppi_idx], zenith.angle = peak_df$zenith.angle[ppi_idx], M = peak_df$DVI_max[ppi_idx] + 0.005, dvi.soil = PPI_DVI_SOIL)
+    peak_df$PPI[ppi_idx] <- ppi(dvi = peak_df$DVI_max[ppi_idx], zenith.angle = peak_df$zenith.angle[ppi_idx], M = peak_df$DVI_max[ppi_idx] + 0.005)
   }
 
   drop_cols <- intersect(c("DVI_max", "PPI", "zenith.angle"), names(df))

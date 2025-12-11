@@ -26,7 +26,6 @@ options(warn = 1)  # print warnings as they occur for debugging
 
 # Skip PPI calculation to avoid zenith.angle errors
 SKIP_PPI <- FALSE
-PPI_DVI_SOIL <- 0.001  # Set to match january_averages.R default
 
 # Input/Output Files
 INPUT_CSV <- "phenology_results/hls_phenology_data.csv"
@@ -37,12 +36,11 @@ TRAIN_YEARS <- c(2024)  # Years to use for training (note: script uses all data)
 
 # Parallel Processing
 PARALLEL_ENABLE <- TRUE
-PARALLEL_WORKERS <- parallel::detectCores()
+PARALLEL_WORKERS <- (parallel::detectCores() - 1)
 COMBO_PARALLEL_WORKERS <- max(1L, floor(PARALLEL_WORKERS/2))
 
 # MESMA Configuration
 ENABLE_DIAGNOSTICS <- TRUE
-# ENABLE_GEOMETRIC_MESMA <- TRUE  # Always use geometric MESMA now
 TOP_K_CANDIDATES <- 10L
 MAX_VARIANTS_PER_VEG <- 10
 MIN_VARIANTS_PER_VEG <- 1
@@ -168,7 +166,6 @@ if (!exists("add_ppi_columns")) add_ppi_columns <- function(df, lat) {
       dvi = peak_df$DVI_max[ppi_idx],
       zenith.angle = peak_df$zenith.angle[ppi_idx],
       M = peak_df$DVI_max[ppi_idx] + 0.005,
-      dvi.soil = PPI_DVI_SOIL
     )
   }
 
@@ -481,7 +478,12 @@ MIN_SKIP_DOYS_PER_LOCATION <- 2L
 
 # General algorithm toggles
 FAST_VAR <- TRUE
-TEMPORAL_BUDGET <- 365L  # Full year resolution (no compression)
+
+# Pentad (5-day interval) aggregation settings
+TEMPORAL_AGGREGATION_DAYS <- 5L  # 5-day intervals (pentads)
+N_TEMPORAL_BINS <- ceiling(365 / TEMPORAL_AGGREGATION_DAYS)  # = 73 pentads
+TEMPORAL_BUDGET <- N_TEMPORAL_BINS  # Use pentad resolution (no compression beyond pentad aggregation)
+
 TOPK_VARIANTS <- 5L
 N_VARIANTS_PER_VEG <- 7L
 MIN_CLUSTER_SIZE <- 10L
@@ -517,35 +519,53 @@ geometric_unmix_two_endmembers <- function(y, m1, m2) {
   m1 <- as.numeric(m1)
   m2 <- as.numeric(m2)
   
+  # Handle NA values: use only indices where ALL three vectors have finite values
+  valid_idx <- is.finite(y) & is.finite(m1) & is.finite(m2)
+  if (sum(valid_idx) < 2) {
+    # Not enough valid dimensions for meaningful unmixing
+    return(list(f1 = NA_real_, f2 = NA_real_, y_proj = rep(NA_real_, length(y)), 
+                residual = NA_real_, t = NA_real_, n_valid = sum(valid_idx)))
+  }
+  
+  # Subset to valid indices only
+  y_valid <- y[valid_idx]
+  m1_valid <- m1[valid_idx]
+  m2_valid <- m2[valid_idx]
+  
   # The EM-line direction vector
-  em_line <- m2 - m1
+  em_line <- m2_valid - m1_valid
   em_norm_sq <- sum(em_line^2)
   
   # Degenerate case: identical endmembers
   if (em_norm_sq < 1e-10) {
-    return(list(f1 = 0.5, f2 = 0.5, y_proj = m1, residual = sqrt(sum((y - m1)^2)), t = 0.5))
+    return(list(f1 = 0.5, f2 = 0.5, y_proj = m1, residual = sqrt(sum((y_valid - m1_valid)^2)), 
+                t = 0.5, n_valid = sum(valid_idx)))
   }
   
   # Project y onto the EM-line
   # t is the parameter: y' = m1 + t * (m2 - m1)
   # t = 0 means y' = m1, t = 1 means y' = m2
-  y_minus_m1 <- y - m1
+  y_minus_m1 <- y_valid - m1_valid
   t_unclamped <- sum(y_minus_m1 * em_line) / em_norm_sq
   
   # Clamp t to [0, 1] for valid fractions (fully constrained)
   t_clamped <- max(0, min(1, t_unclamped))
   
-  # Projected point on EM-line
-  y_proj <- m1 + t_clamped * em_line
+  # Projected point on EM-line (for valid dimensions)
+  y_proj_valid <- m1_valid + t_clamped * em_line
   
-  # Residual (reconstruction error)
-  residual <- sqrt(sum((y - y_proj)^2))
+  # Reconstruct full projection vector with NA where original was NA
+  y_proj <- rep(NA_real_, length(y))
+  y_proj[valid_idx] <- y_proj_valid
+  
+  # Residual (reconstruction error) - only on valid dimensions
+  residual <- sqrt(sum((y_valid - y_proj_valid)^2))
   
   # Fractions: f2 = t (fraction of m2), f1 = 1 - t (fraction of m1)
   f2 <- t_clamped
   f1 <- 1 - t_clamped
   
-  list(f1 = f1, f2 = f2, y_proj = y_proj, residual = residual, t = t_unclamped)
+  list(f1 = f1, f2 = f2, y_proj = y_proj, residual = residual, t = t_unclamped, n_valid = sum(valid_idx))
 }
 
 
@@ -1257,7 +1277,6 @@ MIN_UNIQUE_DOY_DEFAULT <- 5L
 MIN_UNIQUE_DOY_INFERENCE <- 1L
 
 # Maximum number of inference locations to include in the separate inference results
-# INFERENCE_MAX_LOCATIONS <- 2000L  # Removed limit
 # Bootstrap variant-switching control: keep variants fixed by default (recommended).
 VARIANT_SWITCH_BOOTSTRAP <- TRUE
 VARIANT_SWITCH_RE_CENTER <- TRUE
@@ -1349,7 +1368,8 @@ detect_and_rescale_indices <- function(df, cols = OPTIMAL_INDICES) {
     if (scale_factor > 1) {
       for (c in present) df[[c]] <- as.numeric(df[[c]]) / scale_factor
       cat(sprintf("[NOTICE] Detected index magnitudes with 99%%ile ~ %f; rescaled indices by 1/%d to expected range.\n", global_max, scale_factor))
-      return(list(df = df, BAND_SCALE = 1/scale_factor))
+      # Return the scale_factor used, so inference can divide by same factor
+      return(list(df = df, BAND_SCALE = scale_factor))
     }
   }
   return(list(df = df, BAND_SCALE = 1))
@@ -1368,24 +1388,22 @@ if (SKIP_PPI) {
   df$zenith.angle <- NA_real_
 } else {
   df <- add_ppi_columns(df, 40.2)
+  # Ensure numeric PPI column exists
+  if ("PPI" %in% names(df)) df$PPI <- as.numeric(df$PPI)
   cat("Calculated PPI using add_ppi_columns with lat=40.2\n")
+  # If PPI column exists, include it in OPTIMAL_INDICES so it's normalized and treated like other indices
+  if ("PPI" %in% names(df) && !("PPI" %in% OPTIMAL_INDICES)) {
+    OPTIMAL_INDICES <- c(OPTIMAL_INDICES, "PPI")
+    cat("[NOTICE] Added PPI to OPTIMAL_INDICES for normalization and pentad processing\n")
+  }
 }
-# --- PPI Calculation End ---
+# =============================================================================
+# COMPREHENSIVE DATA NORMALIZATION FUNCTION
+# Applies all preprocessing steps consistently to training and inference data
+# =============================================================================
 
-# Ensure PPI-related columns exist
-if (!"zenith.angle" %in% names(df)) df$zenith.angle <- NA_real_
-if (!"PPI" %in% names(df)) df$PPI <- NA_real_
-
-# Apply linearization to indices
-df <- linearize_indices(df)
-
-# Detect and rescale indices after linearization if they appear scaled (e.g. inputs in 0-10000)
-idx_scale_res <- detect_and_rescale_indices(df, cols = OPTIMAL_INDICES)
-df <- idx_scale_res$df
-BAND_SCALE <- idx_scale_res$BAND_SCALE
-if (!exists("BAND_SCALE") || is.null(BAND_SCALE)) BAND_SCALE <- 1
-
-# Normalize indices after linearization to robust [-1..1] range per-index to avoid overly scaled indices
+#' Normalize indices after linearization to robust [-1..1] range per-index
+#' Returns df with scaled indices and stores scale factors as attribute
 normalize_indices_after_linearization <- function(df, cols = OPTIMAL_INDICES) {
   present <- intersect(cols, names(df))
   idx_scales <- list()
@@ -1401,55 +1419,93 @@ normalize_indices_after_linearization <- function(df, cols = OPTIMAL_INDICES) {
   df
 }
 
-# Recompute PPI from scaled DVI values (in case DVI was rescaled post-linearization)
-recompute_ppi_from_scaled_dvi <- function(df, lat_default = 40.2) {
-  if (!"DVI" %in% names(df) || !"date" %in% names(df)) return(df)
-  df$date <- as.Date(df$date)
-  if (!"doy" %in% names(df)) df$doy <- lubridate::yday(df$date)
-  if (!"year" %in% names(df)) df$year <- lubridate::year(df$date)
-  if (!"pheno_year" %in% names(df)) df$pheno_year <- assign_pheno_year(df$date)
-
-  peak_df <- df %>%
-    group_by(location_id, pheno_year) %>%
-    summarise(
-      DVI_max = if (all(is.na(DVI))) NA_real_ else max(DVI, na.rm = TRUE),
-      doy_peak = { if (all(is.na(DVI))) NA_integer_ else { idx <- which.max(DVI); doy[idx[1]] } },
-      .groups = "drop"
-    )
-  peak_df$DVI_max[!is.finite(peak_df$DVI_max)] <- NA_real_
-  peak_df$doy_peak[!is.finite(peak_df$doy_peak)] <- NA_integer_
-
-  if ("lat" %in% names(df)) {
-    lat_lookup <- df %>% group_by(location_id) %>% summarise(lat_use = mean(lat, na.rm = TRUE), .groups = "drop")
-  } else {
-    lat_lookup <- data.frame(location_id = unique(df$location_id), lat_use = lat_default)
+#' Comprehensive normalization function for MESMA data preprocessing
+#' Applies linearization, scaling detection, and per-index normalization
+#' Returns normalized data and normalization parameters for reuse
+normalize_mesma_data <- function(df, cols = OPTIMAL_INDICES, lat_default = 40.2) {
+  cat("Applying comprehensive MESMA data normalization...\n")
+  
+  # Ensure PPI-related columns exist
+  if (!"zenith.angle" %in% names(df)) df$zenith.angle <- NA_real_
+  if (!"PPI" %in% names(df)) df$PPI <- NA_real_
+  
+  # Apply linearization to indices
+  df <- linearize_indices(df)
+  
+  # Calculate Z-score parameters (mean/sd) for each index
+  # Do NOT apply them here - we only want to calculate them for later use
+  INDEX_SCALES <- list()
+  present <- intersect(cols, names(df))
+  
+  for (col in present) {
+    vals <- df[[col]]
+    vals <- vals[is.finite(vals)]
+    if (length(vals) > 0) {
+      mu <- mean(vals)
+      sigma <- sd(vals)
+      if (!is.finite(sigma) || sigma < 1e-10) sigma <- 1.0
+      INDEX_SCALES[[col]] <- list(mean = mu, sd = sigma)
+    }
   }
-  peak_df <- peak_df %>% left_join(lat_lookup, by = "location_id")
-  peak_df$lat_use[!is.finite(peak_df$lat_use)] <- lat_default
-
-  peak_df$zenith.angle <- NA_real_
-  zen_idx <- complete.cases(peak_df$lat_use, peak_df$doy_peak)
-  if (any(zen_idx)) {
-    peak_df$zenith.angle[zen_idx] <- calculate_solar_zenith(lat = peak_df$lat_use[zen_idx], doy = peak_df$doy_peak[zen_idx])
-  }
-
-  peak_df$PPI <- NA_real_
-  ppi_idx <- complete.cases(peak_df$DVI_max, peak_df$zenith.angle)
-  if (any(ppi_idx)) {
-    peak_df$PPI[ppi_idx] <- ppi(dvi = peak_df$DVI_max[ppi_idx], zenith.angle = peak_df$zenith.angle[ppi_idx], M = peak_df$DVI_max[ppi_idx] + 0.005, dvi.soil = PPI_DVI_SOIL)
-  }
-
-  # Replace existing columns in df
-  drop_cols <- intersect(c("DVI_max", "PPI", "zenith.angle"), names(df))
-  if (length(drop_cols)) df[drop_cols] <- NULL
-  df <- df %>% left_join(peak_df %>% select(location_id, pheno_year, DVI_max, zenith.angle, PPI), by = c("location_id", "pheno_year"))
-  as.data.frame(df)
+  
+  # Return linearized (but unscaled) data and parameters
+  list(
+    df = df,
+    BAND_SCALE = 1, # Deprecated
+    INDEX_SCALES = INDEX_SCALES
+  )
 }
 
-# recompute PPI now after possible index rescaling
-df <- recompute_ppi_from_scaled_dvi(df)
+#' Apply stored normalization parameters to new data
+#' Used for inference data to match training data preprocessing
+apply_stored_normalization <- function(df, norm_params, cols = OPTIMAL_INDICES, lat_default = 40.2) {
+  cat("Applying stored normalization parameters to data...\n")
+  
+  # Ensure PPI-related columns exist
+  if (!"zenith.angle" %in% names(df)) df$zenith.angle <- NA_real_
+  if (!"PPI" %in% names(df)) df$PPI <- NA_real_
+  
+  # Apply linearization to indices
+  df <- linearize_indices(df)
+  
+  # Do NOT apply scaling here - we want raw (linearized) data for soil subtraction
+  # Scaling will be applied explicitly in fit_one_task where needed
+  
+  df
+}
 
-df <- normalize_indices_after_linearization(df)
+#' Apply Stage 2 normalization to soil-corrected vegetation data
+#' Uses INDEX_SCALES_STAGE2 computed from pure vegetation samples
+#' @param vec Numeric vector of index values (soil-corrected)
+#' @param idx_names Character vector of index names (same order as vec elements)
+#' @param norm_params List containing INDEX_SCALES_STAGE2
+#' @return Normalized vector
+apply_stage2_normalization <- function(vec, idx_names, norm_params) {
+  if (is.null(norm_params$INDEX_SCALES) || length(norm_params$INDEX_SCALES) == 0) {
+    return(vec)  # No normalization parameters available
+  }
+  
+  if (length(vec) != length(idx_names)) {
+    warning("apply_stage2_normalization: vec/idx_names length mismatch")
+    return(vec)
+  }
+  
+  # Apply per-index Z-score scaling (x - mean) / sd
+  for (i in seq_along(idx_names)) {
+    idx_name <- idx_names[i]
+    if (idx_name %in% names(norm_params$INDEX_SCALES)) {
+      params <- norm_params$INDEX_SCALES[[idx_name]]
+      mu <- params$mean
+      sigma <- params$sd
+      
+      if (is.finite(mu) && is.finite(sigma) && sigma > 0) {
+        vec[i] <- (vec[i] - mu) / sigma
+      }
+    }
+  }
+  
+  vec
+}
 
 # Filter indices based on linearity after linearization
 linearity_file <- "index_linearity_scores.csv"
@@ -1478,6 +1534,25 @@ missing_idx <- setdiff(OPTIMAL_INDICES, names(df))
 if (length(missing_idx) > 0) {
   stop(paste0("INPUT_CSV missing required indices: ", paste(missing_idx, collapse = ", ")))
 }
+
+# Apply comprehensive normalization to training data and store parameters
+cat("\n=== APPLYING TRAINING DATA NORMALIZATION ===\n")
+norm_result <- normalize_mesma_data(df, cols = OPTIMAL_INDICES, lat_default = 40.2)
+df <- norm_result$df
+BAND_SCALE <- norm_result$BAND_SCALE
+INDEX_SCALES <- norm_result$INDEX_SCALES
+
+# Store normalization parameters globally for inference data (Stage 1)
+# Stage 2 normalization will be computed after GeoJSON join provides 'no soil' column
+TRAINING_NORM_PARAMS <- list(
+  BAND_SCALE = BAND_SCALE,
+  INDEX_SCALES = INDEX_SCALES,
+  INDEX_SCALES_STAGE2 = list()  # Will be populated after GeoJSON join
+)
+cat(sprintf("Stored normalization params: BAND_SCALE=%f, INDEX_SCALES for %d indices\n", 
+            BAND_SCALE, length(INDEX_SCALES)))
+cat("(Stage 2 normalization will be computed after GeoJSON join)\n")
+cat("===========================================\n\n")
 
 # Assign valid location_ids as row numbers to replace invalid "L_NA_NA" values
 # Replace only the rows that are invalid (NA or explicitly "L_NA_NA") rather than
@@ -1671,6 +1746,15 @@ if ("location_id" %in% names(df) && "location_id" %in% names(gpts_map)) {
     print(sample_geo_rows)
     cat("Hint: CSV 'location_id' might be numeric row indices; try setting location IDs in the CSV to match the GeoJSON row order or use the row-number mapping.\n")
   }
+  
+  # =============================================================================
+  # STAGE 2 NORMALIZATION: DEPRECATED
+  # =============================================================================
+  # We now use a single Z-score normalization (INDEX_SCALES) computed in normalize_mesma_data.
+  # No separate Stage 2 normalization is performed.
+  # Soil subtraction happens on unscaled data, then Z-score is applied before Stage 2 unmixing.
+  
+  cat("\n=== STAGE 2 NORMALIZATION SKIPPED (Using single Z-score normalization) ===\n")
 }
 
 # Add timing for major operations
@@ -1897,7 +1981,7 @@ whiten_matrix <- function(X, epsilon = 1e-6) {
 #' 
 #' Stage 1: PCA removes multicollinearity while preserving most variance
 #' Stage 2: LDA finds directions that best separate vegetation classes
-#' Compute PCA-LDA weights (weekly resolution for improved dimensionality reduction)
+#' Compute PCA-LDA weights (pentad resolution for improved dimensionality reduction)
 compute_pca_lda_weights <- function(lib_df, avail_idx, pca_variance_threshold = PCA_VARIANCE_THRESHOLD, lda_weight_floor = LDA_WEIGHT_FLOOR) {
   
   cat("\n=== COMPUTING PCA → LDA FEATURE WEIGHTS ===\n")
@@ -1927,17 +2011,19 @@ compute_pca_lda_weights <- function(lib_df, avail_idx, pca_variance_threshold = 
       n_unique_doys <- length(unique(dly_year$doy))
       if (n_unique_doys < 5) next
       
-      # Build weekly 53 × K matrix (reduced temporal resolution)
-      raw_mat <- build_weekly_matrix(dly_year, avail_idx)
+      # Build pentad N_TEMPORAL_BINS × K matrix (5-day aggregation)
+      raw_mat <- build_pentad_matrix(dly_year, avail_idx)
       if (is.null(raw_mat)) next
       
-      # Require at least 5 unique DOYs
-      n_unique_doys <- length(unique(dly_year$doy))
-      if (n_unique_doys < 5) next
+      # Use pentad matrix flattened as features
+      compressed <- as.numeric(raw_mat)  # N_TEMPORAL_BINS * K vector
       
-      # Use weekly matrix flattened as features (reduced dimensionality)
-      compressed <- as.numeric(raw_mat)  # 53 * K vector
-      if (any(!is.finite(compressed))) next
+      # Count valid (non-NA) values - require at least 50% coverage
+      valid_frac <- sum(is.finite(compressed)) / length(compressed)
+      if (valid_frac < 0.5) next
+      
+      # Replace NA with 0 for PCA/LDA (will be centered anyway)
+      compressed[!is.finite(compressed)] <- 0
       
       all_features[[length(all_features) + 1]] <- compressed
       all_labels <- c(all_labels, veg)
@@ -1952,7 +2038,7 @@ compute_pca_lda_weights <- function(lib_df, avail_idx, pca_variance_threshold = 
   X <- do.call(rbind, all_features)
   y <- factor(all_labels)
   
-  cat(sprintf("Feature matrix: %d samples × %d features (weekly resolution)\n", nrow(X), ncol(X)))
+  cat(sprintf("Feature matrix: %d samples × %d features (pentad resolution)\n", nrow(X), ncol(X)))
   cat(sprintf("Class distribution: %s\n", 
               paste(sprintf("%s=%d", levels(y), table(y)), collapse=", ")))
   
@@ -2065,127 +2151,53 @@ compute_pca_lda_weights <- function(lib_df, avail_idx, pca_variance_threshold = 
   )
 }
 
-#' Build weekly aggregated K × 52 index matrix from daily data
-#' Reduces temporal resolution from daily to weekly for better LDA performance
-build_weekly_matrix <- function(dly_year, avail_idx) {
+#' Compute pentad (5-day bin) from DOY
+#' @param doy Day of year (1-366)
+#' @return Pentad number (1-73)
+doy_to_pentad <- function(doy) {
+  pmin(ceiling(doy / TEMPORAL_AGGREGATION_DAYS), N_TEMPORAL_BINS)
+}
+
+#' Build pentad (5-day interval) × K index matrix from daily data
+#' NO interpolation - missing pentads remain as NA
+#' @param dly_year Data frame with daily observations
+#' @param avail_idx Vector of index column names to use
+#' @return Matrix of size N_TEMPORAL_BINS × K (73 × K for 5-day pentads)
+build_pentad_matrix <- function(dly_year, avail_idx) {
   if (nrow(dly_year) == 0) return(NULL)
 
   if (!"doy" %in% names(dly_year)) {
     dly_year$doy <- lubridate::yday(dly_year$date)
   }
+  
+  # Compute pentad for each observation
+  dly_year$pentad <- doy_to_pentad(dly_year$doy)
 
   K <- length(avail_idx)
-  # 52 weeks + 1 extra day bin = 53 bins total
-  raw_mat <- matrix(NA_real_, nrow = 53, ncol = K)
-  colnames(raw_mat) <- avail_idx
+  pentad_mat <- matrix(NA_real_, nrow = N_TEMPORAL_BINS, ncol = K)
+  colnames(pentad_mat) <- avail_idx
 
   for (j in seq_along(avail_idx)) {
     idx <- avail_idx[j]
     if (!idx %in% names(dly_year)) next
 
-    # Aggregate by DOY (median for robustness)
-    vals_by_doy <- tapply(dly_year[[idx]], dly_year$doy, function(v) {
+    # Aggregate by pentad (median for robustness)
+    vals_by_pentad <- tapply(dly_year[[idx]], dly_year$pentad, function(v) {
       v <- v[is.finite(v)]
       if (length(v) == 0) NA_real_ else median(v)
     })
 
-    doy_values <- as.integer(names(vals_by_doy))
-    valid <- doy_values >= 1 & doy_values <= 365
-    daily_vals <- rep(NA_real_, 365)
-    daily_vals[doy_values[valid]] <- vals_by_doy[valid]
-
-    # Interpolate missing DOYs first
-    finite_idx <- which(is.finite(daily_vals))
-    if (length(finite_idx) >= 2) {
-      missing_idx <- which(!is.finite(daily_vals))
-      if (length(missing_idx) > 0) {
-        daily_vals[missing_idx] <- approx(
-          x = finite_idx,
-          y = daily_vals[finite_idx],
-          xout = missing_idx,
-          rule = 2
-        )$y
-      }
-    } else if (length(finite_idx) == 1) {
-      daily_vals[] <- daily_vals[finite_idx]
-    } else {
-      daily_vals[] <- 0
-    }
-
-    # Aggregate into weekly bins (7-day windows)
-    for (week in 1:52) {
-      start_day <- (week - 1) * 7 + 1
-      end_day <- min(week * 7, 365)
-      week_vals <- daily_vals[start_day:end_day]
-      week_vals <- week_vals[is.finite(week_vals)]
-      if (length(week_vals) > 0) {
-        raw_mat[week, j] <- mean(week_vals)
-      }
-    }
-
-    # Handle remaining days (366th day if leap year, or partial last week)
-    remaining_vals <- daily_vals[366:min(365, length(daily_vals))]
-    remaining_vals <- remaining_vals[is.finite(remaining_vals)]
-    if (length(remaining_vals) > 0) {
-      raw_mat[53, j] <- mean(remaining_vals)
-    } else if (is.finite(raw_mat[52, j])) {
-      # Use last complete week if no remaining data
-      raw_mat[53, j] <- raw_mat[52, j]
-    } else {
-      raw_mat[53, j] <- 0
-    }
+    pentad_values <- as.integer(names(vals_by_pentad))
+    valid <- pentad_values >= 1 & pentad_values <= N_TEMPORAL_BINS
+    pentad_mat[pentad_values[valid], j] <- vals_by_pentad[valid]
+    
+    # NO interpolation - leave missing pentads as NA
   }
 
-  raw_mat
+  pentad_mat
 }
 
-#' Build raw 365 × K index matrix from daily data (NO whitening)
-build_raw_365_matrix <- function(dly_year, avail_idx) {
-  if (nrow(dly_year) == 0) return(NULL)
-
-  if (!"doy" %in% names(dly_year)) {
-    dly_year$doy <- lubridate::yday(dly_year$date)
-  }
-
-  K <- length(avail_idx)
-  raw_mat <- matrix(NA_real_, nrow = 365, ncol = K)
-  colnames(raw_mat) <- avail_idx
-
-  for (j in seq_along(avail_idx)) {
-    idx <- avail_idx[j]
-    if (!idx %in% names(dly_year)) next
-
-    # Aggregate by DOY (median for robustness)
-    vals_by_doy <- tapply(dly_year[[idx]], dly_year$doy, function(v) {
-      v <- v[is.finite(v)]
-      if (length(v) == 0) NA_real_ else median(v)
-    })
-
-    doy_values <- as.integer(names(vals_by_doy))
-    valid <- doy_values >= 1 & doy_values <= 365
-    raw_mat[doy_values[valid], j] <- vals_by_doy[valid]
-
-    # Interpolate missing DOYs
-    finite_idx <- which(is.finite(raw_mat[, j]))
-    if (length(finite_idx) >= 2) {
-      missing_idx <- which(!is.finite(raw_mat[, j]))
-      if (length(missing_idx) > 0) {
-        raw_mat[missing_idx, j] <- approx(
-          x = finite_idx,
-          y = raw_mat[finite_idx, j],
-          xout = missing_idx,
-          rule = 2
-        )$y
-      }
-    } else if (length(finite_idx) == 1) {
-      raw_mat[, j] <- raw_mat[finite_idx, j]
-    } else {
-      raw_mat[, j] <- 0
-    }
-  }
-
-  raw_mat
-}
+ 
 
 #' Simple grid compression (NO whitening, NO PCA on individual trace)
 #' Just samples the raw index values at fixed time points
@@ -2257,12 +2269,11 @@ cos_sim <- function(a, b) {
   safe_dot(a, b) / (da * db)
 }
 
-# Helper: parallel map
-.run_map <- function(X, FUN) {
+.run_map <- function(X, FUN, show_pb = TRUE) {
   f_FUN <- FUN
   
   # Check for progress bar support
-  use_pbapply <- requireNamespace("pbapply", quietly = TRUE)
+  use_pbapply <- requireNamespace("pbapply", quietly = TRUE) && isTRUE(show_pb)
 
   if (!PARALLEL_ENABLE) {
     if (use_pbapply) {
@@ -2284,7 +2295,7 @@ cos_sim <- function(a, b) {
       # pbapply supports future backend if plan is set
       pbapply::pblapply(X, function(x) { f_FUN(x) }, cl = "future", future.seed = TRUE)
     } else {
-      cat("Processing (no progress bar available)...\n")
+      # cat("Processing (no progress bar available)...\n")
       future.apply::future_lapply(X, function(x) {
         f_FUN(x)
       }, future.seed = TRUE)
@@ -2441,6 +2452,10 @@ if (length(missing_raw) > 0) {
 }
 
 candidate_indices <- c(found_opt, found_raw)
+if ("PPI" %in% names(df) && !("PPI" %in% candidate_indices)) {
+  candidate_indices <- c(candidate_indices, "PPI")
+  cat("[NOTICE] Added PPI to candidate_indices (will be treated as a pentad index)\n")
+}
 if (length(candidate_indices) == 0) {
   stop("No OPTIMAL_INDICES present in input CSV")
 }
@@ -2477,93 +2492,7 @@ if (length(avail) < USE_INDICES_MIN) {
 
 cat(sprintf("Selected %d indices: %s\n", length(avail), paste(avail, collapse = ", ")))
 
-  # Data sufficiency check DISABLED per user request - all locations are kept regardless of DOY coverage
-  
-  if (FALSE && (is.null(TRAIN_YEARS) || length(TRAIN_YEARS) == 0)) stop("TRAIN_YEARS must be defined and non-empty for data sufficiency checks; no fallback permitted.")
-  if (FALSE && "location_id" %in% names(df_full)) {
-    # For each location and each selected index, count finite observations and error if below threshold
-    offenders <- list()
-    for (loc in unique(df_full$location_id)) {
-      sub <- df_full[df_full$location_id == loc, , drop = FALSE]
-      # Determine number of training years present for this location
-      loc_years <- unique(sub$year[is.finite(sub$year) & !is.na(sub$year)])
-      train_loc_years <- intersect(as.integer(loc_years), as.integer(TRAIN_YEARS))
-      n_years <- length(train_loc_years)
-      if (n_years == 0) {
-        stop(sprintf("Data sufficiency check failed: location '%s' has no observations in TRAIN_YEARS (%s) — cannot compute required DOY threshold; aborting (no fallback permitted).", loc, paste(TRAIN_YEARS, collapse = ", ")))
-      }
-
-      # required days = 50% of all possible DOYs across the location's training years
-      # Allow skipping a minimal number of DOYs per-location (controlled by MIN_SKIP_DOYS_PER_LOCATION)
-      base_required <- as.integer(ceiling(n_years * 365 / 2))
-      required_days_for_loc <- as.integer(max(1L, base_required - as.integer(MIN_SKIP_DOYS_PER_LOCATION)))
-
-      # Count unique DOYs in the training years where at least one of the selected indices is finite
-      if (nrow(sub) == 0) {
-        n_doys_present <- 0L
-      } else {
-        sub_tr <- sub[sub$year %in% train_loc_years, , drop = FALSE]
-        if (nrow(sub_tr) == 0) {
-          n_doys_present <- 0L
-        } else {
-          # Mark rows where any of the selected indices are finite
-          has_any_index <- apply(sub_tr[, intersect(avail, names(sub_tr)), drop = FALSE], 1, function(r) any(is.finite(r)))
-          # Count unique dates (or doy) present with any index
-          if ('date' %in% names(sub_tr)) {
-            n_doys_present <- length(unique(as.character(sub_tr$date[which(has_any_index)])))
-          } else if ('doy' %in% names(sub_tr)) {
-            n_doys_present <- length(unique(sub_tr$doy[which(has_any_index)]))
-          } else {
-            # fallback to counting rows with any index finite
-            n_doys_present <- sum(has_any_index)
-          }
-        }
-      }
-
-      if (n_doys_present < required_days_for_loc) {
-        offenders[[length(offenders) + 1]] <- list(location = loc, n = n_doys_present, required = required_days_for_loc, years = paste(train_loc_years, collapse = ","))
-      }
-    }
-    if (length(offenders) > 0) {
-      # Build detailed messages per offending location (aggregate across indices)
-      msg_lines <- vapply(offenders, function(x) sprintf("loc=%s n=%d required=%d train_years=%s", x$location, x$n, x$required, x$years), character(1))
-      bad_locs <- unique(vapply(offenders, function(x) as.character(x$location), character(1)))
-
-      warning(sprintf(
-        "Data sufficiency: skipping %d locations because they do not meet the per-location DOY threshold (50%% of DOYs across training years) after allowing up to %d missing DOYs per-location.\nSkipped locations: %s\nDetails (loc,obs,required,train_years):\n%s",
-        length(bad_locs), as.integer(MIN_SKIP_DOYS_PER_LOCATION), paste(head(bad_locs, 100), collapse = ", "), paste(msg_lines, collapse = "\n")
-      ))
-
-      
-      # we flag them instead so downstream code can decide how to handle them.
-      flag_col <- ".insufficient_data_by_DOY_threshold"
-      if (!flag_col %in% names(df_full)) df_full[[flag_col]] <- FALSE
-      df_full[[flag_col]][df_full$location_id %in% bad_locs] <- TRUE
-      if (exists("df")) {
-        if (!flag_col %in% names(df)) df[[flag_col]] <- FALSE
-        df[[flag_col]][df$location_id %in% bad_locs] <- TRUE
-      }
-      if (exists("df_train")) {
-        if (!flag_col %in% names(df_train)) df_train[[flag_col]] <- FALSE
-        df_train[[flag_col]][df_train$location_id %in% bad_locs] <- TRUE
-      }
-      if (exists("df_test")) {
-        if (!flag_col %in% names(df_test)) df_test[[flag_col]] <- FALSE
-        df_test[[flag_col]][df_test$location_id %in% bad_locs] <- TRUE
-      }
-
-      # Keep all locations but notify if this leaves nothing usable
-      if (nrow(df_full) == 0 || length(unique(na.omit(df_full$location_id))) == 0) {
-        stop("Data sufficiency check left no usable data — aborting.")
-      }
-    }
-  } else {
-    # Global time series: require TRAIN_YEARS and enforce proportional check globally
-    if (is.null(TRAIN_YEARS) || length(TRAIN_YEARS) == 0) stop("TRAIN_YEARS must be defined for global sufficiency checks; no fallback permitted.")
-    base_req_global <- as.integer(ceiling(length(TRAIN_YEARS) * 365 / 2))
-    required_days_global <- as.integer(max(1L, base_req_global - as.integer(MIN_SKIP_DOYS_PER_LOCATION)))
-    if (nrow(df_full) < required_days_global) stop(sprintf("Data sufficiency check failed: overall data contains fewer than %d rows (50%% of days across TRAIN_YEARS after allowing up to %d missing DOYs)", required_days_global, MIN_SKIP_DOYS_PER_LOCATION))
-  }
+# Note: Data sufficiency check disabled - all locations kept regardless of DOY coverage
 
 #
 # SKIP MOVING VARIANCE CALCULATION IF FLAG IS SET
@@ -2686,23 +2615,7 @@ cat(sprintf("Post-processing rows (baseline subtraction disabled): %d\n", nrow(d
 cat("Data preprocessing complete.\n")
 adj_cols <- intersect(avail, names(df))
 
-# Simple feature pruning
-if (FALSE && length(avail) > 0) {
-  # Originally: compute per-index SD and drop indices below threshold
-  idx_sd <- vapply(avail, function(nm) {
-    x <- df[[nm]]
-    x <- x[is.finite(x)]
-    if (length(x) < 5) {
-      return(0)
-    }
-    stats::sd(x, na.rm = TRUE)
-  }, numeric(1))
-  keep <- idx_sd >= MIN_INDEX_SD
-  dropped <- avail[!keep]
-  if (length(dropped) > 0) cat("Pruned low-variance indices:", paste(dropped, collapse = ", "), "\n")
-  avail <- avail[keep]
-}
-cat("[NOTICE] SD-based simple feature pruning disabled; keeping all indices (MIN_INDEX_SD not applied)\n")
+# Note: SD-based feature pruning was removed - keeping all indices in OPTIMAL_INDICES
 
 # Restrict dataset to allowed vegetation classes
 if ("Veg" %in% names(df) && length(ALLOWED_VEG) > 0) {
@@ -2859,7 +2772,6 @@ build_barren_veg_library <- function(df_local, avail_idx, min_samples = 5) {
   
   # HARD REQUIREMENT: Must have at least min_samples barren observations
   if (nrow(barren_rows) < min_samples) {
-    # stop(sprintf("[Stage1] CRITICAL ERROR: Insufficient barren training data. Found %d barren observations, but require at least %d. Cannot proceed with MESMA analysis.", nrow(barren_rows), min_samples))
     cat(sprintf("[Stage1] Insufficient barren training data. Found %d barren observations, but require at least %d. Returning NULL.\n", nrow(barren_rows), min_samples))
     return(NULL)
   }
@@ -2903,53 +2815,51 @@ build_barren_veg_library <- function(df_local, avail_idx, min_samples = 5) {
   
   stage1_lib <- list()
   
-  # Build barren endmember
+  # Compute pentads for barren and veg rows
+  barren_rows$pentad <- doy_to_pentad(barren_rows$doy)
+  veg_rows$pentad <- doy_to_pentad(veg_rows$doy)
+  
+  # Build barren endmember using pentad aggregation (NO interpolation)
   barren_lib <- list()
   for (idx in avail_idx) {
     if (!idx %in% names(barren_rows)) next
-    vals_by_doy <- tapply(seq_along(barren_rows[[idx]]), barren_rows$doy, function(indices) {
+    vals_by_pentad <- tapply(seq_along(barren_rows[[idx]]), barren_rows$pentad, function(indices) {
       vals <- barren_rows[[idx]][indices]
       vals <- vals[is.finite(vals)]
       if (length(vals) == 0) return(NA_real_)
       median(vals)
     })
-    mu <- rep(NA_real_, 365)
-    if (length(vals_by_doy) > 0) {
-      doy_values <- as.integer(names(vals_by_doy))
-      valid_doy <- doy_values >= 1 & doy_values <= 365
-      mu[doy_values[valid_doy]] <- vals_by_doy[valid_doy]
+    mu <- rep(NA_real_, N_TEMPORAL_BINS)
+    if (length(vals_by_pentad) > 0) {
+      pentad_values <- as.integer(names(vals_by_pentad))
+      valid_pentad <- pentad_values >= 1 & pentad_values <= N_TEMPORAL_BINS
+      mu[pentad_values[valid_pentad]] <- vals_by_pentad[valid_pentad]
     }
     if (all(!is.finite(mu))) next
-    mv <- tryCatch(calc_moving_var(data.frame(date = 1:365, idx = mu), "idx", window = 14), 
-                   error = function(e) rep(NA_real_, 365))
-    barren_lib[[idx]] <- list(mu = mu, mv = mv)
+    # NO interpolation - keep NA values
+    # Skip moving variance for pentad data (not meaningful at this resolution)
+    barren_lib[[idx]] <- list(mu = mu, mv = rep(NA_real_, N_TEMPORAL_BINS))
   }
   
-  # Build vegetation endmember
+  # Build vegetation endmember using pentad aggregation (NO interpolation)
   veg_lib <- list()
   for (idx in avail_idx) {
     if (!idx %in% names(veg_rows)) next
-    vals_by_doy <- tapply(seq_along(veg_rows[[idx]]), veg_rows$doy, function(indices) {
+    vals_by_pentad <- tapply(seq_along(veg_rows[[idx]]), veg_rows$pentad, function(indices) {
       vals <- veg_rows[[idx]][indices]
       vals <- vals[is.finite(vals)]
       if (length(vals) == 0) return(NA_real_)
       median(vals)
     })
-    mu <- rep(NA_real_, 365)
-    if (length(vals_by_doy) > 0) {
-      doy_values <- as.integer(names(vals_by_doy))
-      valid_doy <- doy_values >= 1 & doy_values <= 365
-      mu[doy_values[valid_doy]] <- vals_by_doy[valid_doy]
+    mu <- rep(NA_real_, N_TEMPORAL_BINS)
+    if (length(vals_by_pentad) > 0) {
+      pentad_values <- as.integer(names(vals_by_pentad))
+      valid_pentad <- pentad_values >= 1 & pentad_values <= N_TEMPORAL_BINS
+      mu[pentad_values[valid_pentad]] <- vals_by_pentad[valid_pentad]
     }
-    # Interpolate missing DOYs for complete temporal coverage
-    if (sum(is.finite(mu)) > 2) {
-      mu <- approx(x = which(is.finite(mu)), y = mu[is.finite(mu)], 
-                   xout = 1:365, rule = 2)$y
-    }
+    # NO interpolation - keep NA values
     if (all(!is.finite(mu))) next
-    mv <- tryCatch(calc_moving_var(data.frame(date = 1:365, idx = mu), "idx", window = 14), 
-                   error = function(e) rep(NA_real_, 365))
-    veg_lib[[idx]] <- list(mu = mu, mv = mv)
+    veg_lib[[idx]] <- list(mu = mu, mv = rep(NA_real_, N_TEMPORAL_BINS))
   }
   
   if (length(barren_lib) == 0 || length(veg_lib) == 0) return(NULL)
@@ -2973,12 +2883,15 @@ unmix_vegetated_fraction <- function(dly_local, stage1_lib, avail_idx) {
   for (r in seq_len(nrow(dly_local))) {
     row <- dly_local[r, , drop = FALSE]
     doy <- as.integer(row$doy)
-    if (is.na(doy) || doy < 1 || doy > 365) {
+    if (is.na(doy) || doy < 1 || doy > 366) {
       veg_fractions[r] <- NA_real_
       next
     }
     
-    # Build vectors for this DOY
+    # Convert DOY to pentad for library lookup
+    pentad <- doy_to_pentad(doy)
+    
+    # Build vectors for this pentad
     y <- numeric(0)  # Observation
     B <- numeric(0)  # Barren endmember
     V <- numeric(0)  # Vegetation endmember
@@ -2987,13 +2900,15 @@ unmix_vegetated_fraction <- function(dly_local, stage1_lib, avail_idx) {
       if (!idx %in% names(row)) next
       
       y_val <- as.numeric(row[[idx]])
+      
+      # Look up endmember values using pentad index
       b_val <- if (!is.null(stage1_lib$barren[[idx]]) && 
                    !is.null(stage1_lib$barren[[idx]]$mu)) {
-        stage1_lib$barren[[idx]]$mu[doy]
+        stage1_lib$barren[[idx]]$mu[pentad]
       } else NA_real_
       v_val <- if (!is.null(stage1_lib$vegetation[[idx]]) && 
                    !is.null(stage1_lib$vegetation[[idx]]$mu)) {
-        stage1_lib$vegetation[[idx]]$mu[doy]
+        stage1_lib$vegetation[[idx]]$mu[pentad]
       } else NA_real_
       
       # Only include if all three values are valid
@@ -3071,38 +2986,38 @@ build_stage1_lib <- function(STAGE1_LIB, grid_name = "full") {
   avail_idx <- intersect(names(barren_raw), names(vegetation_raw))
   if (length(avail_idx) == 0) return(NULL)
   
-  # Select indices that maximize barren-vegetation separation
-  avail_idx <- select_stage1_indices(barren_raw, vegetation_raw, avail_idx, min_separation = 0.1)
-  cat(sprintf("[build_stage1_lib] Selected %d indices with good barren-veg separation\n", length(avail_idx)))
+  # Do NOT pre-select indices for stage 1; use all available indices
+  # Previously, indices were preselected using select_stage1_indices(barren_raw, vegetation_raw, avail_idx, min_separation = 0.1)
+  # but we intentionally avoid pre-selection to ensure all candidate indices are used.
   
-  # Helper function to build a 365-day raw index matrix
+  # Helper function to build a pentad (N_TEMPORAL_BINS) raw index matrix
+  # NO interpolation - missing pentads remain as NA
   build_raw_trace <- function(endmember_lib, avail_idx) {
-    # Build raw 365 x n_indices matrix
-    raw_mat <- matrix(NA_real_, nrow = 365, ncol = length(avail_idx))
+    # Build raw N_TEMPORAL_BINS x n_indices matrix (73 pentads x K indices)
+    raw_mat <- matrix(NA_real_, nrow = N_TEMPORAL_BINS, ncol = length(avail_idx))
     colnames(raw_mat) <- avail_idx
     
     for (j in seq_along(avail_idx)) {
       idx <- avail_idx[j]
       if (!is.null(endmember_lib[[idx]]) && !is.null(endmember_lib[[idx]]$mu)) {
-        raw_mat[, j] <- endmember_lib[[idx]]$mu
+        # Ensure mu is the right length (could be 365 from old code or N_TEMPORAL_BINS)
+        mu_vec <- endmember_lib[[idx]]$mu
+        if (length(mu_vec) == 365) {
+          # Aggregate 365-day to pentads
+          for (p in seq_len(N_TEMPORAL_BINS)) {
+            doy_start <- (p - 1) * TEMPORAL_AGGREGATION_DAYS + 1
+            doy_end <- min(p * TEMPORAL_AGGREGATION_DAYS, 365)
+            vals <- mu_vec[doy_start:doy_end]
+            vals <- vals[is.finite(vals)]
+            raw_mat[p, j] <- if (length(vals) > 0) median(vals) else NA_real_
+          }
+        } else if (length(mu_vec) == N_TEMPORAL_BINS) {
+          raw_mat[, j] <- mu_vec
+        }
       }
     }
     
-    # Interpolate missing days
-    for (j in seq_len(ncol(raw_mat))) {
-      col_vals <- raw_mat[, j]
-      finite_idx <- which(is.finite(col_vals))
-      if (length(finite_idx) >= 2) {
-        raw_mat[is.na(raw_mat[, j]), j] <- approx(finite_idx, col_vals[finite_idx], 
-                                                   xout = which(is.na(raw_mat[, j])), rule = 2)$y
-      } else if (length(finite_idx) == 1) {
-        raw_mat[, j] <- col_vals[finite_idx]
-      } else {
-        raw_mat[, j] <- 0
-      }
-    }
-    raw_mat[!is.finite(raw_mat)] <- 0
-    
+    # NO interpolation - keep NA values for honest missing data handling
     raw_mat
   }
   
@@ -3174,8 +3089,40 @@ if (exists('DEBUG_STAGE1_VERBOSE', envir = globalenv()) && isTRUE(get('DEBUG_STA
 # =============================================================================
 # OPTIMIZED LIBRARY PRE-COMPUTATION
 # =============================================================================
-precompute_optimized_library <- function(mesma_lib, compressed_templates_accessor, grid_type, feature_weights = NULL) {
+precompute_optimized_library <- function(mesma_lib, compressed_templates_accessor, grid_type, feature_weights = NULL, stage2_norm_params = NULL) {
   opt_lib <- list()
+  
+  # Get index order from mesma_lib (from raw_mat column names)
+  template_indices <- NULL
+  for (veg in names(mesma_lib)) {
+    if (length(mesma_lib[[veg]]) > 0 && !is.null(mesma_lib[[veg]][[1]]$raw_mat)) {
+      template_indices <- colnames(mesma_lib[[veg]][[1]]$raw_mat)
+      break
+    }
+  }
+  
+  # Compute Z-score scaling vectors if norm_params provided
+  scaling_means <- NULL
+  scaling_sds <- NULL
+  
+  if (!is.null(stage2_norm_params) && !is.null(stage2_norm_params$INDEX_SCALES) && !is.null(template_indices)) {
+    n_bins <- N_TEMPORAL_BINS
+    scaling_means <- numeric(0)
+    scaling_sds <- numeric(0)
+    
+    for (idx_name in template_indices) {
+      mu <- 0
+      sigma <- 1
+      if (idx_name %in% names(stage2_norm_params$INDEX_SCALES)) {
+        params <- stage2_norm_params$INDEX_SCALES[[idx_name]]
+        mu <- params$mean
+        sigma <- params$sd
+      }
+      scaling_means <- c(scaling_means, rep(mu, n_bins))
+      scaling_sds <- c(scaling_sds, rep(sigma, n_bins))
+    }
+    cat(sprintf("[precompute_optimized_library] Applying Z-score scaling to templates using %d indices\n", length(template_indices)))
+  }
   
   for (veg in names(mesma_lib)) {
     variants <- mesma_lib[[veg]]
@@ -3189,8 +3136,21 @@ precompute_optimized_library <- function(mesma_lib, compressed_templates_accesso
     
     for (i in seq_along(variants)) {
       vid <- variants[[i]]$variant_id
-      vec <- compressed_templates_accessor[[veg]][[vid]][["full"]]
+      # Use grid_type if available, fallback to "full"
+      vec <- NULL
+      if (!is.null(compressed_templates_accessor[[veg]][[vid]][[grid_type]])) {
+        vec <- compressed_templates_accessor[[veg]][[vid]][[grid_type]]
+      } else if (!is.null(compressed_templates_accessor[[veg]][[vid]][["full"]])) {
+        vec <- compressed_templates_accessor[[veg]][[vid]][["full"]]
+      }
+      
       if (!is.null(vec)) {
+        # Apply Z-score scaling if params provided
+        if (!is.null(scaling_means) && length(vec) == length(scaling_means)) {
+          vec <- (vec - scaling_means) / scaling_sds
+          vec[!is.finite(vec)] <- 0
+        }
+        
         vec_list[[length(vec_list) + 1]] <- vec
         ids[length(vec_list)] <- vid
         valid_idx <- c(valid_idx, i)
@@ -3240,11 +3200,18 @@ DEBUG_STAGE1_VERBOSE <- if (exists('DEBUG_STAGE1_VERBOSE', envir = globalenv()))
 # Uses angle-based endmember selection + projection as per Tits et al. paper
 # =============================================================================
 unmix_stage2_compressed <- function(veg_kept, veg_frac, y, grid_type, compressed_templates_accessor, mesma_lib, topK = TOPK_VARIANTS, feature_weights = NULL, optimized_library = NULL) {
-  # Initialize variables that might be missing in Fast Path
+  # Require optimized library - no fallback
+  if (is.null(optimized_library)) {
+    stop("[unmix_stage2_compressed] OPTIMIZED_LIBRARY is required. Ensure precompute_optimized_library() was called.")
+  }
+  
+  # Initialize comp_templates as NULL - will be built if ENABLE_UNCERTAINTY is TRUE
+
   comp_templates <- NULL
+  
   compressed_stage1_lib <- if (exists("COMPRESSED_STAGE1_LIB")) COMPRESSED_STAGE1_LIB else NULL
 
-  # Track verbose output to first 3 calls only
+  # Track verbose output to first 5 calls only
   if (!exists(".GEOM_DEBUG_COUNTER", envir = globalenv())) assign(".GEOM_DEBUG_COUNTER", 0L, envir = globalenv())
   debug_counter <- get(".GEOM_DEBUG_COUNTER", envir = globalenv())
   verbose_this_call <- (debug_counter < 5)
@@ -3259,15 +3226,18 @@ unmix_stage2_compressed <- function(veg_kept, veg_frac, y, grid_type, compressed
   
   top_variants <- list()
   
-  # FAST PATH: Use Optimized Library if available
-  if (!is.null(optimized_library)) {
-    y_vec <- as.numeric(y)
+  # Vectorized similarity search using pre-computed optimized library
+  y_vec <- as.numeric(y)
     
     # Prepare y for similarity search
     y_weighted <- y_vec
     if (!is.null(feature_weights) && length(feature_weights) == length(y_vec)) {
       y_weighted <- y_vec * feature_weights
     }
+    
+    # Handle NAs: treat as zero for similarity search
+    y_weighted[is.na(y_weighted)] <- 0
+    
     y_norm <- sqrt(sum(y_weighted^2))
     if (y_norm < 1e-9) y_norm <- 1
     y_weighted_norm <- y_weighted / y_norm
@@ -3311,49 +3281,6 @@ unmix_stage2_compressed <- function(veg_kept, veg_frac, y, grid_type, compressed
       }
       top_variants[[v]] <- variant_list
     }
-    
-  } else {
-    # SLOW PATH: Legacy list-based approach
-    # Access compressed templates as nested list
-    comp_templates <- list()
-    for (v in veg_types) {
-      comp_templates[[v]] <- list()
-      for (variant in mesma_lib[[v]]) {
-        vid <- variant$variant_id
-        vec <- compressed_templates_accessor[[v]][[vid]][[grid_type]]
-        # if (verbose_this_call) cat(sprintf("[DEBUG Stage2 Geometric] v=%s, vid=%s, vec length=%d\n", v, vid, length(vec)))
-        if (!is.null(vec) && length(vec) > 0) {
-          comp_templates[[v]][[length(comp_templates[[v]]) + 1]] <- list(vec = vec, id = vid)
-        }
-      }
-      # if (verbose_this_call) cat(sprintf("[DEBUG unmix_stage2_compressed] comp_templates[[%s]] has %d variants\n", v, length(comp_templates[[v]])))
-    }
-    
-    if (length(comp_templates) == 0) return(NULL)
-    
-    for (v in veg_types) {
-      cand <- comp_templates[[v]]
-      if (verbose_this_call || isTRUE(TESTING_MODE)) {
-        cat(sprintf("[DEBUG Stage2 slow] veg=%s: found %d variants in comp_templates\n", v, length(cand)))
-      }
-      if (length(cand) == 0) next
-      sims <- sapply(cand, function(x) {
-        if (!is.null(feature_weights)) {
-          # Use weighted cosine similarity
-          weighted_cosine_similarity(y, x$vec, feature_weights)
-        } else {
-          cos_sim(y, x$vec)
-        }
-      })
-      ord <- order(sims, decreasing = TRUE)
-      keep <- ord[seq_len(min(topK, length(ord)))]
-      if (verbose_this_call || isTRUE(TESTING_MODE)) {
-        cat(sprintf("[DEBUG Stage2 slow] veg=%s: top_k sims (first 3) = %s\n", v, paste(round(head(sims[ord], 3), 4), collapse=",")))
-      }
-      top_variants[[v]] <- cand[keep]
-      # if (verbose_this_call) cat(sprintf("[DEBUG Stage2 Geometric] top_variants[[%s]] has %d variants\n", v, length(top_variants[[v]])))
-    }
-  }
   
   if (length(top_variants) == 0) {
     if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG Stage2] top_variants empty for veg_types=%s ; returning NULL\n", paste(veg_types, collapse=",")))
@@ -3375,9 +3302,8 @@ unmix_stage2_compressed <- function(veg_kept, veg_frac, y, grid_type, compressed
   }
   
   # Call the geometric stage 2 unmixing
-  comp_templates_var <- if (exists("comp_templates")) comp_templates else NULL
   if (isTRUE(TESTING_MODE)) cat("[DEBUG Stage2] Calling stage2_geometric_unmix...\n")
-  geom_result <- stage2_geometric_unmix(y, veg_libraries, topK = topK, feature_weights = feature_weights, comp_templates = comp_templates_var, compressed_stage1_lib = if (exists("COMPRESSED_STAGE1_LIB")) COMPRESSED_STAGE1_LIB else NULL)
+  geom_result <- stage2_geometric_unmix(y, veg_libraries, topK = topK, feature_weights = feature_weights, comp_templates = NULL, compressed_stage1_lib = compressed_stage1_lib)
   if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG Stage2] stage2_geometric_unmix returned %s\n", if(is.null(geom_result)) "NULL" else "List"))
   
   if (is.null(geom_result)) {
@@ -3926,7 +3852,7 @@ raw_lib_templates <- list()
 for (vname in vegs) {
   dveg <- lib_df[lib_df$Veg == vname, , drop = FALSE]
   if (nrow(dveg) < 10) {
-    raw_lib_templates[[vname]] <- list(T = matrix(0, nrow = 365, ncol = n_features), n_samples = 0)
+    raw_lib_templates[[vname]] <- list(T = matrix(0, nrow = N_TEMPORAL_BINS, ncol = n_features), n_samples = 0)
     next
   }
   
@@ -3943,38 +3869,27 @@ for (vname in vegs) {
   X_v_c <- sweep(X_v, 2, mu_all, "-")
   X_v_std <- sweep(X_v_c, 2, feature_sds, "/")
   
-  # Group by DOY and compute medoid
+  # Group by pentad and compute medoid
   doy_vec <- lubridate::yday(dveg$date)
-  T_medoid <- matrix(NA_real_, nrow = 365, ncol = n_features)
+  pentad_vec <- doy_to_pentad(doy_vec)
+  T_medoid <- matrix(NA_real_, nrow = N_TEMPORAL_BINS, ncol = n_features)
   
-  for (d in 1:365) {
-    rows_d <- which(doy_vec == d)
-    if (length(rows_d) > 0) {
-      sub <- X_v_std[rows_d, , drop = FALSE]
+  for (p in seq_len(N_TEMPORAL_BINS)) {
+    rows_p <- which(pentad_vec == p)
+    if (length(rows_p) > 0) {
+      sub <- X_v_std[rows_p, , drop = FALSE]
       if (nrow(sub) == 1) {
-        T_medoid[d, ] <- sub[1, ]
+        T_medoid[p, ] <- sub[1, ]
       } else {
         center <- colMeans(sub)
         dists <- rowSums(sweep(sub, 2, center, "-")^2)
-        T_medoid[d, ] <- sub[which.min(dists), ]
+        T_medoid[p, ] <- sub[which.min(dists), ]
       }
     }
   }
   
-  # Interpolate missing days
-  for (j in 1:n_features) {
-    y <- T_medoid[, j]
-    if (any(is.na(y))) {
-      x <- which(!is.na(y))
-      if (length(x) >= 2) {
-        T_medoid[is.na(y), j] <- approx(x, y[x], xout = which(is.na(y)), rule = 2)$y
-      } else if (length(x) == 1) {
-        T_medoid[, j] <- y[x[1]]
-      } else {
-        T_medoid[, j] <- 0
-      }
-    }
-  }
+  # NO interpolation - missing pentads remain as NA
+  # Downstream comparison will handle NA masking
   
   raw_lib_templates[[vname]] <- list(T = T_medoid, n_samples = nrow(dveg))
   cat(sprintf("  %s: T_medoid range [%.4f, %.4f], mean=%.4f\n", 
@@ -4412,8 +4327,8 @@ reduce_all_traces <- function(lib_df, veg_types, avail_idx, fixed_grid_size = TE
                                enable_multiscale = FALSE, multiscale_windows = NULL) {
   cat("Performing full-resolution processing on all traces using raw indices...\n")
   
-  # Fixed grid for all traces (ensures comparability)
-  fixed_grid <- unique(round(seq(1, 365, length.out = fixed_grid_size)))
+  # Fixed grid for all traces (using pentad bins for consistency)
+  fixed_grid <- seq_len(N_TEMPORAL_BINS)  # 1:73 for 5-day pentads
   
   reduced_data <- list()
   
@@ -4464,52 +4379,35 @@ reduce_all_traces <- function(lib_df, veg_types, avail_idx, fixed_grid_size = TE
       n_unique_doys <- length(unique(dly_year$doy))
       if (n_unique_doys < 5) next
       
-      # Build a full 365 x K raw-index matrix for this trace
-      # For each index in avail_idx we choose the medoid per DOY and interpolate missing days
+      # Build a pentad x K raw-index matrix for this trace (NO interpolation)
+      # Aggregate by pentad using median
       idxs <- avail_idx
       K <- length(idxs)
-      raw_mat <- matrix(NA_real_, nrow = 365, ncol = K)
+      raw_mat <- matrix(NA_real_, nrow = N_TEMPORAL_BINS, ncol = K)
       colnames(raw_mat) <- idxs
+      
+      # Compute pentad for each observation
+      dly_year$pentad <- doy_to_pentad(dly_year$doy)
 
       for (j in seq_along(idxs)) {
         idn <- idxs[j]
         if (!idn %in% names(dly_year)) next
-        vals_by_doy <- tryCatch(
-          {
-            tapply(seq_along(dly_year[[idn]]), dly_year$doy, function(indices) {
-              vals <- dly_year[[idn]][indices]
-              vals <- vals[is.finite(vals)]
-              if (length(vals) == 0) return(NA_real_)
-              if (length(vals) == 1) return(as.numeric(vals[1]))
-              m <- mean(vals)
-              as.numeric(vals[which.min(abs(vals - m))])
-            })
-          }, error = function(e) NULL)
-
-        if (!is.null(vals_by_doy) && length(vals_by_doy) > 0) {
-          doy_values <- as.integer(names(vals_by_doy))
-          valid_doy <- doy_values >= 1 & doy_values <= 365
-          raw_mat[doy_values[valid_doy], j] <- vals_by_doy[valid_doy]
+        
+        # Aggregate by pentad (median for robustness, NO interpolation)
+        vals_by_pentad <- tapply(dly_year[[idn]], dly_year$pentad, function(v) {
+          v <- v[is.finite(v)]
+          if (length(v) == 0) NA_real_ else median(v)
+        })
+        
+        if (!is.null(vals_by_pentad) && length(vals_by_pentad) > 0) {
+          pentad_values <- as.integer(names(vals_by_pentad))
+          valid_pentad <- pentad_values >= 1 & pentad_values <= N_TEMPORAL_BINS
+          raw_mat[pentad_values[valid_pentad], j] <- vals_by_pentad[valid_pentad]
         }
-
-        # Interpolate missing days per index column
-        colv <- raw_mat[, j]
-        finite_idx <- which(is.finite(colv))
-        if (length(finite_idx) == 0) {
-          raw_mat[, j] <- 0
-        } else if (length(finite_idx) == 1) {
-          raw_mat[, j] <- colv[finite_idx]
-        } else {
-          x <- c(finite_idx - 365, finite_idx, finite_idx + 365)
-          y <- rep(colv[finite_idx], 3)
-          interp <- tryCatch(stats::approx(x = x, y = y, xout = seq_len(365), rule = 2)$y, error = function(e) rep(colv[finite_idx[1]], 365))
-          interp <- as.numeric(interp)
-          interp[!is.finite(interp)] <- median(colv[finite_idx], na.rm = TRUE)
-          raw_mat[, j] <- interp
-        }
+        # NO interpolation - keep NA values for honest missing data handling
       }
 
-      # Full-resolution processing performed ON RAW INDEX MATRIX (features = 365 × indices)
+      # Full-resolution processing performed ON RAW INDEX MATRIX (features = N_TEMPORAL_BINS × indices)
       feat <- as.numeric(raw_mat)
       
       if (any(!is.finite(feat))) next
@@ -4532,7 +4430,7 @@ reduce_all_traces <- function(lib_df, veg_types, avail_idx, fixed_grid_size = TE
     if (length(feature_list) > 0) {
       reduced_data[[veg]] <- list(
         features = do.call(rbind, feature_list),  # Matrix: n_traces x n_features
-        Z_matrices = Z_list,                       # List of full 365 x K RAW INDEX matrices
+        Z_matrices = Z_list,                       # List of N_TEMPORAL_BINS x K RAW INDEX matrices
         trace_info = trace_info,                   # Metadata for each trace
         n_samples = nrow(veg_data)                 # Total samples for this veg
       )
@@ -4713,7 +4611,7 @@ reduce_all_traces_simple <- function(lib_df, veg_types, avail_idx) {
       if (n_unique_doys < 5) next
       
       # Build raw matrix
-      raw_mat <- build_raw_365_matrix(dly_year, avail_idx)
+      raw_mat <- build_pentad_matrix(dly_year, avail_idx)
       if (is.null(raw_mat)) next
       
       # Require at least 5 unique DOYs
@@ -4749,7 +4647,9 @@ reduce_all_traces_simple <- function(lib_df, veg_types, avail_idx) {
 build_mesma_variants_weighted <- function(reduced_data, raw_lib_templates, 
                                            pca_lda_weights = NULL,
                                            n_variants = 10,
-                                           min_cluster_size = 10) {
+                                           min_cluster_size = 10,
+                                           avail_idx = NULL,
+                                           norm_params = NULL) {
   mesma_lib <- list()
   
   for (veg in names(reduced_data)) {
@@ -4768,7 +4668,7 @@ build_mesma_variants_weighted <- function(reduced_data, raw_lib_templates,
       next
     }
     
-    # Per-index standardization across traces and time to equalize index importance
+    # Per-index standardization using GLOBAL training parameters
     if (!is.null(Z_list) && length(Z_list) > 0) {
       n_timepoints <- nrow(Z_list[[1]])
       K <- ncol(Z_list[[1]])
@@ -4776,19 +4676,40 @@ build_mesma_variants_weighted <- function(reduced_data, raw_lib_templates,
       n_timepoints <- 365
       K <- as.integer(ncol(X_feat) / n_timepoints)
     }
+    
     X_std <- matrix(NA_real_, nrow = nrow(X_feat), ncol = ncol(X_feat))
+    
+    # Use provided avail_idx or infer generic names if missing
+    idx_names <- if (!is.null(avail_idx)) avail_idx else paste0("idx", 1:K)
+    
     for (k_idx in seq_len(K)) {
       col_start <- (k_idx - 1) * n_timepoints + 1
       col_end <- k_idx * n_timepoints
       cols <- seq(col_start, col_end)
       if (max(cols) > ncol(X_feat)) cols <- cols[cols <= ncol(X_feat)]
+      
       index_data <- X_feat[, cols, drop = FALSE]
-      global_mean <- mean(index_data, na.rm = TRUE)
-      global_sd <- sd(as.vector(index_data), na.rm = TRUE)
-      if (!is.finite(global_sd) || global_sd < 1e-10) global_sd <- 1.0
-      X_std[, cols] <- (index_data - global_mean) / global_sd
+      
+      # Get global mean/sd for this index
+      idx_name <- idx_names[k_idx]
+      mu <- 0
+      sigma <- 1
+      
+      if (!is.null(norm_params) && !is.null(norm_params$INDEX_SCALES) && idx_name %in% names(norm_params$INDEX_SCALES)) {
+        params <- norm_params$INDEX_SCALES[[idx_name]]
+        mu <- params$mean
+        sigma <- params$sd
+      } else {
+        # Fallback to local scaling if global params missing (should not happen if properly configured)
+        mu <- mean(index_data, na.rm = TRUE)
+        sigma <- sd(as.vector(index_data), na.rm = TRUE)
+        if (!is.finite(sigma) || sigma < 1e-10) sigma <- 1.0
+      }
+      
+      X_std[, cols] <- (index_data - mu) / sigma
     }
     X_std[!is.finite(X_std)] <- 0
+    
     # Apply PCA-LDA weights for clustering (if available)
     # NOTE: We apply weights after performing per-index standardization
     X_weighted <- X_std
@@ -4811,9 +4732,9 @@ build_mesma_variants_weighted <- function(reduced_data, raw_lib_templates,
     }
     X_weighted <- X_weighted[, keep_cols, drop = FALSE]
     
-    # Standardize for clustering (center and scale)
-    X_std <- scale(X_weighted, center = TRUE, scale = TRUE)
-    X_std[!is.finite(X_std)] <- 0
+    # NO additional normalization here!
+    # We already Z-score scaled using global params.
+    X_std <- X_weighted
     
     # Optional: PCA for dimensionality reduction before clustering
     # This addresses multicollinearity in clustering space
@@ -5172,12 +5093,21 @@ build_mesma_variants <- function(reduced_data, raw_lib_templates, min_cluster_si
     p <- ncol(E)
     
     if (n < p) stop("solve_weights_ols: more endmembers than bands")
-    if (any(!is.finite(E)) || any(!is.finite(y))) stop("solve_weights_ols: non-finite values in E or y")
+    
+    # Handle NA values: subset to valid (finite) rows only
+    valid_idx <- apply(E, 1, function(row) all(is.finite(row))) & is.finite(y)
+    if (sum(valid_idx) < p) {
+      # Not enough valid observations
+      return(list(w = rep(1/p, p), rmse = NA_real_, active_count = p))
+    }
+    E_v <- E[valid_idx, , drop = FALSE]
+    y_v <- y[valid_idx]
+    n_v <- nrow(E_v)
     
     # Use geometric projection with simplex constraint
     # Solve unconstrained least squares: w = (E'E)^(-1) E'y
-    EtE <- t(E) %*% E
-    Ety <- t(E) %*% y
+    EtE <- t(E_v) %*% E_v
+    Ety <- t(E_v) %*% y_v
     
     # Add small ridge for numerical stability
     ridge <- 1e-8 * diag(p)
@@ -5201,9 +5131,9 @@ build_mesma_variants <- function(reduced_data, raw_lib_templates, min_cluster_si
       w <- project_to_simplex(w)
     }
     
-    # Compute final RMSE after constraints
-    pred <- E %*% w
-    rmse <- sqrt(mean((y - pred)^2))
+    # Compute final RMSE after constraints (using valid indices only)
+    pred_v <- E_v %*% w
+    rmse <- sqrt(mean((y_v - pred_v)^2))
     
     list(
       w = w,
@@ -5337,17 +5267,34 @@ build_mesma_variants <- function(reduced_data, raw_lib_templates, min_cluster_si
   # GEOMETRIC PROJECTION-BASED UNMIXING (Two Endmembers)
   # ----------------------------------------------------------------------------
   geometric_project_and_unmix <- function(y, m1, m2) {
-    em_line <- m2 - m1
+    # Handle NA values: use only indices where ALL three vectors have finite values
+    valid_idx <- is.finite(y) & is.finite(m1) & is.finite(m2)
+    if (sum(valid_idx) < 2) {
+      # Not enough valid dimensions for meaningful unmixing
+      return(list(f1 = 0.5, f2 = 0.5, y_proj = y, residual = NA_real_, t = 0.5))
+    }
+    
+    # Subset to valid indices
+    y_v <- y[valid_idx]
+    m1_v <- m1[valid_idx]
+    m2_v <- m2[valid_idx]
+    
+    em_line <- m2_v - m1_v
     em_norm_sq <- sum(em_line^2)
     if (em_norm_sq < 1e-10) {
       # Degenerate: identical endmembers
-      return(list(f1 = 0.5, f2 = 0.5, y_proj = m1, residual = sqrt(sum((y - m1)^2))))
+      return(list(f1 = 0.5, f2 = 0.5, y_proj = m1, residual = sqrt(sum((y_v - m1_v)^2))))
     }
-    y_minus_m1 <- y - m1
+    y_minus_m1 <- y_v - m1_v
     t <- sum(y_minus_m1 * em_line) / em_norm_sq
     t_clamped <- max(0, min(1, t))
-    y_proj <- m1 + t_clamped * em_line
-    residual <- sqrt(sum((y - y_proj)^2))
+    y_proj_v <- m1_v + t_clamped * em_line
+    residual <- sqrt(sum((y_v - y_proj_v)^2))
+    
+    # Reconstruct full projection with NAs where original was NA
+    y_proj <- rep(NA_real_, length(y))
+    y_proj[valid_idx] <- y_proj_v
+    
     f2 <- t_clamped
     f1 <- 1 - f2
     list(f1 = f1, f2 = f2, y_proj = y_proj, residual = residual, t = t)
@@ -5479,15 +5426,33 @@ build_mesma_variants <- function(reduced_data, raw_lib_templates, min_cluster_si
   geometric_stage2_unmix <- function(y, vegetation_libraries, topK = 2) {
     veg_types <- names(vegetation_libraries)
     if (length(veg_types) == 0) return(NULL)
-    X <- as.numeric(y); ny <- sqrt(sum(X^2)); X_norm <- if (ny > 0) X / ny else X
+    X <- as.numeric(y)
+    # Do NOT normalize X here - assume it is already scaled appropriately
+    
     top_variants <- list()
     for (v in veg_types) {
       cand <- vegetation_libraries[[v]]; if (length(cand) == 0) next
-      sims <- sapply(cand, function(x) { vec <- if (is.list(x) && !is.null(x$vec)) x$vec else x; norm_x <- sqrt(sum(vec^2)); if (norm_x == 0 || ny == 0) return(0); sum(vec * X) / (norm_x * ny) })
-      ord <- order(sims, decreasing = TRUE); keep <- ord[seq_len(min(topK, length(ord)))]; top_variants[[v]] <- lapply(keep, function(i) { x <- cand[[i]]; if (is.list(x) && !is.null(x$vec)) x else list(vec = x, id = paste0(v, "_", i)) })
+      # Compute cosine similarity for candidate selection (requires normalization for metric, but don't change data)
+      ny <- sqrt(sum(X^2))
+      sims <- sapply(cand, function(x) { 
+        vec <- if (is.list(x) && !is.null(x$vec)) x$vec else x
+        norm_x <- sqrt(sum(vec^2))
+        if (norm_x == 0 || ny == 0) return(0)
+        sum(vec * X) / (norm_x * ny) 
+      })
+      ord <- order(sims, decreasing = TRUE); keep <- ord[seq_len(min(topK, length(ord)))]
+      
+      # Store selected variants (unnormalized)
+      top_variants[[v]] <- lapply(keep, function(i) { 
+        x <- cand[[i]]
+        vec <- if (is.list(x) && !is.null(x$vec)) x$vec else x
+        id <- if (is.list(x) && !is.null(x$id)) x$id else paste0(v, "_", i)
+        list(vec = vec, id = id)
+      })
     }
     if (length(top_variants) == 0) return(NULL)
-    result <- angle_based_mesma(X_norm, top_variants)
+    # Use unnormalized observation with unnormalized library vectors
+    result <- angle_based_mesma(X, top_variants)
     if (is.null(result)) return(NULL)
     list(proportions = result$fractions, chosen_variants = result$chosen, residual = result$residual)
   }
@@ -5507,7 +5472,7 @@ build_mesma_variants <- function(reduced_data, raw_lib_templates, min_cluster_si
       veg_fraction_total <- stage1_unmix$veg_frac; barren_fraction_total <- stage1_unmix$barren_frac
     }
     if (!is.finite(veg_fraction_total)) return(list(fractions = NULL, stage1 = stage1_result, stage2 = NULL, error = 'Stage 1 failed'))
-    if (veg_fraction_total <= 0.01) return(list(fractions = c(barren = 1.0), stage1 = stage1_result, stage2 = NULL, veg_fraction = 0, barren_fraction = 1))
+    if (isTRUE(veg_fraction_total <= 0.01)) return(list(fractions = c(barren = 1.0), stage1 = stage1_result, stage2 = NULL, veg_fraction = 0, barren_fraction = 1))
     stage2_result <- geometric_stage2_unmix(X, vegetation_libraries, topK = topK)
     if (is.null(stage2_result)) return(list(fractions = c(barren = barren_fraction_total, vegetation = veg_fraction_total), stage1 = stage1_result, stage2 = NULL, veg_fraction = veg_fraction_total, barren_fraction = barren_fraction_total))
     stage2_proportions <- stage2_result$proportions
@@ -5620,13 +5585,13 @@ build_mesma_variants <- function(reduced_data, raw_lib_templates, min_cluster_si
   }
 
 # Compress a single trace to a feature vector (using raw spectral indices)
-compress_trace <- function(dly_year, avail_idx, budget = 365L) {
-  # Simply build raw 365 × K matrix and flatten
-  raw_mat <- build_raw_365_matrix(dly_year, avail_idx)
+compress_trace <- function(dly_year, avail_idx, budget = N_TEMPORAL_BINS) {
+  # Build pentad-aggregated matrix and flatten (NO interpolation)
+  raw_mat <- build_pentad_matrix(dly_year, avail_idx)
   if (is.null(raw_mat)) return(NULL)
   
   y <- as.numeric(raw_mat)  # Flatten to vector
-  if (any(!is.finite(y))) return(NULL)
+  # Allow NA values - geometric unmixing handles them
   
   list(y = y, grid_type = "full", raw_mat = raw_mat)
 }
@@ -5646,7 +5611,7 @@ if (exists('DEBUG_STAGE1_VERBOSE', envir = globalenv()) && isTRUE(get('DEBUG_STA
     for (i in seq_len(nrow(sample_rows))) {
       loc <- sample_rows$location_id[i]; yr <- sample_rows$year[i]
       dly_year <- df_train %>% dplyr::filter(.data$location_id == loc & .data$year == yr)
-      raw_mat <- build_raw_365_matrix(dly_year, COMPRESSED_STAGE1_LIB$indices)
+      raw_mat <- build_pentad_matrix(dly_year, COMPRESSED_STAGE1_LIB$indices)
       if (!is.null(raw_mat)) {
         y_vec <- as.numeric(raw_mat)
         stage1_res <- geometric_stage1_unmix(y_vec, COMPRESSED_STAGE1_LIB$barren, COMPRESSED_STAGE1_LIB$vegetation)
@@ -5668,7 +5633,7 @@ geometric_hierarchical_unmix_compressed <- function(y, compressed_stage1_lib, me
   veg_frac <- stage1_res$veg_frac; barren_frac <- stage1_res$barren_frac
   
   if (!is.finite(veg_frac)) return(list(error = 'Stage 1 failed'))
-  if (veg_frac <= 0.01) return(list(vegetation_proportions = c(barren = 1.0), chosen_variants = NULL, rmse = NA_real_, veg_fraction = 0, barren_fraction = 1))
+  if (isTRUE(veg_frac <= 0.01)) return(list(vegetation_proportions = c(barren = 1.0), chosen_variants = NULL, rmse = NA_real_, veg_fraction = 0, barren_fraction = 1))
 
   # Build vegetation libraries for stage 2 using compressed templates accessor
   if (!exists('.COMPRESSED_TEMPLATES_ACCESSOR', envir = globalenv())) return(list(error = 'Missing compressed templates accessor'))
@@ -5810,32 +5775,37 @@ geometric_hierarchical_unmix_compressed <- function(y, compressed_stage1_lib, me
 
   # Missing utility functions for MESMA
   build_Z365 <- function(date_list, k) {
-    # Build a 365 x k matrix from the date_list factor projections
-    Z <- matrix(NA_real_, nrow = 365, ncol = k)
+    # Build a N_TEMPORAL_BINS x k matrix from the date_list factor projections
+    # Using pentad aggregation (NO interpolation)
+    Z <- matrix(NA_real_, nrow = N_TEMPORAL_BINS, ncol = k)
+    
+    # First pass: aggregate by pentad
+    pentad_data <- list()
     for (entry in date_list) {
       if (!is.null(entry$doy) && !is.null(entry$z) && 
-          entry$doy >= 1 && entry$doy <= 365 && 
+          entry$doy >= 1 && entry$doy <= 366 && 
           length(entry$z) == k) {
-        Z[entry$doy, ] <- entry$z
+        pentad <- doy_to_pentad(entry$doy)
+        if (is.null(pentad_data[[as.character(pentad)]])) {
+          pentad_data[[as.character(pentad)]] <- list()
+        }
+        pentad_data[[as.character(pentad)]][[length(pentad_data[[as.character(pentad)]]) + 1]] <- entry$z
       }
     }
-    # Interpolate missing DOYs per component
-    for (col_idx in seq_len(k)) {
-      finite_mask <- is.finite(Z[, col_idx])
-      if (sum(finite_mask) >= 2) {
-        Z[!finite_mask, col_idx] <- approx(
-          x = which(finite_mask),
-          y = Z[finite_mask, col_idx],
-          xout = which(!finite_mask),
-          rule = 2
-        )$y
-      } else if (sum(finite_mask) == 1) {
-        Z[, col_idx] <- Z[finite_mask, col_idx][1]
-      } else {
-        Z[, col_idx] <- 0
+    
+    # Second pass: compute median for each pentad
+    for (pentad_str in names(pentad_data)) {
+      pentad <- as.integer(pentad_str)
+      if (pentad >= 1 && pentad <= N_TEMPORAL_BINS) {
+        z_vals <- do.call(rbind, pentad_data[[pentad_str]])
+        if (!is.null(z_vals) && nrow(z_vals) > 0) {
+          Z[pentad, ] <- apply(z_vals, 2, median, na.rm = TRUE)
+        }
       }
     }
-    Z[!is.finite(Z)] <- 0
+    
+    # NO interpolation - keep NA values for honest missing data handling
+    Z[!is.finite(Z)] <- NA_real_  # Keep NA instead of 0
     Z
   }
 
@@ -5933,7 +5903,9 @@ geometric_hierarchical_unmix_compressed <- function(y, compressed_stage1_lib, me
     raw_lib_templates = lib,
     pca_lda_weights = LDA_FEATURE_WEIGHTS,
     n_variants = N_VARIANTS_PER_VEG,
-    min_cluster_size = MIN_CLUSTER_SIZE
+    min_cluster_size = MIN_CLUSTER_SIZE,
+    avail_idx = avail,
+    norm_params = TRAINING_NORM_PARAMS
   )
 
   # Precompute compressed templates accessor
@@ -6457,9 +6429,16 @@ if (isTRUE(TESTING_MODE)) {
         df_inf$reference_date <- as.Date(df_inf$reference_date)
       }
 
-      # Recompute PPI from DVI if possible
-      if ("DVI" %in% names(df_inf)) {
-        df_inf <- recompute_ppi_from_scaled_dvi(df_inf)
+      # Apply the same normalization as training data using stored parameters
+      if (exists("TRAINING_NORM_PARAMS") && !is.null(TRAINING_NORM_PARAMS)) {
+        cat("\n=== APPLYING STORED NORMALIZATION TO INFERENCE DATA ===\n")
+        df_inf <- apply_stored_normalization(df_inf, TRAINING_NORM_PARAMS, cols = avail, lat_default = 40.2)
+        cat("=======================================================\n\n")
+      } else {
+        # Fallback: apply full normalization (but may compute different scale factors)
+        warning("TRAINING_NORM_PARAMS not found, applying fresh normalization to inference data (scale factors may differ from training!)")
+        inf_norm_result <- normalize_mesma_data(df_inf, cols = avail, lat_default = 40.2)
+        df_inf <- inf_norm_result$df
       }
       
       # Filter to 1985-2025
@@ -6489,23 +6468,11 @@ if (isTRUE(TESTING_MODE)) {
       if (!"year" %in% names(df_tasks_inference) && "date" %in% names(df_tasks_inference)) df_tasks_inference$year <- lubridate::year(df_tasks_inference$date)
       if (!"pheno_year" %in% names(df_tasks_inference) && "date" %in% names(df_tasks_inference)) df_tasks_inference$pheno_year <- assign_pheno_year(df_tasks_inference$date)
       n_infer_loc_years <- nrow(unique(df_tasks_inference[c("location_id", "pheno_year")]))
-      # If training data exists, remove any location-year pairs from inference that overlap training
-      if (exists("df_train") && !is.null(df_train) && nrow(df_train) > 0) {
-        if (!"year" %in% names(df_train) && "date" %in% names(df_train)) df_train$year <- lubridate::year(df_train$date)
-        # Ensure train loc-year pairs exist and are properly typed
-        df_train_pairs <- df_train %>% dplyr::select(location_id, year) %>% dplyr::distinct()
-        df_train_pairs$location_id <- as.character(df_train_pairs$location_id)
-        # Use original inference IDs (before the 'a' append) to match training IDs
-        if ("location_id_orig" %in% names(df_tasks_inference)) {
-          before_overlap <- nrow(df_tasks_inference)
-          df_tasks_inference <- df_tasks_inference %>% dplyr::anti_join(df_train_pairs, by = c("location_id_orig" = "location_id", "year" = "year"))
-          after_overlap <- nrow(df_tasks_inference)
-          removed_overlap <- before_overlap - after_overlap
-          if (removed_overlap > 0) cat(sprintf("[NOTICE] Removed %d inference rows that overlap with training location-years.\n", removed_overlap))
-          # Recompute counts after removal
-          n_infer_loc_years <- nrow(unique(df_tasks_inference[c("location_id", "pheno_year")]))
-        }
-      }
+      # We do NOT remove inference loc-years that share ID strings with training data.
+      # Location IDs in inference datasets and training datasets are treated as separate namespaces
+      # (often coming from different sources). If you intentionally want to exclude overlap by
+      # spatial coordinates or true identifier mapping, ensure you pre-process the inference CSV
+      # or provide a GeoJSON map to join against for an explicit match.
       if (exists("df_train") && !is.null(df_train) && nrow(df_train) > 0) {
         if (!"year" %in% names(df_train) && "date" %in% names(df_train)) df_train$year <- lubridate::year(df_train$date)
         if (!"pheno_year" %in% names(df_train) && "date" %in% names(df_train)) df_train$pheno_year <- assign_pheno_year(df_train$date)
@@ -6516,7 +6483,7 @@ if (isTRUE(TESTING_MODE)) {
       cat(sprintf("(NOTICE) Inference dataset location-years: %d\n", n_infer_loc_years))
       cat(sprintf("(NOTICE) Training dataset location-years: %d\n", n_train_loc_years))
       if (n_train_loc_years > 0 && n_infer_loc_years == n_train_loc_years) {
-        stop(sprintf("ERROR: Training and inference datasets appear to have the same number of location-years (%d). This may indicate you passed the same data for training and inference — aborting to avoid accidental overlap.", n_train_loc_years))
+        cat(sprintf("(WARNING) Training and inference datasets have the same number of location-years (%d). This may be expected if IDs are independent; no automatic filtering will be applied.\n", n_train_loc_years))
       }
 
       # Keep df_tasks as training tasks - do not overwrite
@@ -6718,45 +6685,7 @@ cat(sprintf("Var14 columns: %s\n", paste(grep("_var14$", names(test_dly_year), v
   }
 
   # Filter out location-years with insufficient observations (inference tasks)
-  # DISABLED: df_tasks may be a task list (1 row per task) and not contain full observations.
-  # Filtering for sufficient data (e.g. >5 unique DOYs) is handled inside the processing loop.
-  # if (exists("df_tasks") && nrow(df_tasks) > 0) {
-  #   # Recompute sample sizes reliably (in case diagnostics ran in different scope)
-  #   sample_sizes <- df_tasks %>%
-  #     dplyr::mutate(location_id = trimws(as.character(location_id))) %>%
-  #     dplyr::group_by(location_id, year) %>%
-  #     dplyr::summarize(n_obs = dplyr::n(), .groups = "drop")
-  #   keep_pairs <- sample_sizes[sample_sizes$n_obs >= MIN_OBS_PER_LOC_YEAR, , drop = FALSE]
-  #   # Coerce join columns to consistent types in case they are factors
-  #   keep_pairs$location_id <- trimws(as.character(keep_pairs$location_id))
-  #   keep_pairs$year <- as.integer(keep_pairs$year)
-  #   test_loc_years$location_id <- trimws(as.character(test_loc_years$location_id))
-  #   test_loc_years$year <- as.integer(test_loc_years$year)
-  #   n_before <- nrow(test_loc_years)
-  #   # Perform an inner join to keep only the pairs that meet the threshold
-  #   test_loc_years <- dplyr::inner_join(test_loc_years, keep_pairs[, c('location_id', 'year')], by = c('location_id','year'))
-  #   n_after <- nrow(test_loc_years)
-  #   cat(sprintf("\nFiltered tasks: kept %d/%d location-years with >= %d observations\n", n_after, n_before, MIN_OBS_PER_LOC_YEAR))
-  #   if (n_after < n_before) {
-  #     cat("Sample of excluded location-years:\n")
-  #     excluded <- setdiff(sample_sizes[, c('location_id','year')], keep_pairs[, c('location_id','year')])
-  #     print(utils::head(excluded, 10))
-  #   }
-  #   if (n_after == 0) {
-  #     stop(sprintf("No testing tasks remain after filtering location-years with < %d observations; aborting.", MIN_OBS_PER_LOC_YEAR))
-  #   }
-  #
-  #   # Add debugging before task list creation
-  #   cat(sprintf("DEBUG: test_loc_years has %d rows\n", nrow(test_loc_years)))
-  #   cat(sprintf("DEBUG: NA location_ids in test_loc_years: %d\n", sum(is.na(test_loc_years$location_id))))
-  #   cat(sprintf("DEBUG: Sample location_ids: %s\n", paste(head(test_loc_years$location_id, 10), collapse=", ")))
-  #
-  #   # Rebuild the task_list to reflect the filtered location-years
-  #   n_loc_years <- nrow(test_loc_years)
-  #   task_list <- lapply(seq_len(n_loc_years), function(i) {
-  #     list(loc = test_loc_years$location_id[i], yr = test_loc_years$year[i])
-  #   })
-  # }
+
 
   if (length(task_list) == 0) {
     stop("No testing tasks found")
@@ -6766,15 +6695,14 @@ cat(sprintf("Var14 columns: %s\n", paste(grep("_var14$", names(test_dly_year), v
   # UNIFIED COMPRESSION PIPELINE FUNCTIONS
   # ============================================================================
 
-  #' Build temporal matrix from daily data
+  #' Build temporal matrix from daily data using pentad aggregation
   #' @param dly_year Data frame with daily observations including 'doy' column
   #' @param avail Vector of available indices
-  #' @return Matrix with 365 rows (DOY 1-365) and columns for each index in avail
+  #' @return Matrix with N_TEMPORAL_BINS rows (73 pentads) and columns for each index in avail
   build_temporal_matrix <- function(dly_year, avail) {
     if (nrow(dly_year) == 0 || length(avail) == 0) return(NULL)
     
     # Ensure doy column exists
-
     if (!"doy" %in% names(dly_year)) {
       if ("date" %in% names(dly_year)) {
         dly_year$doy <- lubridate::yday(dly_year$date)
@@ -6782,32 +6710,29 @@ cat(sprintf("Var14 columns: %s\n", paste(grep("_var14$", names(test_dly_year), v
         return(NULL)
       }
     }
+    
+    # Compute pentad for each observation
+    dly_year$pentad <- doy_to_pentad(dly_year$doy)
 
-    # Initialize matrix: 365 rows (DOY 1-365), columns for avail indices
-    temporal_matrix <- matrix(NA_real_, nrow = 365, ncol = length(avail))
+    # Initialize matrix: N_TEMPORAL_BINS rows (73 pentads), columns for avail indices
+    temporal_matrix <- matrix(NA_real_, nrow = N_TEMPORAL_BINS, ncol = length(avail))
     colnames(temporal_matrix) <- avail
 
     # Get indices that exist in the data
     avail_present <- intersect(avail, names(dly_year))
     if (length(avail_present) == 0) return(NULL)
 
-    # Fill matrix with values from dly_year based on doy
-    for (i in seq_len(nrow(dly_year))) {
-      doy <- dly_year$doy[i]
-      if (!is.na(doy) && doy >= 1 && doy <= 365) {
-        for (idx in avail_present) {
-          val <- dly_year[[idx]][i]
-          if (is.finite(val)) {
-            # If multiple observations for same DOY, keep the one closest to existing mean
-            existing <- temporal_matrix[doy, idx]
-            if (is.na(existing)) {
-              temporal_matrix[doy, idx] <- val
-            } else {
-              # Average with existing value
-              temporal_matrix[doy, idx] <- (existing + val) / 2
-            }
-          }
-        }
+    # Aggregate by pentad (median for robustness)
+    for (idx in avail_present) {
+      vals_by_pentad <- tapply(dly_year[[idx]], dly_year$pentad, function(v) {
+        v <- v[is.finite(v)]
+        if (length(v) == 0) NA_real_ else median(v)
+      })
+      pentad_values <- as.integer(names(vals_by_pentad))
+      valid <- pentad_values >= 1 & pentad_values <= N_TEMPORAL_BINS
+      col_idx <- match(idx, avail)
+      if (!is.na(col_idx)) {
+        temporal_matrix[pentad_values[valid], col_idx] <- vals_by_pentad[valid]
       }
     }
 
@@ -6855,14 +6780,7 @@ cat(sprintf("Var14 columns: %s\n", paste(grep("_var14$", names(test_dly_year), v
     raw_matrix
   }
 
-  #' Unified trace compression function - wrapper around original compress_trace
-  #' @param dly_year Data frame with daily observations
-  #' @param avail Available indices
-  #' @param temporal_budget Maximum temporal points
-  #' @return Compressed trace result
-  compress_trace_unified <- function(dly_year, avail, temporal_budget) {
-    compress_trace(dly_year, avail, temporal_budget)
-  }
+  
 
   #' Unified Stage 1 library compression
   #' @param stage1_lib Raw Stage 1 endmember library
@@ -6872,10 +6790,10 @@ cat(sprintf("Var14 columns: %s\n", paste(grep("_var14$", names(test_dly_year), v
 
 # Dummy compress_temporal_matrix for compatibility (no compression)
 compress_temporal_matrix <- function(data, temporal_budget, avail) {
-  # No compression - return data as-is
+  # No compression - return data as-is (using pentad grid)
   list(
     compressed_matrix = data,
-    grid = 1:365,
+    grid = seq_len(N_TEMPORAL_BINS),  # 1:73 for 5-day pentads
     grid_type = "full"
   )
 }
@@ -6953,7 +6871,7 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
     for (trace_name in names(traces)) {
       trace_data <- traces[[trace_name]]
 
-      compressed <- compress_trace_unified(trace_data, avail, temporal_budget)
+      compressed <- compress_trace(trace_data, avail, temporal_budget)
 
       if (!is.null(compressed)) {
         compressed_traces[[trace_name]] <- compressed
@@ -7032,7 +6950,6 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
     }
 
     if (exists("TESTING_MODE") && isTRUE(TESTING_MODE)) {
-       # cat(sprintf("[DEBUG fit_one_task ENTRY] loc=%s yr=%d\n", loc, yr))
     }
 
     res_safe <- tryCatch(
@@ -7073,7 +6990,7 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
         } else {
           avail
         }
-        raw_mat <- build_raw_365_matrix(dly_year, stage1_indices)
+        raw_mat <- build_pentad_matrix(dly_year, stage1_indices)
         if (is.null(raw_mat)) {
           if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] raw_mat NULL for loc=%s yr=%d\n", loc, yr))
           return(NULL)
@@ -7081,8 +6998,10 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
         
         # Flatten to vector
         y <- as.numeric(raw_mat)
-        if (length(y) == 0 || any(!is.finite(y))) {
-          if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] y invalid for loc=%s yr=%d len=%d anynonfinite=%s\n", loc, yr, length(y), any(!is.finite(y))))
+        # Require at least 50% valid (non-NA) values for meaningful unmixing
+        n_valid <- sum(is.finite(y))
+        if (length(y) == 0 || n_valid < length(y) * 0.5) {
+          if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] y insufficient valid data for loc=%s yr=%d len=%d valid=%d\n", loc, yr, length(y), n_valid))
           return(NULL)
         }
         
@@ -7097,7 +7016,6 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
         }
         
         if (!is.finite(veg_fraction_total)) {
-          # cat(sprintf("[DEBUG fit_one_task] Stage 1 unmixing returned non-finite for %s/%d\n", loc, yr))
           veg_fraction_total <- 0.5  # Default to 50/50 if unmixing fails
         }
         veg_fraction_total <- pmax(0, pmin(1, veg_fraction_total))
@@ -7107,11 +7025,12 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
         barren_fraction_total <- 1 - veg_fraction_total
         
         # Apply minimum fraction threshold (10%) like in stage 2
+        # Use isTRUE() to handle potential NA values safely
         MIN_FRACTION <- 0.10
-        if (veg_fraction_total < MIN_FRACTION) {
+        if (isTRUE(veg_fraction_total < MIN_FRACTION)) {
           veg_fraction_total <- 0
           barren_fraction_total <- 1
-        } else if (barren_fraction_total < MIN_FRACTION) {
+        } else if (isTRUE(barren_fraction_total < MIN_FRACTION)) {
           barren_fraction_total <- 0
           veg_fraction_total <- 1
         }
@@ -7121,7 +7040,7 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
           return(NULL)
         }
         # If veg_fraction_total is exactly zero, this is a pure barren observation — proceed
-        if (veg_fraction_total <= 0) {
+        if (isTRUE(veg_fraction_total <= 0)) {
           veg_fraction_total <- 0
           barren_fraction_total <- 1
           # Prepare output with only barren fraction
@@ -7154,7 +7073,6 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
         veg_kept <- veg_names[tolower(veg_names) %in% ALLOWED_VEG]
 
         # (Logging removed for speed in optimized loop)
-        # cat(sprintf("veg_names: %s\n", paste(veg_names, collapse = ",")))
 
         if (length(veg_kept) < MAX_VEG_COMPONENTS && length(veg_counts) > 0) {
           global_order <- names(veg_counts)
@@ -7188,7 +7106,7 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
         if (!is.null(COMPRESSED_STAGE1_LIB) && !is.null(COMPRESSED_STAGE1_LIB$indices_full)) {
            # Use full indices for Stage 2
            stage2_indices <- COMPRESSED_STAGE1_LIB$indices_full
-           raw_mat_stage2 <- build_raw_365_matrix(dly_year, stage2_indices)
+           raw_mat_stage2 <- build_pentad_matrix(dly_year, stage2_indices)
            if (!is.null(raw_mat_stage2)) {
              y_stage2_raw <- as.numeric(raw_mat_stage2)
              barren_prototype <- COMPRESSED_STAGE1_LIB$barren_full
@@ -7197,13 +7115,27 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
         }
 
         y_for_stage2 <- y_stage2_raw
-        if (barren_fraction_total > 0 && !is.null(barren_prototype)) {
+        if (!is.na(barren_fraction_total) && barren_fraction_total > 0 && !is.null(barren_prototype)) {
           if (length(barren_prototype) == length(y_stage2_raw)) {
             soil_component <- barren_fraction_total * barren_prototype
             y_for_stage2 <- y_stage2_raw - soil_component
           } else {
              if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] Barren prototype length mismatch: proto=%d y=%d\n", length(barren_prototype), length(y_stage2_raw)))
           }
+        }
+        
+        # Apply Stage 2 normalization to soil-corrected data
+        # Uses vegetation-only INDEX_SCALES computed from pure vegetation samples
+        if (exists("TRAINING_NORM_PARAMS") && !is.null(TRAINING_NORM_PARAMS$INDEX_SCALES)) {
+          stage2_idx_names <- if (!is.null(COMPRESSED_STAGE1_LIB$indices_full)) {
+            rep(COMPRESSED_STAGE1_LIB$indices_full, each = N_TEMPORAL_BINS)
+          } else {
+            rep(avail, each = N_TEMPORAL_BINS)
+          }
+          y_for_stage2 <- apply_stage2_normalization(y_for_stage2, stage2_idx_names, TRAINING_NORM_PARAMS)
+          if (isTRUE(TESTING_MODE)) cat("[DEBUG fit_one_task] Applied Stage 2 normalization (Z-score) to soil-corrected y\n")
+        } else {
+          if (isTRUE(TESTING_MODE)) cat("[DEBUG fit_one_task] SKIPPING Stage 2 normalization: TRAINING_NORM_PARAMS missing or invalid\n")
         }
 
         # 3. STAGE 2 MESMA: Unmix vegetation using soil-corrected data
@@ -7227,12 +7159,8 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
         if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] mesma_result obtained: %s\n", if(is.null(mesma_result)) "NULL" else "List"))
 
         if (isTRUE(DEBUG_UNCERTAINTY)) {
-          # cat(sprintf("[DEBUG] Location %s, Year %d: ENABLE_UNCERTAINTY = %s\n", loc, yr, as.character(ENABLE_UNCERTAINTY)))
-          # cat(sprintf("[DEBUG] mesma_result$uncertainty is NULL: %s\n", as.character(is.null(mesma_result$uncertainty))))
           if (!is.null(mesma_result$uncertainty)) {
-            # cat(sprintf("[DEBUG] coef_ci exists: %s\n", as.character(!is.null(mesma_result$uncertainty$coef_ci))))
             if (!is.null(mesma_result$uncertainty$coef_ci)) {
-              # cat(sprintf("[DEBUG] coef_ci rows: %d\n", nrow(mesma_result$uncertainty$coef_ci)))
               print(mesma_result$uncertainty$coef_ci)
             }
           }
@@ -7247,6 +7175,7 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
 
         coef_stage2 <- mesma_result$vegetation_proportions
         use_median <- !is.null(mesma_result$uncertainty$w_median)
+        is_nested <- FALSE  # Initialize to avoid undefined variable issues
         if (use_median) {
           coef_stage2 <- mesma_result$uncertainty$w_median
           is_nested <- !is.null(mesma_result$uncertainty$veg_frac_ci)
@@ -7289,8 +7218,6 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
         if (!is.null(mesma_result$uncertainty) && !is.null(mesma_result$uncertainty$coef_ci)) {
           ci_tbl <- mesma_result$uncertainty$coef_ci
           if (isTRUE(DEBUG_UNCERTAINTY)) {
-            # cat(sprintf("[DEBUG] CI table vegs: %s\n", paste(ci_tbl$Veg, collapse=", ")))
-            # cat(sprintf("[DEBUG] coef_df vegs: %s\n", paste(coef_df$Veg, collapse=", ")))
           }
           
           # Determine if this is nested bootstrap (already includes veg_fraction)
@@ -7301,7 +7228,6 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
             row_ci <- ci_tbl[ci_tbl$Veg == vname, , drop = FALSE]
             
             if (isTRUE(DEBUG_UNCERTAINTY)) {
-              # cat(sprintf("[DEBUG] Looking for %s: found %d matching rows\n", vname, nrow(row_ci)))
             }
             
             if (nrow(row_ci) >= 1) {  # Changed from == 1 to >= 1
@@ -7325,8 +7251,6 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
                 # Calculate interval
                 coef_df$interval[i] <- coef_df$coef_975[i] - coef_df$coef_025[i]
               } else if (isTRUE(DEBUG_UNCERTAINTY)) {
-                # cat(sprintf("[DEBUG] Non-finite CIs for %s: ci_025=%s, ci_975=%s\n",
-                #             vname, ci_025, ci_975))
               }
             } else if (isTRUE(DEBUG_UNCERTAINTY)) {
               cat(sprintf("[DEBUG] No CI rows found for vegetation: %s\n", vname))
@@ -7358,7 +7282,7 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
           diag_df$vegetated_frac_hi <- unc$veg_frac_ci[2]
         }
 
-        if (barren_fraction_total >= 0) {
+        if (isTRUE(barren_fraction_total >= 0)) {
           barren_row <- data.frame(
             location_id = loc,
             year = yr,
@@ -7440,7 +7364,7 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
         ))
       },
       error = function(e) {
-        cat(sprintf("[DEBUG fit_one_task] CAUGHT ERROR: %s\n", e$message))
+        # cat(sprintf("[DEBUG fit_one_task] CAUGHT ERROR: %s\n", e$message))
         dbg_return_null(paste0("error:", as.character(e$message)))
       }
     )
@@ -7448,8 +7372,13 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
   }
 
   # Pre-compute Optimized Library for Vectorized Similarity Search
+  # Apply Stage 2 normalization conversion to templates
   cat("Pre-computing optimized library for vectorized similarity search...\n")
-  OPTIMIZED_LIBRARY <- precompute_optimized_library(mesma_lib, compressed_templates_accessor, grid_type = "full", feature_weights = LDA_FEATURE_WEIGHTS)
+  OPTIMIZED_LIBRARY <- precompute_optimized_library(
+    mesma_lib, compressed_templates_accessor, grid_type = "full", 
+    feature_weights = LDA_FEATURE_WEIGHTS,
+    stage2_norm_params = if (exists("TRAINING_NORM_PARAMS")) TRAINING_NORM_PARAMS else NULL
+  )
   assign("OPTIMIZED_LIBRARY", OPTIMIZED_LIBRARY, envir = globalenv())
 
   # Prepare task function environment
@@ -7466,11 +7395,9 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
     OUT_DIR = OUT_DIR,
     # df_tasks = df_tasks, # REMOVED
     prepare_factor_data = prepare_factor_data,
-    compress_trace = compress_trace_unified,
     compress_temporal_matrix = compress_temporal_matrix,
     build_temporal_matrix = build_temporal_matrix,
     build_raw_index_matrix = build_raw_index_matrix,
-    compress_trace_unified = compress_trace_unified,
     compress_stage1_lib_unified = compress_stage1_lib_unified,
     precompute_compressed_templates_unified = precompute_compressed_templates_unified,
     reduce_all_traces_unified = reduce_all_traces_unified,
@@ -7499,10 +7426,12 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
     DEBUG_UNCERTAINTY = DEBUG_UNCERTAINTY,
     VARIANT_SWITCH_BOOTSTRAP = VARIANT_SWITCH_BOOTSTRAP,
     INSEPARABLE_VARIANT_INFO = if (exists("INSEPARABLE_VARIANT_INFO")) INSEPARABLE_VARIANT_INFO else NULL,
+    OPTIMIZED_LIBRARY = if (exists("OPTIMIZED_LIBRARY")) OPTIMIZED_LIBRARY else NULL,
+    TRAINING_NORM_PARAMS = if (exists("TRAINING_NORM_PARAMS")) TRAINING_NORM_PARAMS else NULL,
+    apply_stage2_normalization = apply_stage2_normalization,
     INSEPARABLE_VARIANTS = if (exists("INSEPARABLE_VARIANTS")) INSEPARABLE_VARIANTS else NULL,
     VARIANT_SIMILARITY_TABLE = if (exists("VARIANT_SIMILARITY_TABLE")) VARIANT_SIMILARITY_TABLE else NULL,
     LDA_FEATURE_WEIGHTS = if (exists("LDA_FEATURE_WEIGHTS")) LDA_FEATURE_WEIGHTS else NULL,
-    OPTIMIZED_LIBRARY = OPTIMIZED_LIBRARY,
     TESTING_MODE = if (exists("TESTING_MODE")) TESTING_MODE else FALSE,
     DEBUG = if (exists("DEBUG")) DEBUG else FALSE
   )
@@ -7559,6 +7488,9 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
   
   # Create batches of keys
   key_batches <- split(target_keys, ceiling(seq_along(target_keys) / BATCH_SIZE))
+  # Batch progress bar dimensions
+  n_batches <- length(key_batches)
+  pb_width <- min(40L, max(4L, n_batches))
   
   cat(sprintf("Processing %d tasks in %d batches (approx %d tasks/batch)...\n", n_keys, length(key_batches), BATCH_SIZE))
   
@@ -7571,7 +7503,11 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
   # Process batches
   for (i in seq_along(key_batches)) {
     batch_keys <- key_batches[[i]]
-    cat(sprintf("  Batch %d/%d: Processing %d tasks...\n", i, length(key_batches), length(batch_keys)))
+    # Print a single-line batch-level progress bar (visual only)
+    nfull <- floor(pb_width * i / n_batches)
+    bar <- paste0(paste(rep('+', nfull), collapse=''), paste(rep(' ', pb_width - nfull), collapse=''))
+    # cat(sprintf("\r  Batch %d/%d [%s] Processing %d tasks...", i, n_batches, bar, length(batch_keys)))
+    flush.console()
     
     # Subset data for this batch ONLY
     # This avoids creating a copy of the full dataset
@@ -7581,7 +7517,7 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
     batch_task_list <- split(batch_df, batch_df$task_key)
     
     # Run parallel map on this batch
-    batch_results <- .run_map(batch_task_list, fit_one_task)
+    batch_results <- .run_map(batch_task_list, fit_one_task, show_pb = FALSE)
     
     # Store results
     # We match by name to ensure correct placement
@@ -7616,6 +7552,7 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
     # Explicitly clean up to free RAM before next batch
     rm(batch_df, batch_task_list, batch_results)
     gc(verbose = FALSE)
+    cat("\n")
   }
   
   end_time <- Sys.time()
@@ -7671,6 +7608,8 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
     if (n_inference_keys > 0) {
       # Create batches
       inference_key_batches <- split(inference_target_keys, ceiling(seq_along(inference_target_keys) / BATCH_SIZE))
+      inference_n_batches <- length(inference_key_batches)
+      inference_pb_width <- min(40L, max(4L, inference_n_batches))
       
       cat(sprintf("Processing %d inference tasks in %d batches...\n", n_inference_keys, length(inference_key_batches)))
       
@@ -7682,7 +7621,10 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
       
       for (i in seq_along(inference_key_batches)) {
         batch_keys <- inference_key_batches[[i]]
-        cat(sprintf("  Inference Batch %d/%d: Processing %d tasks...\n", i, length(inference_key_batches), length(batch_keys)))
+        nfull <- floor(inference_pb_width * i / inference_n_batches)
+        bar <- paste0(paste(rep('+', nfull), collapse=''), paste(rep(' ', inference_pb_width - nfull), collapse=''))
+        # cat(sprintf("\r  Inference Batch %d/%d [%s] Processing %d tasks...", i, inference_n_batches, bar, length(batch_keys)))
+        flush.console()
         
         # Subset data for this batch
         batch_df <- df_tasks_inference[df_tasks_inference$task_key %in% batch_keys, ]
@@ -7691,7 +7633,7 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
         batch_task_list <- split(batch_df, batch_df$task_key)
         
         # Run parallel map
-        batch_results <- .run_map(batch_task_list, fit_one_task)
+        batch_results <- .run_map(batch_task_list, fit_one_task, show_pb = FALSE)
         
         # Store results
         inference_results_list[names(batch_results)] <- batch_results
@@ -7714,6 +7656,7 @@ compress_temporal_matrix <- function(data, temporal_budget, avail) {
         # Clean up
         rm(batch_df, batch_task_list, batch_results)
         gc(verbose = FALSE)
+          cat("\n")
       }
       
       inference_end_time <- Sys.time()
