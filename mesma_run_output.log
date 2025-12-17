@@ -1,0 +1,508 @@
+
+Attaching package: 'zoo'
+
+The following objects are masked from 'package:base':
+
+    as.Date, as.Date.numeric
+
+
+Attaching package: 'dplyr'
+
+The following objects are masked from 'package:stats':
+
+    filter, lag
+
+The following objects are masked from 'package:base':
+
+    intersect, setdiff, setequal, union
+
+Linking to GEOS 3.13.1, GDAL 3.11.0, PROJ 9.6.0; sf_use_s2() is TRUE
+
+Attaching package: 'scales'
+
+The following object is masked from 'package:readr':
+
+    col_factor
+
+
+Attaching package: 'nlme'
+
+The following object is masked from 'package:dplyr':
+
+    collapse
+
+This is version 1.0.2.2 of RStoolbox
+Warning message:
+package 'RStoolbox' was built under R version 4.5.2 
+Warning message:
+package 'nnls' was built under R version 4.5.2 
+terra 1.8.60
+
+Attaching package: 'terra'
+
+The following object is masked from 'package:scales':
+
+    rescale
+
+The following object is masked from 'package:zoo':
+
+    time<-
+
+Warning: setup_parallel_backend() not found after attempting to source 'init_mesma.R'; defining a harmless fallback.
+[CONFIG] Parallel processing ENABLED
+After deduplication: 26820 rows remaining from original 26820 rows.
+[NOTICE] Renamed 'vegetation' column to 'Veg'
+Testing mode: subset to 13410 rows (50% of original 26820 rows)
+[NOTICE] Normalized band column 'Blue' -> 'blue'
+[NOTICE] Normalized band column 'Green' -> 'green'
+[NOTICE] Normalized band column 'Red' -> 'red'
+[NOTICE] Normalized band column 'NIR' -> 'nir'
+[NOTICE] Normalized band column 'SWIR1' -> 'swir1'
+[NOTICE] Normalized band column 'SWIR2' -> 'swir2'
+Filtering indices with linearity > 0.2 after linearization. Retained indices: DVI, TCB, GVI, NDMI, NBR, MSAVI2, NIRv, OSAVI, PSRI, NDVI
+Preserved 6 raw bands: blue, green, red, nir, swir1, swir2
+
+=== APPLYING TRAINING DATA NORMALIZATION ===
+Filtering training data to 1985-2025 (phenological years: March-February) before PPI baseline calculation...
+[PPI] Computed baseline from 2886 barren observations (mean DVI of barren): dvi_soil = 0.0578
+[PPI] Auto-added PPI to dataset before normalization (reason: calculated)
+Applying comprehensive MESMA data normalization...
+Applying linearization transformations to indices...
+  Linearizing NIRv (2x - x^2)...
+  Linearizing MSAVI2 (log(x+1))...
+  Linearizing PSRI (signed sqrt)...
+Stored normalization params: INDEX_SCALES for 10 indices
+(Stage 2 normalization will be computed after location mapping)
+===========================================
+
+[NOTICE] Constructed gpts_map from 214 unique lat/lon combos in CSV
+
+=== GPTS_MAP LOADING DEBUG ===
+Total locations in gpts_map: 214
+Veg class distribution:
+
+         agri        alhagi        barren    halocnemum    phragmites 
+           21             1            18             5            50 
+      populus populus_herbs    salicornia       tamarix tamarix_herbs 
+           49             5             2            44             7 
+        water          <NA> 
+           11             1 
+Sample location_ids (first 5): L_82.614926_41.004447, L_82.622036_41.044707, L_82.685707_41.030795, L_82.717700_41.035604, L_82.733332_41.029682
+Barren locations: 19
+  Barren location_ids: L_87.036181_40.814881, NA, L_87.641837_40.263256, L_87.652918_40.149026, L_87.993049_39.981095, L_87.998593_40.076358, L_88.022034_40.108857, L_88.185789_40.196047, L_88.215505_40.250018, L_88.250094_40.161468
+==============================
+
+[NOTICE] Normalized CSV 'location_id' to row-number format where possible.
+
+=== BARREN JOIN DEBUG ===
+Barren locations in gpts_map: 19
+  Sample barren location_ids: L_87.036181_40.814881, NA, L_87.641837_40.263256, L_87.652918_40.149026, L_87.993049_39.981095
+  Location L_87.036181_40.814881: 202 rows in joined, Veg values: barren
+    Veg.geo values: barren
+  Location NA: 13410 rows in joined, Veg values: NA
+    Veg.geo values: NA
+  Location L_87.641837_40.263256: 54 rows in joined, Veg values: barren
+    Veg.geo values: barren
+  Location L_87.652918_40.149026: 53 rows in joined, Veg values: barren
+    Veg.geo values: barren
+  Location L_87.993049_39.981095: 100 rows in joined, Veg values: barren
+    Veg.geo values: barren
+=========================
+
+[NOTICE] Replaced CSV latitude with GeoJSON latitude where available
+[NOTICE] GeoJSON join results - Veg before=13374 after=13374; matched location_id strings=214
+
+=== STAGE 1 TRAINING DATA DIAGNOSTIC ===
+Total rows in joined data: 13410
+Rows with Veg='barren': 1545
+Rows with non-NA no soil: 1341
+Rows with no soil ≈ 1 (pure veg, threshold 0.01): 1341
+Rows with no soil > 0.95: 1341
+Rows with no soil ≈ 0 (barren, threshold 0.01): 0
+no soil value distribution:
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max.    NA's 
+      1       1       1       1       1       1   12069 
+
+Pure vegetation (no soil ≈ 1) by type:
+  water: 0 rows
+  phragmites: 432 rows
+  populus: 321 rows
+  tamarix: 189 rows
+  agri: 0 rows
+  tamarix_herbs: 317 rows
+  alhagi: 0 rows
+  halocnemum: 0 rows
+  populus_herbs: 82 rows
+  salicornia: 0 rows
+=========================================
+
+Calculating PPI...
+[PPI] Computed baseline from 2886 barren observations (mean DVI of barren): dvi_soil = -0.0255
+[PPI] Auto-added PPI to dataset (reason: calculated)
+
+=== STAGE 2 NORMALIZATION SKIPPED (Using single Z-score normalization) ===
+Starting vegetation mixture analysis with MESMA approach...
+✓ Multiple endmember spectral mixture analysis
+✓ Dynamic programming for year-constant proportions
+✓ Variant switching allowed throughout the year
+
+Dataset size: 13410 rows, 29 columns
+Number of locations: 214
+Date range: 2023-01-02 to 2025-12-09
+
+=== TRAIN/INFERENCE DATA CONFIGURATION ===
+Training years (config): 2022, 2023, 2024
+Filtering training data to phenological years (March-February): 2022, 2023, 2024
+Training dataset: 10038 rows from 214 locations
+Testing dataset: 13410 rows from 214 locations
+[16:36:24] TESTING MODE: Capping observations per vegetation type to 10,000L
+[16:36:24] Observations capped. New training data size: 10038 rows
+Using training data for vegetation library construction
+=====================================
+
+
+=== BARREN LOADING DEBUG ===
+Barren locations in gpts_map: 19
+  Sample location_ids: L_87.036181_40.814881, NA, L_87.641837_40.263256, L_87.652918_40.149026, L_87.993049_39.981095
+Barren locations found in phenology df: 1135 rows from 18 locations
+Rows with Veg='barren' in df: 1166
+=============================
+
+Vegetation class counts after loading:
+
+      populus    phragmites       tamarix        barren          agri 
+         2313          2249          2154          1135           701 
+        water tamarix_herbs    halocnemum populus_herbs        alhagi 
+          478           394           195           175           134 
+   salicornia 
+           79 
+Found 10 OPTIMAL_INDICES in input: DVI, TCB, GVI, NDMI, NBR, MSAVI2, NIRv, OSAVI, PSRI, NDVI
+Found 6 RAW_BANDS in input: blue, green, red, nir, swir1, swir2
+[NOTICE] Candidate indices computed from existing indices and raw bands; PPI column detected in input and will be used.
+Selected 17 indices: DVI, TCB, GVI, NDMI, NBR, MSAVI2, NIRv, OSAVI, PSRI, NDVI, blue, green, red, nir, swir1, swir2, PPI
+Skipping moving variance calculation (SKIP_MOVING_VARIANCE = TRUE)...
+Post-processing rows (baseline subtraction disabled): 10038
+Data preprocessing complete.
+Normalized 2488 rows to canonical Veg 'populus'
+Normalized 2548 rows to canonical Veg 'tamarix'
+Normalized 2249 rows to canonical Veg 'phragmites'
+Filtered to allowed classes (populus,tamarix,phragmites) + barren: kept 8451/10038 rows
+Per-veg quick summary:
+  populus: rows=2488 unique_doys=247 unique_locs=55
+  tamarix: rows=2548 unique_doys=256 unique_locs=52
+  phragmites: rows=2249 unique_doys=232 unique_locs=51
+  barren: rows=1135 unique_doys=210 unique_locs=19
+Non-NA Veg rows: 8420 of 8451 
+Constructed loc_years with 517 rows from filtered df
+Constructing lib from TRAINING dataset...
+[DEBUG] Defining functions...
+[DEBUG] Functions defined successfully.
+===============================================
+
+[TEST] Running simple Stage2 NNLS self-check...
+[TEST] solve_weights_nnls_simple not defined yet; skipping self-check
+[TEST] Stage2 NNLS self-check failed: could not find function "stage2_ols_unmix"
+[DEBUG] About to call build_barren_veg_library...
+[DEBUG] df has 8451 rows, 'no soil' column exists: FALSE
+Warning: Unknown or uninitialised column: `no.soil`.
+Warning: Unknown or uninitialised column: `no.soil`.
+Warning: Unknown or uninitialised column: `no.soil`.
+[Stage1] Mapped 'no soil' -> 'no.soil' inside build_barren_veg_library
+[Stage1] Barren rows: 1135 from Veg=='barren'
+[Stage1] After filtering: barren=1135, veg=998 rows
+[Stage1] Original sample sizes - Barren: 1135, VegPure: 998
+[Stage1] Stage1 balanced sample sizes - Barren: 1996, VegPure: 1996 (target=1996)
+[Stage1] Balanced sample sizes - Barren: 1996, VegPure: 1996 (target=1996)
+[Stage1 Balancing] Rebuilt STAGE1_LIB from balanced stage-1 data
+[Stage1] Building barren-veg library from barren=1996, veg=1996 rows
+[Stage1] Barren-vegetation library built successfully for stage 1 unmixing
+
+=== STAGE 1 LIBRARY CHECK ===
+Barren: mean across indices = -0.0663 (range: [-0.8858, 0.7330])
+Vegetation: mean across indices = 0.2294 (range: [-0.9359, 0.9022])
+
+Per-index separation (ratio-based; dist = ratio - 1):
+  DVI: barren=-0.5225, veg=0.4092, ratio=1.277, dist=0.277
+  TCB: barren=0.7330, veg=-0.9359, ratio=1.277, dist=0.277
+  GVI: barren=-0.6577, veg=0.7016, ratio=1.067, dist=0.067
+    [NOTICE] Index GVI has low relative barren-veg separation (dist=0.067 < 0.1)
+  NDMI: barren=-0.0120, veg=0.0282, ratio=2.345, dist=1.345
+  NBR: barren=-0.8858, veg=0.9022, ratio=1.019, dist=0.019
+    [NOTICE] Index NBR has low relative barren-veg separation (dist=0.019 < 0.1)
+  MSAVI2: barren=-0.5604, veg=0.5457, ratio=1.027, dist=0.027
+    [NOTICE] Index MSAVI2 has low relative barren-veg separation (dist=0.027 < 0.1)
+  NIRv: barren=-0.5070, veg=0.4066, ratio=1.247, dist=0.247
+  OSAVI: barren=-0.4279, veg=0.4853, ratio=1.134, dist=0.134
+  PSRI: barren=0.4624, veg=-0.4862, ratio=1.051, dist=0.051
+    [NOTICE] Index PSRI has low relative barren-veg separation (dist=0.051 < 0.1)
+  NDVI: barren=-0.5317, veg=0.7186, ratio=1.351, dist=0.351
+  blue: barren=0.1621, veg=0.0960, ratio=1.688, dist=0.688
+  green: barren=0.2411, veg=0.1375, ratio=1.754, dist=0.754
+  red: barren=0.2905, veg=0.1602, ratio=1.813, dist=0.813
+  nir: barren=0.3215, veg=0.2484, ratio=1.294, dist=0.294
+  swir1: barren=0.3886, veg=0.2108, ratio=1.843, dist=0.843
+  swir2: barren=0.3781, veg=0.1592, ratio=2.376, dist=1.376
+  PPI: barren=0.0000, veg=0.1134, ratio=8917354.252, dist=8917353.252
+=============================
+
+TESTING_MODE: Capped per-vegetation samples to 5000 (lib_df rows: 8420)
+Applying aggressive sample size balancing to training data...
+Original sample sizes - Min: 2249, Max: 2548, Median: 2488.0
+Final balancing size (2x minimum original sample size): 4498
+Training data balanced: 7285 total samples across 3 vegetation types (exactly equal)
+Skipping per-DOY averaging (will build variants from raw traces)...
+Skipping first (old) training pipeline - using second pipeline instead...
+=== Building raw index library ===
+Raw index features: DVI, TCB, GVI, NDMI, NBR, MSAVI2, NIRv, OSAVI, PSRI, NDVI, blue, green, red, nir, swir1, swir2, PPI
+Raw index library: 17 features from 7285 training samples
+Computing raw index templates per vegetation type...
+  phragmites: T_medoid range [-2.4162, 2.3652], mean=-0.2068 (filled 72/73 pentads)
+  populus: T_medoid range [-2.0076, 3.5869], mean=0.1171 (filled 73/73 pentads)
+  tamarix: T_medoid range [-2.0055, 2.8692], mean=0.0361 (filled 73/73 pentads)
+Raw index library templates computed.
+Building MESMA endmember library...
+Constructing task list from inference dataset (all years)...
+Skipping inference data loading (TESTING_MODE = TRUE).
+[TESTING MODE] Limited to 5 locations (with most observations) for testing: L_87.036181_40.814881, L_88.095016_40.404528, L_88.088003_40.402898, L_88.066309_40.405910, L_88.053729_40.412727
+Processing 5 unique locations (20 location-year pairs total)
+
+=== PRE-FLIGHT CHECK ===
+Test location: L_88.088003_40.402898
+Years available for this location: 2022, 2023, 2024, 2025
+Total rows for this location: 184
+Columns available: location_id, lat, lon, date, doy, Veg, no soil, blue, green, red, nir, swir1, swir2, NBR, NDMI, NDVI, NIRv, DVI, OSAVI, PSRI, TCB, GVI, MSAVI2, pheno_year, zenith.angle, PPI, lon.geo, location_row, location_id_seq, lat.geo, lon.geo.geo, no soil.geo, location_row.geo, location_id_seq.geo
+Var14 columns: 
+======================
+
+
+=== DATA DISTRIBUTION ANALYSIS ===
+Total locations in df_tasks: 214
+Total location-years: 20
+
+Observations per location-year distribution:
+  Min:    1
+  Q1:     7
+  Median: 14
+  Q3:     22
+  Max:    83
+  Mean:   15.8
+
+Location-years with < 1 observations: 0 (0.0%)
+
+DOY coverage per location-year:
+  Median unique DOYs: 14
+  Median DOY span:    272 days
+  Location-years with < 30 unique DOYs: 769 (90.6%)
+Building separated Stage 1 and Stage 2 libraries with Z-score/PCA/LDA weighting...
+[NOTICE] Mapped 'no soil' -> 'no.soil' in df_train for Stage1 processing
+Training Stage 1 feature pipeline (barren vs vegetation)...
+[NOTICE] Using feature set for Stage1 training: DVI, TCB, GVI, NDMI, NBR, MSAVI2, NIRv, OSAVI, PSRI, NDVI, blue, green, red, nir, swir1, swir2, PPI
+[Stage1 Weighted] Stage1 data: 2133 rows with barren=1135, vegetation=998
+
+=== Training Feature Pipeline for Class: stage1_class ===
+  Building trace matrix...
+  Computing Z-score parameters...
+  Computing PCA-LDA weights...
+Warning in train_feature_pipeline(stage1_data, "stage1_class", avail) :
+  PCA->LDA: Reducing n_pcs from 53 to 20 to satisfy p < n_min constraint (smallest class has 47 samples, max_pcs=20)
+LDA weights rescaled to mean=1 (new max=7.5199)
+[NOTICE] STAGE1_PARAMS weights (unnormalized): mean=1.000000, max=7.519893
+[WEIGHTS STAGE1] Per-index mean weights (top 8):
+  swir2: mean=1.1222, max=3.5169
+  DVI: mean=1.0808, max=4.7745
+  PPI: mean=1.0505, max=7.5199
+  nir: mean=1.0468, max=3.9868
+  MSAVI2: mean=1.0448, max=4.4880
+  swir1: mean=1.0360, max=3.1122
+  NIRv: mean=1.0316, max=4.8692
+  GVI: mean=1.0260, max=3.9385
+[WEIGHTS STAGE1] Full per-index means: DVI=1.0808, TCB=1.0230, GVI=1.0260, NDMI=0.8712, NBR=0.9924, MSAVI2=1.0448, NIRv=1.0316, OSAVI=1.0030, PSRI=0.8501, NDVI=0.9679, blue=0.8586, green=0.9831, red=1.0120, nir=1.0468, swir1=1.0360, swir2=1.1222, PPI=1.0505
+Training Stage 2 feature pipeline (vegetation types)...
+[NOTICE] Using feature set for Stage2 training: DVI, TCB, GVI, NDMI, NBR, MSAVI2, NIRv, OSAVI, PSRI, NDVI, blue, green, red, nir, swir1, swir2, PPI
+
+=== Training Feature Pipeline for Class: Veg ===
+  Building trace matrix...
+  Computing Z-score parameters...
+  Computing PCA-LDA weights...
+Warning in train_feature_pipeline(stage2_data, "Veg", avail) :
+  PCA->LDA: Reducing n_pcs from 99 to 20 to satisfy p < n_min constraint (smallest class has 98 samples, max_pcs=20)
+LDA weights rescaled to mean=1 (new max=5.7393)
+[NOTICE] STAGE2_PARAMS weights (unnormalized): mean=1.000000, max=5.739279
+[WEIGHTS STAGE2] Per-index mean weights (top 8):
+  swir2: mean=1.4842, max=5.1886
+  swir1: mean=1.4213, max=5.4997
+  NBR: mean=1.3050, max=3.2351
+  TCB: mean=1.1943, max=5.0039
+  DVI: mean=1.1708, max=4.4217
+  MSAVI2: mean=1.1640, max=4.2806
+  NIRv: mean=1.1549, max=3.7235
+  OSAVI: mean=1.1257, max=3.9214
+[WEIGHTS STAGE2] Full per-index means: DVI=1.1708, TCB=1.1943, GVI=0.8419, NDMI=0.1929, NBR=1.3050, MSAVI2=1.1640, NIRv=1.1549, OSAVI=1.1257, PSRI=0.5763, NDVI=1.0826, blue=0.7992, green=0.9215, red=1.0015, nir=1.1071, swir1=1.4213, swir2=1.4842, PPI=0.4569
+Building weighted Stage 1 library...
+[DIAGNOSTIC] BEFORE weighting (using mean veg) - Cosine similarity: -0.6152, Euclidean distance: 10.7558
+[DIAGNOSTIC] Weight statistics: min=0.000773, max=7.519893, mean=1.000000, sd=0.901950
+[DIAGNOSTIC] Number of weights: 1241, Expected: 1241
+[DIAGNOSTIC] Clipped 2 weights at threshold=6.000 (old_max=7.520 -> new_max=6.000), re-normalized to mean=0.998718
+[DIAGNOSTIC] AFTER weighting (using mean veg) - Cosine similarity: -0.6470, Euclidean distance: 16.1038
+[WARNING] Stage 1 weighting reduced cosine similarity from -0.6152 -> -0.6470 (105.2%). Consider inspecting weights or disabling Stage1 weighting for diagnostics.
+[DIAGNOSTIC] Barren mean before weighting: -0.004489, after weighting: -0.000570
+[DIAGNOSTIC] Veg mean before weighting: 0.000840, after weighting: 0.018099
+[build_weighted_stage1_lib] Barren samples: 54 traces, Vegetation samples: 78 traces
+Building weighted Stage 2 libraries...
+Pre-computing optimized weighted library for vectorized similarity search...
+[DEBUG] Optimized library built: veg_count=3 variants_per_veg_sample=10,10,10
+[NOTICE] Feature counts: avail=17, STAGE1_params_indices=17, STAGE2_params_indices=17
+
+=== SAVING MESMA MODEL CACHE ===
+Model cache saved to: phenology_results/veg_mixture_fit/mesma_cache
+Total cache size: 0.28 MB
+Model cache saved after training pipeline.
+Starting main processing loop...
+
+=== Starting MESMA processing ===
+Training dataset location-years: 635
+Inference dataset location-years: 849
+Preparing locations for batched processing (multi-year bootstrap)...
+Processing 5 locations in 1 batches (approx 50 locations/batch)...
+[AGENT_DEBUG] fit_one_task loc=L_87.036181_40.814881 yr=2022, veg_frac=0.0000, barren_frac=1.0000
+[DEBUG Stage1 DIAG] loc=L_87.036181_40.814881 year=2022 cos_sim=NA euc_dist=NA veg_frac=0.0000 barren_frac=1.0000
+[AGENT_DEBUG] fit_one_task loc=L_87.036181_40.814881 yr=2023, veg_frac=0.0000, barren_frac=1.0000
+[DEBUG Stage1 DIAG] loc=L_87.036181_40.814881 year=2023 cos_sim=NA euc_dist=NA veg_frac=0.0000 barren_frac=1.0000
+[AGENT_DEBUG] fit_one_task loc=L_87.036181_40.814881 yr=2024, veg_frac=0.0698, barren_frac=0.9302
+[DEBUG Stage1 DIAG] loc=L_87.036181_40.814881 year=2024 cos_sim=NA euc_dist=NA veg_frac=0.0698 barren_frac=0.9302
+[DEBUG fit_one_task] loc=L_87.036181_40.814881 yr=2024: insufficient Stage2 signal (norm=0), returning Stage1-only result
+[AGENT_DEBUG] fit_one_task loc=L_87.036181_40.814881 yr=2025, veg_frac=0.0000, barren_frac=1.0000
+[DEBUG Stage1 DIAG] loc=L_87.036181_40.814881 year=2025 cos_sim=NA euc_dist=NA veg_frac=0.0000 barren_frac=1.0000
+[AGENT_DEBUG] fit_one_task loc=L_88.053729_40.412727 yr=2022, veg_frac=0.6130, barren_frac=0.3870
+[DEBUG Stage1 DIAG] loc=L_88.053729_40.412727 year=2022 cos_sim=NA euc_dist=NA veg_frac=0.6130 barren_frac=0.3870
+[DEBUG fit_one_task] loc=L_88.053729_40.412727 yr=2022: insufficient Stage2 signal (norm=0), returning Stage1-only result
+[AGENT_DEBUG] fit_one_task loc=L_88.053729_40.412727 yr=2023, veg_frac=0.1069, barren_frac=0.8931
+[DEBUG Stage1 DIAG] loc=L_88.053729_40.412727 year=2023 cos_sim=NA euc_dist=NA veg_frac=0.1069 barren_frac=0.8931
+[DEBUG fit_one_task] loc=L_88.053729_40.412727 yr=2023: insufficient Stage2 signal (norm=0), returning Stage1-only result
+[AGENT_DEBUG] fit_one_task loc=L_88.053729_40.412727 yr=2024, veg_frac=0.2078, barren_frac=0.7922
+[DEBUG Stage1 DIAG] loc=L_88.053729_40.412727 year=2024 cos_sim=NA euc_dist=NA veg_frac=0.2078 barren_frac=0.7922
+[DEBUG fit_one_task] loc=L_88.053729_40.412727 yr=2024: insufficient Stage2 signal (norm=0), returning Stage1-only result
+[AGENT_DEBUG] fit_one_task loc=L_88.053729_40.412727 yr=2025, veg_frac=0.0612, barren_frac=0.9388
+[DEBUG Stage1 DIAG] loc=L_88.053729_40.412727 year=2025 cos_sim=NA euc_dist=NA veg_frac=0.0612 barren_frac=0.9388
+[DEBUG fit_one_task] loc=L_88.053729_40.412727 yr=2025: insufficient Stage2 signal (norm=0), returning Stage1-only result
+[AGENT_DEBUG] fit_one_task loc=L_88.066309_40.405910 yr=2022, veg_frac=0.0000, barren_frac=1.0000
+[DEBUG Stage1 DIAG] loc=L_88.066309_40.405910 year=2022 cos_sim=NA euc_dist=NA veg_frac=0.0000 barren_frac=1.0000
+[AGENT_DEBUG] fit_one_task loc=L_88.066309_40.405910 yr=2023, veg_frac=0.0000, barren_frac=1.0000
+[DEBUG Stage1 DIAG] loc=L_88.066309_40.405910 year=2023 cos_sim=NA euc_dist=NA veg_frac=0.0000 barren_frac=1.0000
+[AGENT_DEBUG] fit_one_task loc=L_88.066309_40.405910 yr=2024, veg_frac=0.0432, barren_frac=0.9568
+[DEBUG Stage1 DIAG] loc=L_88.066309_40.405910 year=2024 cos_sim=NA euc_dist=NA veg_frac=0.0432 barren_frac=0.9568
+[DEBUG fit_one_task] loc=L_88.066309_40.405910 yr=2024: insufficient Stage2 signal (norm=0), returning Stage1-only result
+[AGENT_DEBUG] fit_one_task loc=L_88.066309_40.405910 yr=2025, veg_frac=0.0078, barren_frac=0.9922
+[DEBUG Stage1 DIAG] loc=L_88.066309_40.405910 year=2025 cos_sim=NA euc_dist=NA veg_frac=0.0078 barren_frac=0.9922
+[AGENT_DEBUG] fit_one_task loc=L_88.088003_40.402898 yr=2022, veg_frac=0.6413, barren_frac=0.3587
+[DEBUG Stage1 DIAG] loc=L_88.088003_40.402898 year=2022 cos_sim=NA euc_dist=NA veg_frac=0.6413 barren_frac=0.3587
+[DEBUG fit_one_task] loc=L_88.088003_40.402898 yr=2022: insufficient Stage2 signal (norm=0), returning Stage1-only result
+[AGENT_DEBUG] fit_one_task loc=L_88.088003_40.402898 yr=2023, veg_frac=0.6122, barren_frac=0.3878
+[DEBUG Stage1 DIAG] loc=L_88.088003_40.402898 year=2023 cos_sim=NA euc_dist=NA veg_frac=0.6122 barren_frac=0.3878
+[DEBUG fit_one_task] loc=L_88.088003_40.402898 yr=2023: insufficient Stage2 signal (norm=0), returning Stage1-only result
+[AGENT_DEBUG] fit_one_task loc=L_88.088003_40.402898 yr=2024, veg_frac=0.1808, barren_frac=0.8192
+[DEBUG Stage1 DIAG] loc=L_88.088003_40.402898 year=2024 cos_sim=NA euc_dist=NA veg_frac=0.1808 barren_frac=0.8192
+[DEBUG fit_one_task] loc=L_88.088003_40.402898 yr=2024: insufficient Stage2 signal (norm=0), returning Stage1-only result
+[AGENT_DEBUG] fit_one_task loc=L_88.088003_40.402898 yr=2025, veg_frac=1.0000, barren_frac=0.0000
+[DEBUG Stage1 DIAG] loc=L_88.088003_40.402898 year=2025 cos_sim=NA euc_dist=NA veg_frac=1.0000 barren_frac=0.0000
+[DEBUG fit_one_task] loc=L_88.088003_40.402898 yr=2025: insufficient Stage2 signal (norm=0), returning Stage1-only result
+[WARN] loc=L_88.095016_40.404528 pheno_year=2022: low valid observations (51 < 62) - proceeding anyway
+[AGENT_DEBUG] fit_one_task loc=L_88.095016_40.404528 yr=2022, veg_frac=0.4394, barren_frac=0.5606
+[DEBUG Stage1 DIAG] loc=L_88.095016_40.404528 year=2022 cos_sim=NA euc_dist=NA veg_frac=0.4394 barren_frac=0.5606
+[DEBUG fit_one_task] loc=L_88.095016_40.404528 yr=2022: insufficient Stage2 signal (norm=0), returning Stage1-only result
+[AGENT_DEBUG] fit_one_task loc=L_88.095016_40.404528 yr=2023, veg_frac=0.0000, barren_frac=1.0000
+[DEBUG Stage1 DIAG] loc=L_88.095016_40.404528 year=2023 cos_sim=NA euc_dist=NA veg_frac=0.0000 barren_frac=1.0000
+[AGENT_DEBUG] fit_one_task loc=L_88.095016_40.404528 yr=2024, veg_frac=0.2020, barren_frac=0.7980
+[DEBUG Stage1 DIAG] loc=L_88.095016_40.404528 year=2024 cos_sim=NA euc_dist=NA veg_frac=0.2020 barren_frac=0.7980
+[DEBUG fit_one_task] loc=L_88.095016_40.404528 yr=2024: insufficient Stage2 signal (norm=0), returning Stage1-only result
+[AGENT_DEBUG] fit_one_task loc=L_88.095016_40.404528 yr=2025, veg_frac=0.0327, barren_frac=0.9673
+[DEBUG Stage1 DIAG] loc=L_88.095016_40.404528 year=2025 cos_sim=NA euc_dist=NA veg_frac=0.0327 barren_frac=0.9673
+[DEBUG fit_one_task] loc=L_88.095016_40.404528 yr=2025: insufficient Stage2 signal (norm=0), returning Stage1-only result
+[DEBUG batch_result] location L_87.036181_40.814881 returned 4 year(s)
+  Year 2022: veg_frac=0.0000 barren_frac=1.0000 coef_rows=1 has_uncertainty=FALSE
+  Year 2023: veg_frac=0.0000 barren_frac=1.0000 coef_rows=1 has_uncertainty=FALSE
+  Year 2024: veg_frac=0.0698 barren_frac=0.9302 coef_rows=2 has_uncertainty=FALSE
+  Year 2025: veg_frac=0.0000 barren_frac=1.0000 coef_rows=1 has_uncertainty=FALSE
+[DEBUG batch_result] location L_88.053729_40.412727 returned 4 year(s)
+  Year 2022: veg_frac=0.6130 barren_frac=0.3870 coef_rows=2 has_uncertainty=FALSE
+  Year 2023: veg_frac=0.1069 barren_frac=0.8931 coef_rows=2 has_uncertainty=FALSE
+  Year 2024: veg_frac=0.2078 barren_frac=0.7922 coef_rows=2 has_uncertainty=FALSE
+  Year 2025: veg_frac=0.0612 barren_frac=0.9388 coef_rows=2 has_uncertainty=FALSE
+[DEBUG batch_result] location L_88.066309_40.405910 returned 4 year(s)
+  Year 2022: veg_frac=0.0000 barren_frac=1.0000 coef_rows=1 has_uncertainty=FALSE
+  Year 2023: veg_frac=0.0000 barren_frac=1.0000 coef_rows=1 has_uncertainty=FALSE
+  Year 2024: veg_frac=0.0432 barren_frac=0.9568 coef_rows=2 has_uncertainty=FALSE
+  Year 2025: veg_frac=0.0000 barren_frac=1.0000 coef_rows=1 has_uncertainty=FALSE
+[DEBUG batch_result] location L_88.088003_40.402898 returned 4 year(s)
+  Year 2022: veg_frac=0.6413 barren_frac=0.3587 coef_rows=2 has_uncertainty=FALSE
+  Year 2023: veg_frac=0.6122 barren_frac=0.3878 coef_rows=2 has_uncertainty=FALSE
+  Year 2024: veg_frac=0.1808 barren_frac=0.8192 coef_rows=2 has_uncertainty=FALSE
+  Year 2025: veg_frac=1.0000 barren_frac=0.0000 coef_rows=2 has_uncertainty=FALSE
+[DEBUG batch_result] location L_88.095016_40.404528 returned 4 year(s)
+  Year 2022: veg_frac=0.4394 barren_frac=0.5606 coef_rows=2 has_uncertainty=FALSE
+  Year 2023: veg_frac=0.0000 barren_frac=1.0000 coef_rows=1 has_uncertainty=FALSE
+  Year 2024: veg_frac=0.2020 barren_frac=0.7980 coef_rows=2 has_uncertainty=FALSE
+  Year 2025: veg_frac=0.0327 barren_frac=0.9673 coef_rows=2 has_uncertainty=FALSE
+Main processing loop finished in 10.85 seconds (0.18 minutes)
+Flattening location-based results into year-based results...
+Flattened 5 location results into 20 year results
+Average time per year-result: 0.54 seconds
+[TESTING MODE] Skipping inference processing for faster testing
+Processing results and writing to Excel files...
+After filtering NULL results: 20 results remaining
+Barren fraction = 1 in 35.0% of predictions (7/20) - within acceptable limits
+Combining coefficient data frames...
+Combined coefficients: 33 rows
+Combining chosen variant summaries...
+[DEBUG] all_coefs$location_id class: character
+[DEBUG] all_coefs$location_id sample: L_88.088003_40.402898, L_88.088003_40.402898, L_88.088003_40.402898, L_88.088003_40.402898, L_88.088003_40.402898, L_88.088003_40.402898, L_88.088003_40.402898, L_88.088003_40.402898, L_88.053729_40.412727, L_88.053729_40.412727
+[DEBUG] all_coefs$location_id is.na sum: 0
+[DEBUG] all_coefs$location_id == '' sum: 0
+Creating Excel file with 5 valid locations
+[NOTICE] Running separate (silent) inference on 8804 training-location rows (years 2023 & 2025)...
+
+=== Training-locations inference accuracy (silent run) ===
+Year 2023: overall accuracy = 8.4% (18/214)
+Year 2025: overall accuracy = 8.4% (18/214)
+Per-vegetation accuracy summary (training locations):
+# A tibble: 24 × 5
+   pheno_year true_veg          n correct accuracy
+        <int> <chr>         <int>   <int>    <dbl>
+ 1       2023 agri             21       0        0
+ 2       2023 alhagi            1       0        0
+ 3       2023 barren           18      18      100
+ 4       2023 halocnemum        5       0        0
+ 5       2023 phragmites       50       0        0
+ 6       2023 populus          49       0        0
+ 7       2023 populus_herbs     5       0        0
+ 8       2023 salicornia        2       0        0
+ 9       2023 tamarix          44       0        0
+10       2023 tamarix_herbs     7       0        0
+# ℹ 14 more rows
+Saved training-locations inference accuracy summary to: phenology_results/veg_mixture_fit/training_locations_inference_accuracy.csv
+Creating single Excel file with all location results...
+Saving workbook to: phenology_results/veg_mixture_fit/mesma_results.xlsx
+Created Excel file 'mesma_results.xlsx' with 5 location sheets
+No inference results to process.
+
+Generating average coverage plot...
+
+========================================
+FATAL ERROR: Unknown method. Use 'location_bootstrap' or 'hierarchical'.
+========================================
+
+Stack trace:
+
+Diagnostic frames dumped to 'mesma_error_dump.rda'
+To inspect: load('mesma_error_dump.rda'); debugger(mesma_error_dump)
+
+Script terminated due to error.
+
+========================================
+[SCRIPT FAILED] Check error messages above
+========================================
+[CLEANUP] Finalizing outputs and freeing temporary memory...
+[CLEANUP] Removing 10 objects to free memory...
+[CLEANUP] Memory freed (gc called).
+
+=== Script execution finished ===

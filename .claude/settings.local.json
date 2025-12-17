@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Rscript:*)",
+      "Bash(awk:*)",
+      "Bash(python3:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(tee:*)",
+      "Bash(head:*)",
+      "Bash(grep:*)",
+      "Bash(git log:*)",
+      "Bash(wc:*)"
+    ]
+  }
+}

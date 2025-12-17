@@ -123,76 +123,35 @@ if (!is.null(gpts_raw)) {
   tryCatch({
     gpts_wgs84 <- sf::st_transform(gpts_raw, 4326)
     coords_wgs84 <- sf::st_coordinates(gpts_wgs84)
-    mean_lat_study_area <- mean(coords_wgs84[, 2], na.rm = TRUE)
   }, error = function(e) {
     cat("Warning: Could not calculate mean latitude from GeoJSON:", e$message, "\n")
   })
 }
 
-# Process GeoJSON to get Veg mapping
-if (!is.null(gpts_raw)) {
-    geojson_names <- names(gpts_raw)
-    normalized_names <- gsub("[^a-z0-9]+", "_", tolower(geojson_names))
-    no_soil_col <- geojson_names[normalized_names == "no_soil"]
-    if (length(no_soil_col) > 0) {
-        no_soil_raw <- gpts_raw[[no_soil_col[1]]]
-        no_soil_vals <- safe_as_numeric(no_soil_raw)
-        gpts_raw$`.__no soil__` <- no_soil_vals
+# Load vegetation mapping from CSV instead of GeoJSON
+MAPPING_CSV <- "C:/Users/yolan/Downloads/landsat_timeseries_vegetation_filtered (4).csv"
+if (file.exists(MAPPING_CSV)) {
+    cat("Loading vegetation mapping from:", MAPPING_CSV, "\n")
+    map_df <- readr::read_csv(MAPPING_CSV, show_col_types = FALSE)
+    veg_cols <- names(map_df)[tolower(names(map_df)) %in% c("vegetation", "veg", "class")]
+    if (length(veg_cols) > 0) map_df$Veg <- as.character(map_df[[veg_cols[1]]])
+    map_df <- normalize_no_soil_col(map_df)
+
+    if (!"location_id" %in% names(map_df) && all(c("lon", "lat") %in% names(map_df))) {
+      map_df$location_id <- make_location_id(map_df$lon, map_df$lat)
     }
 
-    matched_cols <- names(gpts_raw)[tolower(names(gpts_raw)) %in% c("vegetation", "veg", "class")]
-    if (length(matched_cols) > 0) {
-      veg_col_orig <- matched_cols[1]
-      gpts_raw$.__veg__ <- as.character(gpts_raw[[veg_col_orig]])
+    if ("location_id" %in% names(map_df)) {
+      if ("no.soil" %in% names(map_df) && !"no soil" %in% names(map_df)) map_df$`no soil` <- map_df$`no.soil`
+      if (!"Veg" %in% names(map_df)) map_df$Veg <- NA_character_
+      cat("Mapping CSV will NOT be joined into the main observations data; it will only be used for barren/no-soil summaries and soil DVI estimation.\n")
+      cat("DEBUG: Unique Veg types in mapping CSV:\n")
+      print(table(map_df$Veg, useNA = "ifany"))
     } else {
-      gpts_raw$.__veg__ <- NA_character_
+      cat("Warning: mapping CSV lacks 'location_id' and 'lon'/'lat'; cannot use location-level mapping.\n")
     }
-    
-    gpts_wgs84 <- sf::st_transform(gpts_raw, 4326)
-    coords_wgs84 <- sf::st_coordinates(gpts_wgs84)
-    gpts_raw$.__lon__ <- coords_wgs84[, 1]
-    gpts_raw$.__lat__ <- coords_wgs84[, 2]
-    gpts_raw$location_id_geo <- make_location_id(gpts_raw$.__lon__, gpts_raw$.__lat__)
-    gpts_raw$location_id <- as.character(seq_len(nrow(gpts_raw)))
-    
-    gdf <- sf::st_drop_geometry(gpts_raw)
-    
-    # Determine mapping strategy
-    use_seq_id <- FALSE
-    if (exists("df") && "location_id" %in% names(df)) {
-        sample_id <- as.character(df$location_id[1])
-        if (!grepl("^L_", sample_id)) {
-            use_seq_id <- TRUE
-        }
-    }
-    
-    if (use_seq_id) {
-        gpts_map <- gdf %>%
-        dplyr::select(location_id, Veg = .__veg__, `no soil` = `.__no soil__`) %>%
-        dplyr::mutate(location_row = as.character(seq_len(dplyr::n()))) %>%
-        dplyr::distinct(location_id, .keep_all = TRUE)
-    } else {
-        gpts_map <- gdf %>%
-        dplyr::select(location_id = location_id_geo, Veg = .__veg__, `no soil` = `.__no soil__`) %>%
-        dplyr::mutate(location_row = as.character(seq_len(dplyr::n()))) %>%
-        dplyr::distinct(location_id, .keep_all = TRUE)
-    }
-    
-    # Join
-    if ("location_id" %in% names(df)) df$location_id <- as.character(df$location_id)
-    if ("location_id" %in% names(gpts_map)) gpts_map$location_id <- as.character(gpts_map$location_id)
-    
-    df <- dplyr::left_join(df, gpts_map, by = "location_id", suffix = c("", ".geo"))
-    
-    if ("Veg.geo" %in% names(df)) {
-      if (!"Veg" %in% names(df)) df$Veg <- NA_character_
-      df$Veg <- ifelse(is.na(df$Veg) | df$Veg == "", df$Veg.geo, df$Veg)
-      df$Veg.geo <- NULL
-    }
-    df <- normalize_no_soil_col(df)
-    if ("Veg" %in% names(df)) {
-      df$Veg <- tolower(df$Veg)
-    }
+} else {
+    cat("Mapping CSV not found at:", MAPPING_CSV, "- proceeding without Veg/no-soil mapping.\n")
 }
 
 # --- PPI Calculation ---
@@ -209,11 +168,8 @@ if (!"DVI" %in% names(df) && all(c("nir", "red") %in% names(df))) {
 }
 
 # Calculate DVI_max per location
-if ("DVI" %in% names(df)) {
-  df <- df %>%
-    group_by(location_id) %>%
-    mutate(DVI_max = max(DVI, na.rm = TRUE)) %>%
-    ungroup()
+  if ("DVI" %in% names(df)) {
+  df <- df |> dplyr::group_by(location_id) |> dplyr::mutate(DVI_max = max(DVI, na.rm = TRUE)) |> dplyr::ungroup()
   df$DVI_max[!is.finite(df$DVI_max)] <- NA_real_
 }
 
@@ -228,16 +184,13 @@ if (any(zenith_candidates %in% names(df))) {
   elev_col <- elev_candidates[elev_candidates %in% names(df)][1]
   df$zenith.angle <- (90 - df[[elev_col]]) * pi / 180
 } else {
-    # Fallback calculation
-    use_lat <- NULL
-    if ("lat" %in% names(df) && !all(is.na(df$lat))) {
-      use_lat <- df$lat
-    } else if (exists("mean_lat_study_area")) {
-      use_lat <- rep(mean_lat_study_area, nrow(df))
-    }
-    
-    if (!is.null(use_lat)) {
-        df$zenith.angle <- calculate_solar_zenith(use_lat, df$doy)
+    # Use per-row latitude when available; otherwise leave zenith angle NA
+    if ("lat" %in% names(df) && any(is.finite(df$lat))) {
+      use_lat <- as.numeric(df$lat)
+      df$zenith.angle <- calculate_solar_zenith(use_lat, df$doy)
+    } else {
+      cat("No per-row latitude available; leaving 'zenith.angle' as NA. PPI will not be computed without SZA.\n")
+      df$zenith.angle <- NA_real_
     }
 }
 
@@ -251,7 +204,9 @@ df$PPI <- NA_real_
 if ("DVI" %in% names(df) && "zenith.angle" %in% names(df) && "DVI_max" %in% names(df)) {
     complete_idx <- complete.cases(df$DVI, df$zenith.angle, df$DVI_max)
     if (any(complete_idx)) {
-        df$PPI[complete_idx] <- ppi(df$DVI[complete_idx], df$zenith.angle[complete_idx], M = df$DVI_max[complete_idx] + 0.005)
+        dsoil <- if (exists("PPI_DVI_SOIL", envir = .GlobalEnv)) get("PPI_DVI_SOIL", envir = .GlobalEnv) else 0.09
+        # Use fixed M=0.7 per standardized PPI implementation
+        df$PPI[complete_idx] <- ppi(df$DVI[complete_idx], df$zenith.angle[complete_idx], M = 0.7, dvi.soil = dsoil)
     }
 }
 
@@ -263,19 +218,19 @@ cat("Aggregating data...\n")
 # And filter for specific vegetation types: barren, phragmites, populus, tamarix
 target_veg <- c("barren", "phragmites", "populus", "tamarix")
 
-plot_data <- df %>%
-  filter(!is.na(PPI), !is.na(Veg)) %>%
-  filter(Veg %in% target_veg) %>%
-  mutate(year = year(date),
+plot_data <- df |> 
+  dplyr::filter(!is.na(PPI), !is.na(Veg)) |> 
+  dplyr::filter(Veg %in% target_veg) |> 
+  dplyr::mutate(year = year(date),
          doy = yday(date))
 
 # Calculate average PPI per Veg type and Date
-ppi_summary <- plot_data %>%
-  group_by(Veg, date) %>%
-  summarize(
+ppi_summary <- plot_data |> 
+  dplyr::group_by(Veg, date) |> 
+  dplyr::summarize(
     mean_PPI = mean(PPI, na.rm = TRUE),
     sd_PPI = sd(PPI, na.rm = TRUE),
-    n = n(),
+    n = dplyr::n(),
     se_PPI = sd_PPI / sqrt(n),
     .groups = "drop"
   )

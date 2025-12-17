@@ -56,7 +56,7 @@ if(!("Veg" %in% names(df)) || all(is.na(df$Veg))) {
       pp$lon_round <- round(coords[,1], 4)
       pp$lat_round <- round(coords[,2], 4)
       if(!("location_id" %in% names(df))) {
-        df <- df %>% dplyr::mutate(location_id = paste0(round(target_lat,4), "_", round(target_lon,4)))
+        df <- df |> dplyr::mutate(location_id = paste0(round(target_lat,4), "_", round(target_lon,4)))
       }
       if(all(c("target_lon","target_lat") %in% names(df))) {
         df$lon_round <- round(df$target_lon, 4)
@@ -65,7 +65,7 @@ if(!("Veg" %in% names(df)) || all(is.na(df$Veg))) {
         j <- dplyr::left_join(df, as.data.frame(pp)[, keep, drop = FALSE], by = c("lat_round","lon_round"))
         if(!("Veg" %in% names(df)) && ("Veg" %in% names(j))) df$Veg <- j$Veg
         if(!("coverage" %in% names(df)) && ("coverage" %in% names(j))) df$coverage <- j$coverage
-        df <- df %>% dplyr::select(-dplyr::any_of(c("lat_round","lon_round")))
+        df <- df |> dplyr::select(-dplyr::any_of(c("lat_round","lon_round")))
         cat("Attached Veg/coverage from GeoJSON (rounded coord join).\n")
       }
     }
@@ -128,18 +128,18 @@ params <- get_msavi_params(df)
 MSAVI_SOIL <- params$soil; MSAVI_VEG <- params$veg
 cat(sprintf("Using MSAVI_SOIL=%.3f, MSAVI_VEG=%.3f (visualize)\n", MSAVI_SOIL, MSAVI_VEG))
 if("MSAVI" %in% names(df) && "date" %in% names(df)) {
-  df <- df %>% dplyr::mutate(.tmp_year = assign_pheno_year(date))
-  fvc_by <- df %>% dplyr::group_by(location_id, .tmp_year) %>% dplyr::summarise(ms_peak = suppressWarnings(max(MSAVI, na.rm = TRUE)), .groups='drop') %>%
+  df <- df |> dplyr::mutate(.tmp_year = assign_pheno_year(date))
+  fvc_by <- df |> dplyr::group_by(location_id, .tmp_year) |> dplyr::summarise(ms_peak = suppressWarnings(max(MSAVI, na.rm = TRUE)), .groups='drop') |> 
     dplyr::mutate(FVC_est = {denom <- (MSAVI_VEG - MSAVI_SOIL); ifelse(is.finite(ms_peak) & denom > 1e-6, pmax(0, pmin(1, ((ms_peak - MSAVI_SOIL)/denom)^2)), NA_real_)})
-  df <- df %>% dplyr::left_join(fvc_by, by = c("location_id",".tmp_year"))
+  df <- df |> dplyr::left_join(fvc_by, by = c("location_id",".tmp_year"))
   # Avoid duplicate year column: rename only if 'year' not already present
-  if("year" %in% names(df)) {
-    df <- df %>% dplyr::select(-.tmp_year)
+    if("year" %in% names(df)) {
+    df <- df |> dplyr::select(-.tmp_year)
   } else {
-    df <- df %>% dplyr::rename(year = .tmp_year)
+    df <- df |> dplyr::rename(year = .tmp_year)
   }
 } else {
-  if(!"year" %in% names(df) && "date" %in% names(df)) df <- df %>% dplyr::mutate(year = lubridate::year(date))
+  if(!"year" %in% names(df) && "date" %in% names(df)) df <- df |> dplyr::mutate(year = lubridate::year(date))
   df$FVC_est <- NA_real_
 }
 
@@ -179,9 +179,9 @@ flag_time_outliers <- function(vec, doy, k=7) {
 DO_GAMM_SMOOTH <- TRUE
 
 plot_location_years <- function(data, loc_id, idx_col, out_dir = PLOTS_DIR) {
-  d <- data %>% dplyr::filter(.data$location_id == loc_id)
+  d <- data |> dplyr::filter(.data$location_id == loc_id)
   if(nrow(d) < 5) return(NULL)
-  d <- d %>% dplyr::mutate(year = year(date))
+  d <- d |> dplyr::mutate(year = year(date))
   # Determine vegetation label for this location (most frequent Veg if available)
   veg_lab <- NA_character_
   if("Veg" %in% names(d) && any(!is.na(d$Veg))) {
@@ -191,7 +191,7 @@ plot_location_years <- function(data, loc_id, idx_col, out_dir = PLOTS_DIR) {
   # Outliers by time window
   d$outlier_time <- flag_time_outliers(d[[idx_col]], yday(d$date), k=10)
   # Create a non-outlier subset for connecting lines so lines are not drawn across outlier points
-  d_nonout <- d %>% dplyr::filter(!.data$outlier_time)
+  d_nonout <- d |> dplyr::filter(!.data$outlier_time)
   title_txt <- paste0("Time Series at ", loc_id,
                       if(!is.na(veg_lab) && nzchar(veg_lab)) paste0(" — Veg: ", veg_lab) else "",
                       " (", idx_col, ")")
@@ -205,7 +205,7 @@ plot_location_years <- function(data, loc_id, idx_col, out_dir = PLOTS_DIR) {
     ggplot2::labs(title = title_txt, x = "Day of Year", y = idx_col, color = "Year", shape = "Time Outlier")
 
   if(DO_GAMM_SMOOTH) {
-  sub <- d %>% dplyr::mutate(doy = yday(date)) %>% dplyr::filter(is.finite(.data[[idx_col]]) & !.data$outlier_time)
+  sub <- d |> dplyr::mutate(doy = yday(date)) |> dplyr::filter(is.finite(.data[[idx_col]]) & !.data$outlier_time)
     if(nrow(sub) >= 10) {
       # Cyclic smooth over DOY; provide knots for periodicity
       try({
@@ -215,7 +215,7 @@ plot_location_years <- function(data, loc_id, idx_col, out_dir = PLOTS_DIR) {
         dat <- sub
   if("FVC_est" %in% names(dat) && is.finite(mean(dat$FVC_est, na.rm = TRUE)) && "MSAVI" %in% names(df) && "Veg" %in% names(df)) {
           # crude barren seasonal: fit a GCV GAM on all rows labelled barren/bare (visual-only approximation)
-          barr <- df %>% dplyr::filter(grepl("barr|bare", tolower(.data$Veg))) %>% dplyr::mutate(doy = yday(date))
+          barr <- df |> dplyr::filter(grepl("barr|bare", tolower(.data$Veg))) |> dplyr::mutate(doy = yday(date))
           if(nrow(barr) >= 10 && idx_col %in% names(barr)) {
             g_barr <- try(mgcv::gam(stats::as.formula(paste0(idx_col, " ~ s(doy, bs='cc', k=20)")), data = barr, method = "REML"), silent = TRUE)
             if(!inherits(g_barr, "try-error")) {
@@ -248,8 +248,8 @@ plot_location_years <- function(data, loc_id, idx_col, out_dir = PLOTS_DIR) {
 }
 
 # Prepare location ids
-if(!("location_id" %in% names(df))) {
-  df <- df %>% dplyr::mutate(location_id = paste0(round(target_lat,4), "_", round(target_lon,4)))
+  if(!("location_id" %in% names(df))) {
+  df <- df |> dplyr::mutate(location_id = paste0(round(target_lat,4), "_", round(target_lon,4)))
 }
 
 # Explicitly set vegetation column to 'Veg'
@@ -259,39 +259,39 @@ VEG_COL <- "Veg"
 ## Plot multiple locations per vegetation type, multiple years on DOY x-axis
 plot_vegtype_multiloc <- function(data, veg_val, idx_col, out_dir = PLOTS_DIR) {
   if(is.null(VEG_COL) || !(VEG_COL %in% names(data))) return(NULL)
-  d <- data %>%
+  d <- data |>
     dplyr::filter(.data[[VEG_COL]] == veg_val, is.finite(.data[[idx_col]]))
   if(nrow(d) < 10) return(NULL)
 
   # Keep top N locations by observation count for readability
-  top_locs <- d %>%
-    dplyr::count(.data$location_id, sort = TRUE) %>%
-    utils::head(MAX_LOC_PER_VEGTYPE) %>%
+  top_locs <- d |>
+    dplyr::count(.data$location_id, sort = TRUE) |>
+    utils::head(MAX_LOC_PER_VEGTYPE) |>
     dplyr::pull(.data$location_id)
 
-  d <- d %>% dplyr::filter(.data$location_id %in% top_locs) %>% dplyr::arrange(date)
+  d <- d |> dplyr::filter(.data$location_id %in% top_locs) |> dplyr::arrange(date)
   if(dplyr::n_distinct(d$location_id) < 2) return(NULL)
 
   # Ensure year column exists
-  if(!"year" %in% names(d)) d <- d %>% dplyr::mutate(year = lubridate::year(date))
+  if(!"year" %in% names(d)) d <- d |> dplyr::mutate(year = lubridate::year(date))
 
   # Per-location outlier detection (same logic as per-location plots)
-  d <- d %>% dplyr::group_by(.data$location_id) %>%
-    dplyr::mutate(outlier_time = flag_time_outliers(.data[[idx_col]], yday(date), k = 10)) %>%
+  d <- d |> dplyr::group_by(.data$location_id) |> 
+    dplyr::mutate(outlier_time = flag_time_outliers(.data[[idx_col]], yday(date), k = 10)) |> 
     dplyr::ungroup()
 
   # Drop locations that are mostly outliers (relaxed: >50% of observations flagged)
   OUTLIER_LOC_FRAC <- 0.5
-  loc_frac <- d %>% dplyr::group_by(.data$location_id) %>% dplyr::summarise(frac_out = mean(.data$outlier_time, na.rm = TRUE))
-  bad_locs <- loc_frac %>% dplyr::filter(.data$frac_out > OUTLIER_LOC_FRAC) %>% dplyr::pull(.data$location_id)
+  loc_frac <- d |> dplyr::group_by(.data$location_id) |> dplyr::summarise(frac_out = mean(.data$outlier_time, na.rm = TRUE))
+  bad_locs <- loc_frac |> dplyr::filter(.data$frac_out > OUTLIER_LOC_FRAC) |> dplyr::pull(.data$location_id)
   if(length(bad_locs) > 0) {
     # remember which locations were dropped globally
     OUTLIER_LOCATIONS <<- unique(c(OUTLIER_LOCATIONS, as.character(bad_locs)))
-  d <- d %>% dplyr::filter(!.data$location_id %in% bad_locs)
+  d <- d |> dplyr::filter(!.data$location_id %in% bad_locs)
   }
 
   # For plotting, remove individual outlier observations (do not show them)
-  d_plot <- d %>% dplyr::filter(!.data$outlier_time)
+  d_plot <- d |> dplyr::filter(!.data$outlier_time)
   if(nrow(d_plot) < 10) return(NULL)
 
   # Base plot: lines drawn only between non-outlier observations; points show all observations and mark outliers
@@ -308,7 +308,7 @@ plot_vegtype_multiloc <- function(data, veg_val, idx_col, out_dir = PLOTS_DIR) {
 
   # Add a single GAM smoothing across all selected locations (common seasonal fit)
   grid <- data.frame(doy = 1:365)
-  sub_all <- d_plot %>% dplyr::mutate(doy = yday(date)) %>% dplyr::filter(is.finite(.data[[idx_col]]))
+  sub_all <- d_plot |> dplyr::mutate(doy = yday(date)) |> dplyr::filter(is.finite(.data[[idx_col]]))
   if(nrow(sub_all) >= 10) {
     try({
       knts <- list(doy = c(0.5, 366.5))
@@ -395,10 +395,10 @@ if(length(sel) == 0) {
 
 for(idx in sel) {
   subdir <- file.path(PLOTS_DIR, idx)
-  df_idx <- df %>% dplyr::filter(is.finite(.data[[idx]]))
+  df_idx <- df |> dplyr::filter(is.finite(.data[[idx]]))
   if(nrow(df_idx) == 0) next
   # Use all years present in the data
-  locs <- df_idx %>% dplyr::count(location_id, sort = TRUE)
+  locs <- df_idx |> dplyr::count(location_id, sort = TRUE)
   locs <- utils::head(locs, MAX_LOC_PER_INDEX)
   for(li in seq_len(nrow(locs))) {
     plot_location_years(df_idx, locs$location_id[li], idx, out_dir = subdir)
@@ -407,9 +407,9 @@ for(idx in sel) {
   # Per vegetation-type plots (multiple locations per plot)
   if(!is.null(VEG_COL) && (VEG_COL %in% names(df_idx))) {
     subdir_veg <- file.path(PLOTS_DIR, idx, "by_vegtype")
-    veg_vals <- df_idx %>%
-      dplyr::filter(!is.na(.data[[VEG_COL]])) %>%
-      dplyr::pull(.data[[VEG_COL]]) %>%
+    veg_vals <- df_idx |> 
+      dplyr::filter(!is.na(.data[[VEG_COL]])) |> 
+      dplyr::pull(.data[[VEG_COL]]) |> 
       unique()
     for(v in veg_vals) {
       # For each vegetation type, plot only one year (most recent)
@@ -423,11 +423,11 @@ for(idx in sel) {
     veg_gam_list <- list()
     grid <- data.frame(doy = 1:365)
     for(v in veg_vals) {
-      dd0 <- df_idx %>% dplyr::filter(.data[[VEG_COL]] == v) %>% dplyr::mutate(doy = yday(date)) %>% dplyr::filter(is.finite(.data[[idx]]))
+      dd0 <- df_idx |> dplyr::filter(.data[[VEG_COL]] == v) |> dplyr::mutate(doy = yday(date)) |> dplyr::filter(is.finite(.data[[idx]]))
       n0 <- nrow(dd0)
       if(n0 == 0) next
       # flag and remove outlier observations
-      dd <- dd0 %>% dplyr::mutate(outlier_time = flag_time_outliers(.data[[idx]], doy, k=10)) %>% dplyr::filter(!outlier_time)
+      dd <- dd0 |> dplyr::mutate(outlier_time = flag_time_outliers(.data[[idx]], doy, k=10)) |> dplyr::filter(!outlier_time)
       n1 <- nrow(dd)
       # report status
       cat(sprintf("Veg '%s': rows_before=%d, rows_after_outlier_filter=%d\n", as.character(v), n0, n1))

@@ -56,14 +56,30 @@ lines = clean_content.split('\n')
 for i, line in enumerate(lines):
     for j, char in enumerate(line):
         if char == '{':
-            stack.append((i + 1, j + 1))
+            stack.append((i + 1, j + 1, '{'))
         elif char == '}':
             if not stack:
                 print(f'Extra closing brace at line {i + 1}, col {j + 1}')
             else:
                 stack.pop()
+        elif char == '(':
+            stack.append((i + 1, j + 1, '('))
+        elif char == ')':
+            if not stack:
+                print(f'Extra closing paren at line {i + 1}, col {j + 1}')
+            else:
+                stack.pop()
+        elif char == '[':
+            stack.append((i + 1, j + 1, '['))
+        elif char == ']':
+            if not stack:
+                print(f'Extra closing bracket at line {i + 1}, col {j + 1}')
+            else:
+                stack.pop()
 
 if stack:
-    print(f'Unclosed braces: {len(stack)}')
+    print(f'Unclosed delimiters: {len(stack)}')
     for item in stack[-5:]:
-        print(f'Unclosed brace at line {item[0]}, col {item[1]}')
+        print(f'Unclosed {item[2]} at line {item[0]}, col {item[1]}')
+else:
+    print('All delimiters balanced.')
