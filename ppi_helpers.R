@@ -70,36 +70,36 @@ add_ppi_columns <- function(df, dvi_soil = NULL) {
   barren_idx <- barren_idx & valid_dvi
 
   # --- CRITICAL: Determine dvi_soil baseline ---
-  if ("location_id" %in% names(df)) {
-    # Compute 5th percentile DVI per location as baseline
-    df <- df %>%
-      dplyr::group_by(location_id) %>%
-      dplyr::mutate(dvi_soil = quantile(DVI[is.finite(DVI)], 0.05, na.rm = TRUE)) %>%
-      dplyr::ungroup()
-    cat("[PPI] Using per-location 5th percentile DVI as baseline\n")
-  } else {
-    # Fallback: single baseline
-    dvi_soil_calc <- NULL
-    
-    # Priority 1: Use provided dvi_soil parameter (e.g., from training data)
-    if (!is.null(dvi_soil) && is.finite(dvi_soil)) {
-      dvi_soil_calc <- dvi_soil
-      cat(sprintf("[PPI] Using provided dvi_soil baseline: %.4f\n", dvi_soil_calc))
-    }
-    # Priority 2: Compute from barren pixels in current dataset (use mean DVI of barren rows)
-    else if (any(barren_idx)) {
-      dvi_soil_calc <- as.numeric(mean(df$DVI[barren_idx], na.rm = TRUE))
-      cat(sprintf("[PPI] Computed baseline from %d barren observations (mean DVI of barren): dvi_soil = %.4f\n",
-                  sum(barren_idx), dvi_soil_calc))
-    }
-    # Priority 3: Error - no baseline available
-    else {
-      stop("[PPI ERROR] Cannot compute PPI: No dvi_soil provided and no barren pixels found in data. ",
-           "Pass dvi_soil parameter from training data or ensure barren pixels are present.")
-    }
-    
-    df$dvi_soil <- dvi_soil_calc
+  # AGENT CHANGE: Per user feedback, using a single global DVI baseline
+  # from 'barren' veg type, with no fallback to other methods.
+
+  dvi_soil_calc <- NULL
+
+  # Priority 1: Use provided dvi_soil parameter (e.g., from training data override)
+  if (!is.null(dvi_soil) && is.finite(dvi_soil)) {
+    dvi_soil_calc <- dvi_soil
+    cat(sprintf("[PPI] Using provided single global dvi_soil baseline: %.4f\n", dvi_soil_calc))
   }
+  # Priority 2: Compute global baseline from 'barren' vegetation type
+  else if ("Veg" %in% names(df)) {
+    barren_dvi <- df$DVI[is.finite(df$DVI) & tolower(df$Veg) == 'barren']
+    if (length(barren_dvi) > 0) {
+      dvi_soil_calc <- as.numeric(median(barren_dvi, na.rm = TRUE))
+      cat(sprintf("[PPI] Computed single global baseline from median of %d 'barren' observations: dvi_soil = %.4f\n",
+                  length(barren_dvi), dvi_soil_calc))
+    }
+  }
+
+  # If after all checks, dvi_soil_calc is still NULL, stop execution.
+  if (is.null(dvi_soil_calc)) {
+      stop("[PPI ERROR] Cannot determine DVI soil baseline. No 'dvi_soil' parameter was provided and no observations with Veg='barren' were found in the dataset.")
+  }
+
+  df$dvi_soil <- dvi_soil_calc
+  
+  # Store baseline globally for inference step
+  assign("GLOBAL_TRAINING_DVI_SOIL", dvi_soil_calc, envir = globalenv())
+
 
   # Latitude Handling for SZA
   lat_fallback <- 40.2
@@ -118,12 +118,22 @@ add_ppi_columns <- function(df, dvi_soil = NULL) {
   # Calculate PPI
   df$PPI <- NA_real_
   calc_idx <- complete.cases(df$DVI, df$zenith.angle, df$dvi_soil)
-  
+
+  # Debug: Check if we have any valid data
+  if (!any(calc_idx)) {
+    n_missing_dvi <- sum(is.na(df$DVI) | !is.finite(df$DVI))
+    n_missing_zenith <- sum(is.na(df$zenith.angle) | !is.finite(df$zenith.angle))
+    n_missing_dvi_soil <- sum(is.na(df$dvi_soil) | !is.finite(df$dvi_soil))
+    cat(sprintf("[PPI WARNING] No complete cases for PPI calculation (missing: %d DVI, %d zenith.angle, %d dvi_soil out of %d rows)\n",
+                n_missing_dvi, n_missing_zenith, n_missing_dvi_soil, nrow(df)))
+  }
+
   # Only run if we have data
   if (any(calc_idx)) {
     df$PPI[calc_idx] <- ppi(df$DVI[calc_idx], df$zenith.angle[calc_idx], M = 0.7, dvi.soil = df$dvi_soil[calc_idx])
+
   }
-  
+
   df$lat_use <- NULL
   return(df)
 }
@@ -137,6 +147,7 @@ auto_add_ppi_columns <- function(df, dvi_soil = NULL, env_var = "MESMA_DVI_SOIL"
     df_out <- add_ppi_columns(df)
     return(list(df = df_out, added = TRUE, reason = "calculated"))
   }, error = function(e) {
+    cat(sprintf("[PPI ERROR] auto_add_ppi_columns caught error: %s\n", e$message))
     # Fallback logic
     user_dvi <- suppressWarnings(as.numeric(Sys.getenv(env_var)))
     if (!is.na(user_dvi)) {

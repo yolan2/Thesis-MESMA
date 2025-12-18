@@ -10,7 +10,14 @@
       "Bash(head:*)",
       "Bash(grep:*)",
       "Bash(git log:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(powershell -Command \"Get-Content fit_veg_mixture_mesma.R | Select-Object -First 9074 | Select-String -Pattern ''^\\s*\\{'' | Measure-Object\")",
+      "Bash(cat:*)",
+      "Bash(python check_braces.py:*)",
+      "Bash(python:*)",
+      "Bash(timeout 30 Rscript:*)",
+      "Bash(Rscript -e \"tryCatch(parse(''fit_veg_mixture_mesma.R''), error = function(e) cat(e$message, ''\\n''))\")",
+      "Bash(Rscript --vanilla -e:*)"
     ]
   }
 }

@@ -19,10 +19,10 @@ def remove_comments_and_strings(text):
     in_string = False
     string_char = ''
     in_comment = False
-    
+
     while i < n:
         char = text[i]
-        
+
         if in_comment:
             if char == '\n':
                 in_comment = False
@@ -40,7 +40,7 @@ def remove_comments_and_strings(text):
             if char == '#' and (i == 0 or text[i-1] != '\\'): # Naive check for escaped #
                 in_comment = True
                 out.append(' ')
-            elif char == '"' or char == "'":
+            elif char == '"' or char == "'" or char == '`':  # Include backtick for R function names
                 in_string = True
                 string_char = char
                 out.append(' ')
@@ -53,29 +53,21 @@ clean_content = remove_comments_and_strings(content)
 
 stack = []
 lines = clean_content.split('\n')
+matching = {'}': '{', ')': '(', ']': '['}
+
 for i, line in enumerate(lines):
     for j, char in enumerate(line):
-        if char == '{':
-            stack.append((i + 1, j + 1, '{'))
-        elif char == '}':
+        if char in '{([':
+            stack.append((i + 1, j + 1, char))
+        elif char in '})]':
             if not stack:
-                print(f'Extra closing brace at line {i + 1}, col {j + 1}')
+                print(f'Extra closing {char} at line {i + 1}, col {j + 1}')
             else:
-                stack.pop()
-        elif char == '(':
-            stack.append((i + 1, j + 1, '('))
-        elif char == ')':
-            if not stack:
-                print(f'Extra closing paren at line {i + 1}, col {j + 1}')
-            else:
-                stack.pop()
-        elif char == '[':
-            stack.append((i + 1, j + 1, '['))
-        elif char == ']':
-            if not stack:
-                print(f'Extra closing bracket at line {i + 1}, col {j + 1}')
-            else:
-                stack.pop()
+                line_num, col_num, opening = stack[-1]
+                if opening == matching[char]:
+                    stack.pop()
+                else:
+                    print(f'Mismatched delimiter: {opening} at line {line_num}, col {col_num} closed by {char} at line {i + 1}, col {j + 1}')
 
 if stack:
     print(f'Unclosed delimiters: {len(stack)}')

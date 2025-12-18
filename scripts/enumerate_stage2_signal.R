@@ -1,4 +1,4 @@
-MESMA_NO_AUTO_RUN <- TRUE
+# Run script and use helpers directly
 source('fit_veg_mixture_mesma.R')
 
 if (!exists('df_tasks') || is.null(df_tasks) || nrow(df_tasks) == 0) {
