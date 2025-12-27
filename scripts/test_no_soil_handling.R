@@ -1,9 +1,7 @@
-# Test that presence of 'no_soil'/'no.soil' with only NA values is treated as a fatal error
-# This test exercises january_averages.R's policy: if 'no.soil' exists, it must
-# contain at least one non-NA value; otherwise the script should stop with an
-# error explaining the problem.
-
-cat("TEST: january_averages.R no_soil/no.soil policy\n")
+# Deprecated test removed
+# The test that enforced 'no_soil'/'no.soil' policy has been deprecated because
+# the codebase no longer uses a 'no soil' fraction column. Remove this file if
+# you want to clean up obsolete tests.
 
 # Minimal safe_as_numeric helper (same semantics used by january_averages.R)
 safe_as_numeric <- function(x) {

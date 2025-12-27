@@ -46,6 +46,44 @@ safe_as_numeric <- function(x) {
   num
 }
 
+# Define indices of interest globally
+INDICES_OF_INTEREST <- c("MSAVI", "NDVI", "PPI", "OSAVI", "MCARI", "NIRv", "PSRI", "NBR", "TCW", "NDMI", "TCB", "GVI")
+
+calculate_indices <- function(df) {
+  # Ensure bands are present
+  req_bands <- c("blue", "green", "red", "nir", "swir1", "swir2")
+  missing_bands <- setdiff(req_bands, names(df))
+  if (length(missing_bands) > 0) {
+    cat("Warning: Missing bands for index calculation:", paste(missing_bands, collapse=", "), ". Skipping index calculation.\n")
+    return(df)
+  }
+  
+  eps <- 1e-9
+  
+  # Calculate DVI if missing
+  if (!"DVI" %in% names(df)) df$DVI <- df$nir - df$red
+  
+  # Calculate additional indices
+  df$OSAVI <- (df$nir - df$red) / (df$nir + df$red + 0.16)
+  df$MCARI <- ((df$red - df$green) - 0.2*(df$red - df$blue)) * (df$red / (df$green + eps))
+  df$NIRv  <- (df$nir * ((df$nir - df$red) / (df$nir + df$red + eps))) * 1.3
+  df$PSRI  <- (df$red - df$blue) / (df$nir + eps)
+  df$NBR   <- (df$nir - df$swir2) / (df$nir + df$swir2 + eps)
+  # Project-specific TCW (Normalized Difference) definition
+  df$TCW   <- (df$swir1 - df$swir2) / (df$swir1 + df$swir2 + eps) 
+  df$NDMI  <- (df$nir - df$swir1) / (df$nir + df$swir1 + eps)
+  
+  # Tasseled Cap (using project-specific coefficients)
+  df$TCB   <- 0.3029 * df$blue + 0.2786 * df$green + 0.4733 * df$red + 0.5599 * df$nir + 0.508 * df$swir1 + 0.1872 * df$swir2
+  df$GVI   <- -0.2941 * df$blue - 0.243 * df$green - 0.5424 * df$red + 0.7276 * df$nir + 0.0713 * df$swir1 - 0.1608 * df$swir2
+  
+  # Ensure NDVI/MSAVI are present and consistent
+  df$NDVI <- (df$nir - df$red) / (df$nir + df$red + eps)
+  df$MSAVI <- (2 * df$nir + 1 - sqrt(pmax(0, (2 * df$nir + 1)^2 - 8 * (df$nir - df$red)))) / 2
+  
+  return(df)
+}
+
 ## Outlier filtering intentionally removed per user request.
 ## The previous implementation used a MAD-based high-outlier filter
 ## (remove_outliers_mad) which removed large positive PPI values.
@@ -53,28 +91,8 @@ safe_as_numeric <- function(x) {
 ## removal; therefore that helper has been removed and PPI values are
 ## left as-is.
 
-normalize_no_soil_col <- function(tbl) {
-  if (is.null(tbl) || !is.data.frame(tbl)) return(tbl)
-  nm <- names(tbl)
-  candidates <- c("no soil", "no_soil", "no.soil", "__no soil__", "__no_soil__", ".__no soil__", ".__no_soil__")
-  # Prefer canonical 'no soil' column name (mapped into internal 'no.soil')
-  if ("no.soil" %in% nm) {
-    tbl[["no.soil"]] <- safe_as_numeric(tbl[["no.soil"]])
-    return(tbl)
-  }
-  if ("no soil" %in% nm) {
-    tbl[["no.soil"]] <- safe_as_numeric(tbl[["no soil"]])
-    tbl[["no soil"]] <- NULL
-    return(tbl)
-  }
-  found <- intersect(candidates, nm)
-  if (length(found) > 0) {
-    src <- found[1]
-    tbl[["no.soil"]] <- safe_as_numeric(tbl[[src]])
-    if (src != "no.soil") tbl[[src]] <- NULL
-  }
-  tbl
-}
+# normalize_no_soil_col removed — 'no soil' column handling is deprecated and no longer used.
+# If migration of legacy datasets is required, normalize the column externally before running this script.
 
 ## Use centralized PPI helper to ensure identical PPI calculation
 if (file.exists("ppi_helpers.R")) {
@@ -96,9 +114,9 @@ if ("vegetation" %in% names(df) && !"Veg" %in% names(df)) {
   df$Veg <- df$vegetation
   cat("[NOTICE] Renamed 'vegetation' column to 'Veg' (from CSV)\n")
 }
-df <- normalize_no_soil_col(df)
-if ("Veg" %in% names(df) || "no soil" %in% names(df)) {
-  cat("[NOTICE] Found Veg or 'no soil' values in input CSV; skipping GeoJSON join and using CSV-provided values.\n")
+# Use CSV-provided Veg values if present (no 'no soil' processing)
+if ("Veg" %in% names(df)) {
+  cat("[NOTICE] Found Veg values in input CSV; skipping GeoJSON join and using CSV-provided Veg values.\n")
   skip_geojson <- TRUE
 } else {
   skip_geojson <- FALSE
@@ -176,7 +194,7 @@ if (file.exists(MAPPING_CSV)) {
   # Normalize common column names (detect veg column robustly)
   veg_cols <- names(map_df)[tolower(names(map_df)) %in% c("vegetation", "veg", "class")]
   if (length(veg_cols) > 0) map_df$Veg <- as.character(map_df[[veg_cols[1]]])
-  map_df <- normalize_no_soil_col(map_df)
+  # 'no soil' normalization removed; mapping CSV will only be used for Veg mapping and barren DVI estimation based on Veg=='barren'
 
   # Construct location_id from lon/lat if necessary
   if (!"location_id" %in% names(map_df) && all(c("lon", "lat") %in% names(map_df))) {
@@ -184,10 +202,9 @@ if (file.exists(MAPPING_CSV)) {
   }
 
   if ("location_id" %in% names(map_df)) {
-    if ("no.soil" %in% names(map_df) && !"no soil" %in% names(map_df)) map_df$`no soil` <- map_df$`no.soil`
     # Ensure Veg exists or is NA
     if (!"Veg" %in% names(map_df)) map_df$Veg <- NA_character_
-    gpts_map <- map_df |> dplyr::select(location_id, Veg, `no soil`) |> dplyr::mutate(location_id = as.character(location_id)) |> dplyr::distinct(location_id, .keep_all = TRUE)
+    gpts_map <- map_df |> dplyr::select(location_id, Veg) |> dplyr::mutate(location_id = as.character(location_id)) |> dplyr::distinct(location_id, .keep_all = TRUE)
   } else {
     cat("Warning: mapping CSV lacks 'location_id' and 'lon'/'lat'; cannot join Veg mapping.\n")
     gpts_map <- NULL
@@ -201,7 +218,7 @@ if (file.exists(MAPPING_CSV)) {
 if (exists("map_df")) {
     cat("DEBUG: Unique Veg types in mapping CSV:\n")
     print(table(map_df$Veg, useNA = "ifany"))
-    cat("Mapping CSV will NOT be joined to main CSV; it will only be used to estimate soil DVI from Veg=='barren' or 'no soil' values.\n")
+    cat("Mapping CSV will NOT be joined to main CSV; it will only be used to estimate soil DVI from Veg=='barren'.\n")
 }
 
 # --- TRAINING DATA (used for statistics) ---
@@ -223,7 +240,7 @@ if (file.exists(TRAINING_CSV)) {
 
   # Normalize and compute indices as for the main df
   if ("vegetation" %in% names(training_df) && !"Veg" %in% names(training_df)) training_df$Veg <- training_df$vegetation
-  training_df <- normalize_no_soil_col(training_df)
+  # 'no soil' normalization removed — training_df no longer uses 'no soil' column
   for (orig in names(band_mapping)) if (orig %in% names(training_df) && !band_mapping[orig] %in% names(training_df)) names(training_df)[names(training_df) == orig] <- band_mapping[orig]
   if (!"date" %in% names(training_df) && "prediction_date" %in% names(training_df)) training_df$date <- as.Date(training_df$prediction_date)
   if ("date" %in% names(training_df)) training_df$date <- as.Date(training_df$date)
@@ -231,7 +248,10 @@ if (file.exists(TRAINING_CSV)) {
   if (!"year" %in% names(training_df) && "date" %in% names(training_df)) training_df$year <- lubridate::year(training_df$date)
   if (!"pheno_year" %in% names(training_df) && "date" %in% names(training_df)) training_df$pheno_year <- ifelse(lubridate::month(training_df$date) >= 3, lubridate::year(training_df$date), lubridate::year(training_df$date) - 1)
   if (!"month" %in% names(training_df) && "date" %in% names(training_df)) training_df$month <- lubridate::month(training_df$date)
-  if (!"DVI" %in% names(training_df) && all(c("nir","red") %in% names(training_df))) training_df$DVI <- training_df$nir - training_df$red
+  
+  # Calculate indices for training data
+  training_df <- calculate_indices(training_df)
+  
   if (!"location_id" %in% names(training_df) && all(c("lon","lat") %in% names(training_df))) training_df$location_id <- make_location_id(training_df$lon, training_df$lat)
 
   # Ensure PPI is present for training data (uses mapping or internal barren rows)
@@ -251,7 +271,7 @@ if (file.exists(TRAINING_CSV)) {
 # Join df with gpts_map to add Veg column
 if ("location_id" %in% names(df)) df$location_id <- as.character(df$location_id) else cat("Warning: input CSV missing 'location_id' column; skipping cast.\n")
 cat("Note: No Veg/no-soil joining performed; mapping CSV only used to estimate barren DVI when present.\n")
-df <- normalize_no_soil_col(df)
+# df <- normalize_no_soil_col(df)  # Function removed - deprecated
 ## Enforce policy: if a no_soil/no.soil/no\ssoi l column exists it must contain at least
 ## one non-NA value. A present-but-all-NA column is a data error and should be
 ## fixed by the data provider (do not silently fall back to index inference).
@@ -283,26 +303,8 @@ cat("Filtering data for years 1985-2025...\n")
 df <- df |> dplyr::filter(year >= 1985 & year <= 2025)
 cat("Data rows after year filtering:", nrow(df), "\n")
 
-# Check if MSAVI and NDVI are present
-indices_to_check <- c("MSAVI", "NDVI")
-missing_indices <- setdiff(indices_to_check, names(df))
-
-if (length(missing_indices) > 0) {
-  cat("Warning: The following indices are missing from the dataset:", paste(missing_indices, collapse = ", "), "\n")
-  cat("Available indices:", paste(intersect(indices_to_check, names(df)), collapse = ", "), "\n")
-
-  # If NDVI is missing, calculate it
-  if ("NDVI" %in% missing_indices && all(c("nir", "red") %in% names(df))) {
-    df$NDVI <- (df$nir - df$red) / (df$nir + df$red)
-    cat("Calculated NDVI from nir and red bands\n")
-  }
-
-  # If MSAVI is missing, calculate it (MSAVI = (2*nir + 1 - sqrt((2*nir + 1)^2 - 8*(nir - red)))/2 )
-  if ("MSAVI" %in% missing_indices && all(c("nir", "red") %in% names(df))) {
-    df$MSAVI <- (2 * df$nir + 1 - sqrt((2 * df$nir + 1)^2 - 8 * (df$nir - df$red))) / 2
-    cat("Calculated MSAVI from nir and red bands\n")
-  }
-}
+# Calculate all indices of interest
+df <- calculate_indices(df)
 
 # Optionally prefer mitmat/ppi package if installed
 if (!exists("ppi", mode = "function") && requireNamespace("ppi", quietly = TRUE)) {
@@ -378,7 +380,7 @@ if (exists("map_df")) {
 if (is.na(dvi_soil_est) && "DVI" %in% names(df)) {
   barren_idx <- FALSE
   if ("Veg" %in% names(df)) barren_idx <- tolower(as.character(df$Veg)) == "barren"
-  if ("no.soil" %in% names(df)) barren_idx <- barren_idx | (is.finite(df$`no.soil`) & df$`no.soil` > 0.5)
+
 
   if (any(barren_idx, na.rm = TRUE)) {
     dvi_soil_est <- mean(df$DVI[barren_idx], na.rm = TRUE)
@@ -444,8 +446,8 @@ compute_global_index_snr <- function(df, indices, group_col = "location_id", eps
   out
 }
 
-# Calculate SNR for the three indices of interest using training data
-indices_to_snr <- c("MSAVI", "NDVI", "PPI")
+# Calculate SNR for the indices of interest using training data
+indices_to_snr <- INDICES_OF_INTEREST
 index_snr <- compute_global_index_snr(training_df, indices_to_snr, group_col = "location_id")
 ## For backward-compatible SNR reporting (and to match prior reported values),
 ## compute SNR as location-wise amplitude (range) / noise (MAD) on non-barren
@@ -534,10 +536,10 @@ bootstrap_hierarchical_means <- function(df, metrics = c("MSAVI", "NDVI", "PPI")
 
   cis <- apply(boot_replicates, 1, function(x) stats::quantile(x, probs = c(0.025, 0.975), na.rm = TRUE))
 
-  # Format output: metric_lower, metric_upper
+  # Format output: metric_ci_lower, metric_ci_upper
   output <- as.vector(cis)
   metric_names <- rep(metrics, each = 2)
-  ci_types <- rep(c("lower", "upper"), times = length(metrics))
+  ci_types <- rep(c("ci_lower", "ci_upper"), times = length(metrics))
   names(output) <- paste(metric_names, ci_types, sep = "_")
 
   return(output)
@@ -602,56 +604,32 @@ mean_of_means <- function(vals, ids) {
 set.seed(123)
 B <- 1000  # Number of bootstrap replicates
 
+# Helper to process global averages
+process_global_averages <- function(data, month_name) {
+  cat(sprintf("Calculating Global %s Averages with Hierarchical Bootstrapping...\n", month_name))
+  global_boot <- bootstrap_hierarchical_means(data, metrics = INDICES_OF_INTEREST, B = B)
+  
+  avg_stats <- data |> 
+    dplyr::summarize(
+      n_observations = dplyr::n(),
+      n_locations = dplyr::n_distinct(location_id),
+      across(all_of(INDICES_OF_INTEREST), ~ mean_of_means(.x, location_id), .names = "avg_{.col}")
+    )
+  
+  # Bind CIs
+  # global_boot is a named vector. Convert to 1-row DF.
+  ci_df <- as.data.frame(t(global_boot))
+  dplyr::bind_cols(avg_stats, ci_df)
+}
+
 # Calculate Global Averages (Aggregated 2020-2024) for January
-cat("Calculating Global January Averages with Hierarchical Bootstrapping...\n")
-jan_global_boot <- bootstrap_hierarchical_means(january_data, metrics = c("MSAVI", "NDVI", "PPI"), B = B)
-jan_global_avg <- january_data |> 
-  dplyr::summarize(
-    n_observations = dplyr::n(),
-    n_locations = dplyr::n_distinct(location_id),
-    avg_MSAVI = mean_of_means(MSAVI, location_id),
-    avg_NDVI = mean_of_means(NDVI, location_id),
-    avg_PPI = mean_of_means(PPI, location_id)
-  ) |> 
-  dplyr::mutate(
-    MSAVI_ci_lower = jan_global_boot[1], MSAVI_ci_upper = jan_global_boot[2],
-    NDVI_ci_lower = jan_global_boot[3], NDVI_ci_upper = jan_global_boot[4],
-    PPI_ci_lower = jan_global_boot[5], PPI_ci_upper = jan_global_boot[6]
-  )
+jan_global_avg <- process_global_averages(january_data, "January")
 
 # Calculate Global Averages (Aggregated 2020-2024) for July
-cat("Calculating Global July Averages with Hierarchical Bootstrapping...\n")
-july_global_boot <- bootstrap_hierarchical_means(july_data, metrics = c("MSAVI", "NDVI", "PPI"), B = B)
-july_global_avg <- july_data |> 
-  dplyr::summarize(
-    n_observations = dplyr::n(),
-    n_locations = dplyr::n_distinct(location_id),
-    avg_MSAVI = mean_of_means(MSAVI, location_id),
-    avg_NDVI = mean_of_means(NDVI, location_id),
-    avg_PPI = mean_of_means(PPI, location_id)
-  ) |> 
-  dplyr::mutate(
-    MSAVI_ci_lower = july_global_boot[1], MSAVI_ci_upper = july_global_boot[2],
-    NDVI_ci_lower = july_global_boot[3], NDVI_ci_upper = july_global_boot[4],
-    PPI_ci_lower = july_global_boot[5], PPI_ci_upper = july_global_boot[6]
-  )
+july_global_avg <- process_global_averages(july_data, "July")
 
 # Calculate Global Averages (Aggregated 2020-2024) for September
-cat("Calculating Global September Averages with Hierarchical Bootstrapping...\n")
-sept_global_boot <- bootstrap_hierarchical_means(september_data, metrics = c("MSAVI", "NDVI", "PPI"), B = B)
-sept_global_avg <- september_data |> 
-  dplyr::summarize(
-    n_observations = dplyr::n(),
-    n_locations = dplyr::n_distinct(location_id),
-    avg_MSAVI = mean_of_means(MSAVI, location_id),
-    avg_NDVI = mean_of_means(NDVI, location_id),
-    avg_PPI = mean_of_means(PPI, location_id)
-  ) |> 
-  dplyr::mutate(
-    MSAVI_ci_lower = sept_global_boot[1], MSAVI_ci_upper = sept_global_boot[2],
-    NDVI_ci_lower = sept_global_boot[3], NDVI_ci_upper = sept_global_boot[4],
-    PPI_ci_lower = sept_global_boot[5], PPI_ci_upper = sept_global_boot[6]
-  )
+sept_global_avg <- process_global_averages(september_data, "September")
 
 # --- Averages by Vegetation Type (using mapping CSV at location-level) ---
 
@@ -664,9 +642,9 @@ location_summary <- function(data, metrics = c("MSAVI", "NDVI", "PPI")) {
   )
 }
 
-loc_jan <- location_summary(january_data, metrics = c("MSAVI", "NDVI", "PPI"))
-loc_july <- location_summary(july_data, metrics = c("MSAVI", "NDVI", "PPI"))
-loc_sept <- location_summary(september_data, metrics = c("MSAVI", "NDVI", "PPI"))
+loc_jan <- location_summary(january_data, metrics = INDICES_OF_INTEREST)
+loc_july <- location_summary(july_data, metrics = INDICES_OF_INTEREST)
+loc_sept <- location_summary(september_data, metrics = INDICES_OF_INTEREST)
 
 # Prepare mapping at location level (map_df should already be loaded if available)
 map_loc <- NULL
@@ -698,9 +676,7 @@ veg_stats_from_locs <- function(loc_tbl, data_tbl, period_name) {
   veg_loc_stats <- loc_joined |> dplyr::group_by(Veg) |> dplyr::summarize(
     n_locations = dplyr::n(),
     n_observations = sum(n_observations, na.rm = TRUE),
-    avg_MSAVI = mean(avg_MSAVI, na.rm = TRUE),
-    avg_NDVI = mean(avg_NDVI, na.rm = TRUE),
-    avg_PPI = mean(avg_PPI, na.rm = TRUE),
+    across(starts_with("avg_"), ~ mean(.x, na.rm = TRUE)),
     .groups = "drop"
   )
 
@@ -708,18 +684,23 @@ veg_stats_from_locs <- function(loc_tbl, data_tbl, period_name) {
   veg_boot <- lapply(unique(loc_joined$Veg), function(v) {
     locs <- loc_joined |> dplyr::filter(Veg == v) |> dplyr::pull(location_id)
     sub <- data_tbl |> dplyr::filter(location_id %in% locs)
-    if (nrow(sub) == 0) return(data.frame(Veg = v, MSAVI_ci_lower = NA_real_, MSAVI_ci_upper = NA_real_, NDVI_ci_lower = NA_real_, NDVI_ci_upper = NA_real_, PPI_ci_lower = NA_real_, PPI_ci_upper = NA_real_))
-    res <- bootstrap_hierarchical_means(sub, metrics = c("MSAVI", "NDVI", "PPI"), B = B)
-    if (is.null(res) || length(res) < 6) res <- rep(NA_real_, 6)
-    data.frame(Veg = v, MSAVI_ci_lower = res[1], MSAVI_ci_upper = res[2], NDVI_ci_lower = res[3], NDVI_ci_upper = res[4], PPI_ci_lower = res[5], PPI_ci_upper = res[6])
+    
+    # Run bootstrap (returns named vector)
+    res <- bootstrap_hierarchical_means(sub, metrics = INDICES_OF_INTEREST, B = B)
+    
+    # Convert res vector to 1-row DF
+    res_df <- as.data.frame(t(res))
+    res_df$Veg <- v
+    res_df
   })
+  
   if (length(veg_boot) > 0) {
-    veg_boot_df <- do.call(rbind, veg_boot)
+    veg_boot_df <- dplyr::bind_rows(veg_boot)
   } else {
-    veg_boot_df <- data.frame(Veg = character(0), MSAVI_ci_lower = numeric(0), MSAVI_ci_upper = numeric(0), NDVI_ci_lower = numeric(0), NDVI_ci_upper = numeric(0), PPI_ci_lower = numeric(0), PPI_ci_upper = numeric(0), stringsAsFactors = FALSE)
+    veg_boot_df <- data.frame(Veg = character(0))
   }
 
-  left_join(veg_loc_stats, veg_boot_df, by = "Veg")
+  dplyr::left_join(veg_loc_stats, veg_boot_df, by = "Veg")
 }
 
 cat("Calculating Vegetation Type January Averages using mapping CSV and location summaries...\n")
@@ -763,56 +744,9 @@ nonbarren_jan <- exclude_barren_filter(january_data)
 nonbarren_july <- exclude_barren_filter(july_data)
 nonbarren_sept <- exclude_barren_filter(september_data)
 
-jan_nb_boot <- if (nrow(nonbarren_jan) > 0) bootstrap_hierarchical_means(nonbarren_jan, metrics = c("MSAVI", "NDVI", "PPI"), B = B) else rep(NA, 6)
-jan_global_avg_nonbarren <- if (nrow(nonbarren_jan) > 0) nonbarren_jan |> 
-  dplyr::summarize(
-    n_observations = dplyr::n(),
-    n_locations = dplyr::n_distinct(location_id),
-    avg_MSAVI = mean_of_means(MSAVI, location_id),
-    avg_NDVI = mean_of_means(NDVI, location_id),
-    avg_PPI = mean_of_means(PPI, location_id)
-  ) |> 
-  dplyr::mutate(
-    MSAVI_ci_lower = jan_nb_boot[1], MSAVI_ci_upper = jan_nb_boot[2],
-    NDVI_ci_lower = jan_nb_boot[3], NDVI_ci_upper = jan_nb_boot[4],
-    PPI_ci_lower = jan_nb_boot[5], PPI_ci_upper = jan_nb_boot[6]
-  ) else {
-    data.frame(n_observations = 0, n_locations = 0, avg_MSAVI = NA_real_, avg_NDVI = NA_real_, avg_PPI = NA_real_, MSAVI_ci_lower = NA_real_, MSAVI_ci_upper = NA_real_, NDVI_ci_lower = NA_real_, NDVI_ci_upper = NA_real_, PPI_ci_lower = NA_real_, PPI_ci_upper = NA_real_)
-  }
-
-july_nb_boot <- if (nrow(nonbarren_july) > 0) bootstrap_hierarchical_means(nonbarren_july, metrics = c("MSAVI", "NDVI", "PPI"), B = B) else rep(NA, 6)
-july_global_avg_nonbarren <- if (nrow(nonbarren_july) > 0) nonbarren_july |> 
-  dplyr::summarize(
-    n_observations = dplyr::n(),
-    n_locations = dplyr::n_distinct(location_id),
-    avg_MSAVI = mean_of_means(MSAVI, location_id),
-    avg_NDVI = mean_of_means(NDVI, location_id),
-    avg_PPI = mean_of_means(PPI, location_id)
-  ) |> 
-  dplyr::mutate(
-    MSAVI_ci_lower = july_nb_boot[1], MSAVI_ci_upper = july_nb_boot[2],
-    NDVI_ci_lower = july_nb_boot[3], NDVI_ci_upper = july_nb_boot[4],
-    PPI_ci_lower = july_nb_boot[5], PPI_ci_upper = july_nb_boot[6]
-  ) else {
-    data.frame(n_observations = 0, n_locations = 0, avg_MSAVI = NA_real_, avg_NDVI = NA_real_, avg_PPI = NA_real_, MSAVI_ci_lower = NA_real_, MSAVI_ci_upper = NA_real_, NDVI_ci_lower = NA_real_, NDVI_ci_upper = NA_real_, PPI_ci_lower = NA_real_, PPI_ci_upper = NA_real_)
-  }
-
-sept_nb_boot <- if (nrow(nonbarren_sept) > 0) bootstrap_hierarchical_means(nonbarren_sept, metrics = c("MSAVI", "NDVI", "PPI"), B = B) else rep(NA, 6)
-sept_global_avg_nonbarren <- if (nrow(nonbarren_sept) > 0) nonbarren_sept |> 
-  dplyr::summarize(
-    n_observations = dplyr::n(),
-    n_locations = dplyr::n_distinct(location_id),
-    avg_MSAVI = mean_of_means(MSAVI, location_id),
-    avg_NDVI = mean_of_means(NDVI, location_id),
-    avg_PPI = mean_of_means(PPI, location_id)
-  ) |> 
-  dplyr::mutate(
-    MSAVI_ci_lower = sept_nb_boot[1], MSAVI_ci_upper = sept_nb_boot[2],
-    NDVI_ci_lower = sept_nb_boot[3], NDVI_ci_upper = sept_nb_boot[4],
-    PPI_ci_lower = sept_nb_boot[5], PPI_ci_upper = sept_nb_boot[6]
-  ) else {
-    data.frame(n_observations = 0, n_locations = 0, avg_MSAVI = NA_real_, avg_NDVI = NA_real_, avg_PPI = NA_real_, MSAVI_ci_lower = NA_real_, MSAVI_ci_upper = NA_real_, NDVI_ci_lower = NA_real_, NDVI_ci_upper = NA_real_, PPI_ci_lower = NA_real_, PPI_ci_upper = NA_real_)
-  }
+jan_global_avg_nonbarren <- if (nrow(nonbarren_jan) > 0) process_global_averages(nonbarren_jan, "January (Non-Barren)") else process_global_averages(nonbarren_jan[0,], "January (Empty)")
+july_global_avg_nonbarren <- if (nrow(nonbarren_july) > 0) process_global_averages(nonbarren_july, "July (Non-Barren)") else process_global_averages(nonbarren_july[0,], "July (Empty)")
+sept_global_avg_nonbarren <- if (nrow(nonbarren_sept) > 0) process_global_averages(nonbarren_sept, "September (Non-Barren)") else process_global_averages(nonbarren_sept[0,], "September (Empty)")
 create_summary_entry <- function(idx_name, snr_val, jan_row, july_row, sept_row) {
   # Helper to format mean +/- margin
   fmt_val <- function(mean_val, lower, upper) {

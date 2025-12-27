@@ -58,13 +58,7 @@ add_ppi_columns <- function(df, dvi_soil = NULL) {
     barren_idx <- barren_idx | (!is.na(df$Veg) & tolower(trimws(as.character(df$Veg))) == "barren")
   }
   
-  # Identify based on "no soil" fraction if available
-  ns_cols <- c("no soil", "no.soil", "no_soil")
-  ns_col <- intersect(ns_cols, names(df))[1]
-  if (!is.na(ns_col)) {
-    vals <- as.numeric(as.character(df[[ns_col]]))
-    barren_idx <- barren_idx | (is.finite(vals) & vals > 0.5)
-  }
+  # Note: 'no soil' fraction column is deprecated and ignored; barren identification uses Veg=='barren' only
   
   valid_dvi <- is.finite(df$DVI)
   barren_idx <- barren_idx & valid_dvi

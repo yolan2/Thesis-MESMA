@@ -30,7 +30,7 @@
   target_locations <- intersect(target_locations, available_locations)
 
   n_locs_to_process <- length(target_locations)
-  BATCH_SIZE <- 50 # Smaller batches for location-level processing (each has multiple years)
+  BATCH_SIZE <- 6 # Smaller batches for location-level processing (each has multiple years)
 
   loc_batches <- split(target_locations, ceiling(seq_along(target_locations) / BATCH_SIZE))
   n_batches <- length(loc_batches)
@@ -137,6 +137,8 @@
     inference_target_keys <- paste(inference_loc_years$location_id, inference_loc_years$pheno_year, sep = "_")
     inference_available_keys <- unique(df_tasks_inference$task_key)
     inference_target_keys <- intersect(inference_target_keys, inference_available_keys)
+    
+    # Process all inference tasks (no limit)
     
     n_inference_keys <- length(inference_target_keys)
 
@@ -874,12 +876,7 @@
 
           current_row <- nrow(quality_metrics) + 4
 
-          loc_diag <- if (exists("all_diagnostics") && !is.null(all_diagnostics) && "location_id" %in% names(all_diagnostics)) all_diagnostics[all_diagnostics$location_id == loc_id, , drop = FALSE] else NULL
-          if (!is.null(loc_diag) && nrow(loc_diag) > 0) {
-            openxlsx::writeData(wb, sheet_name, "DIAGNOSTICS", startRow = current_row, startCol = 1)
-            openxlsx::writeData(wb, sheet_name, loc_diag, startRow = current_row + 1, startCol = 1)
-            current_row <- current_row + nrow(loc_diag) + 3
-          }
+          # Removed DIAGNOSTICS section
 
           loc_best <- if ("location_id" %in% names(best_fit_summary)) best_fit_summary[best_fit_summary$location_id == loc_id, , drop = FALSE] else data.frame()
           if (!is.null(loc_best) && nrow(loc_best) > 0) {
@@ -942,19 +939,6 @@
               startRow = current_row + 1, startCol = 1
             )
             current_row <- current_row + nrow(variant_usage) + 3
-          }
-
-          if (exists("all_unc_var") && !is.null(all_unc_var) && "location_id" %in% names(all_unc_var)) {
-            loc_unc_var <- all_unc_var[all_unc_var$location_id == loc_id, , drop = FALSE]
-            if (nrow(loc_unc_var) > 0) {
-              openxlsx::writeData(wb, sheet_name, "VARIANT DOMINANCE (%)",
-                startRow = current_row, startCol = 1
-              )
-              openxlsx::writeData(wb, sheet_name, loc_unc_var,
-                startRow = current_row + 1, startCol = 1
-              )
-              current_row <- current_row + nrow(loc_unc_var) + 3
-            }
           }
 
           if (!is.null(loc_q_data) && nrow(loc_q_data) > 0) {

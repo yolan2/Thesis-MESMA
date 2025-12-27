@@ -35,18 +35,16 @@ if (is.null(data_file)) {
 cat(sprintf("Loading data from: %s\n", data_file))
 df_raw <- fread(data_file)
 
-# GeoJSON support removed: expect Veg / 'no soil' to be provided in the CSV
+# GeoJSON support removed: expect Veg to be provided in the CSV
 if ("vegetation" %in% names(df_raw) && !"Veg" %in% names(df_raw)) {
   df_raw$Veg <- df_raw$vegetation
   cat("[NOTICE] Renamed 'vegetation' -> 'Veg' in phenology data\n")
 }
-# Reject legacy 'no.soil'/'no_soil' column names
-bad_nosoil <- intersect(c("no.soil", "no_soil", "no-soil"), names(df_raw))
-if (length(bad_nosoil) > 0) stop(sprintf("Unsupported column name(s) present in phenology data: %s. Please rename to 'no soil' (with a space) if needed.", paste(bad_nosoil, collapse = ", ")))
+# Legacy 'no.soil'/'no_soil' columns are ignored and not used by this script
 
-# Require that either Veg or 'no soil' be present to extract endmembers
-if (!("Veg" %in% names(df_raw) || "no soil" %in% names(df_raw))) {
-  stop("Phenology data must include 'Veg' or 'no soil' columns. GeoJSON support has been removed — include these fields in landsat_lower.csv.")
+# Require that Veg be present to extract endmembers
+if (!("Veg" %in% names(df_raw))) {
+  stop("Phenology data must include a 'Veg' column. GeoJSON support has been removed — include this field in landsat_lower.csv.")
 }
 
 # Extract TRUE barren endmember (Veg == 'barren')
@@ -74,14 +72,14 @@ soil_spec <- c(
 cat("True soil endmember spectrum:\n")
 print(soil_spec)
 
-# Extract TRUE pure vegetation endmember (no soil ≈ 1)
+# Extract TRUE pure vegetation endmember (identified by Veg != 'barren')
 cat("\nExtracting TRUE pure vegetation endmember from data...\n")
 pure_veg_data <- df_raw |> 
-  dplyr::filter(!is.na(`no soil`) & abs(as.numeric(as.character(`no soil`)) - 1) < 0.01) |> 
+  dplyr::filter(!is.na(Veg) & tolower(Veg) != 'barren') |> 
   dplyr::filter(across(c(blue, green, red, nir, swir1, swir2), is.finite))
 
 if (nrow(pure_veg_data) == 0) {
-  stop("No pure vegetation data found (no soil ≈ 1)! Cannot extract true vegetation endmember.")
+  stop("No pure vegetation data found (no vegetation types present)! Cannot extract true vegetation endmember.")
 }
 
 cat(sprintf("Found %d pure vegetation observations\n", nrow(pure_veg_data)))

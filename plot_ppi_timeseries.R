@@ -44,21 +44,7 @@ safe_as_numeric <- function(x) {
   num
 }
 
-normalize_no_soil_col <- function(tbl) {
-  if (is.null(tbl) || !is.data.frame(tbl)) return(tbl)
-  nm <- names(tbl)
-  candidates <- c("no soil", "no_soil", "no.soil", "__no soil__", "__no_soil__", ".__no soil__", ".__no_soil__")
-  if ("no soil" %in% nm) {
-    tbl[["no soil"]] <- safe_as_numeric(tbl[["no soil"]])
-    return(tbl)
-  }
-  found <- intersect(candidates, nm)
-  if (length(found) > 0) {
-    src <- found[1]
-    tbl[["no soil"]] <- safe_as_numeric(tbl[[src]])
-  }
-  tbl
-}
+# Legacy normalize_no_soil_col removed — 'no soil' / 'no_soil' columns are not used in PPI plotting any more.
 
 ## Centralized PPI helpers
 if (file.exists("ppi_helpers.R")) {
@@ -135,16 +121,14 @@ if (file.exists(MAPPING_CSV)) {
     map_df <- readr::read_csv(MAPPING_CSV, show_col_types = FALSE)
     veg_cols <- names(map_df)[tolower(names(map_df)) %in% c("vegetation", "veg", "class")]
     if (length(veg_cols) > 0) map_df$Veg <- as.character(map_df[[veg_cols[1]]])
-    map_df <- normalize_no_soil_col(map_df)
 
     if (!"location_id" %in% names(map_df) && all(c("lon", "lat") %in% names(map_df))) {
       map_df$location_id <- make_location_id(map_df$lon, map_df$lat)
     }
 
     if ("location_id" %in% names(map_df)) {
-      if ("no.soil" %in% names(map_df) && !"no soil" %in% names(map_df)) map_df$`no soil` <- map_df$`no.soil`
       if (!"Veg" %in% names(map_df)) map_df$Veg <- NA_character_
-      cat("Mapping CSV will NOT be joined into the main observations data; it will only be used for barren/no-soil summaries and soil DVI estimation.\n")
+      cat("Mapping CSV will NOT be joined into the main observations data; it will only be used for Veg mapping and summaries.\n")
       cat("DEBUG: Unique Veg types in mapping CSV:\n")
       print(table(map_df$Veg, useNA = "ifany"))
     } else {
