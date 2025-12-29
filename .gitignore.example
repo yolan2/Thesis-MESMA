@@ -27,6 +27,12 @@ training_visualizations/
 .png
 .csv
 .rds
+*.rda
+*.RDA
+*.log
+*.LOG
+*.pdf
+*.PDF
 .Ruserdata
 .Rbuildignore
 .Rproj
