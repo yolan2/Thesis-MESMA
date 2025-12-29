@@ -25,6 +25,6 @@ venv.*
 .Rhistory
 .bak
 .proj
-
+.png
 # Temporary MESMA results
 /temp_results/
