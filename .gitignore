@@ -11,6 +11,11 @@ venv.*
 # Local editor/IDE settings
 .idea/
 
+# Project folders
+path/
+scripts/
+training_visualizations/
+
 # R-specific
 .vscode/    # ignore VS Code workspace settings (keep this line to ignore the folder)
 .gemini/
