@@ -24,8 +24,8 @@ make_location_id <- function(lon, lat) {
   # Create a mask for non-finite values
   invalid_mask <- !is.finite(lon) | !is.finite(lat)
   
-  # Use vectorized sprintf
-  res <- sprintf("L_%0.6f_%0.6f", round(lon, 6), round(lat, 6))
+  # Use vectorized sprintf: L_lat_lon format
+  res <- sprintf("L_%0.6f_%0.6f", round(lat, 6), round(lon, 6))
   
   # Set invalid entries to NA
   res[invalid_mask] <- NA_character_
@@ -54,6 +54,7 @@ if (requireNamespace("MASS", quietly = TRUE)) library(MASS) # For lda
 
 options(warn = 1)  # print warnings as they occur for debugging
 options(future.progress = FALSE)  # disable progress bars from future package
+options(progressr.enable = FALSE) # disable progress bars from progressr package
 
 # Ensure core initialization helpers are available (defines setup_parallel_backend(), constants, etc.)
 if (!exists("setup_parallel_backend", mode = "function")) {
@@ -62,64 +63,20 @@ if (!exists("setup_parallel_backend", mode = "function")) {
   }
 }
 if (!exists("setup_parallel_backend", mode = "function")) {
-  # Provide a practical fallback: use the 'future' package if available to set up a
-  # parallel plan and return a cleanup function that restores the previous plan.
-  setup_parallel_backend <- function(workers = NULL) {
-    if (!requireNamespace("future", quietly = TRUE)) {
-      warning("setup_parallel_backend: 'future' package not available; parallel execution disabled.")
-      return(function() {})
-    }
-
-    # Capture current plan to allow restoration
-    old_plan <- future::plan()
-
-    # Determine the number of workers: respect MESMA_PARALLEL env var; otherwise use detectCores()-1
-    if (is.null(workers)) {
-      env <- Sys.getenv("MESMA_PARALLEL", "")
-      if (nzchar(env)) {
-        w <- suppressWarnings(as.integer(env))
-        if (is.na(w) || w <= 0) w <- max(1L, parallel::detectCores() - 1L)
-        workers <- w
-      } else {
-        workers <- max(1L, parallel::detectCores() - 1L)
-      }
-    }
-
-    if (is.null(workers) || workers <= 1L) {
-      cat("[PARALLEL] Parallel disabled (workers <= 1). Running sequentially.\n")
-      return(function() { invisible(future::plan(old_plan)) })
-    }
-
-    future::plan(future::multisession, workers = workers)
-    cat(sprintf("[PARALLEL] Set up 'future' multisession with %d workers\n", workers))
-
-    cleanup <- function() {
-      future::plan(old_plan)
-      cat("[PARALLEL] Restored previous plan\n")
-      invisible(NULL)
-    }
-    cleanup
-  }
-
-  # Notify user about fallback status
-  if (!requireNamespace("future", quietly = TRUE)) {
-    warning("setup_parallel_backend() not found after attempting to source 'init_mesma.R'; defined fallback but 'future' package is missing so parallel will remain disabled. Install 'future' for parallel support.")
-  } else {
-    cat("[NOTICE] setup_parallel_backend() not found; defined fallback that uses 'future' if available.\n")
-  }
+  stop("`setup_parallel_backend` function not found after attempting to source 'init_mesma.R'. Please ensure 'init_mesma.R' is present and defines this function.")
 }
 
 
 SKIP_PPI <- TRUE
 
-INPUT_CSV <- "C:\\Users\\yolan\\Downloads\\landsat_timeseries_vegetation_filtered (4)_fixed.csv"
+INPUT_CSV <- "C:\\Users\\yolan\\Downloads\\LS_S2_Harmonized_Timeseries.csv"
 INFERENCE_CSV <- "C:\\Users\\yolan\\OneDrive\\Documenten\\UGENT\\Master\\masterproef\\GIS\\landsat_lower_inference.csv"
 
 # AGENT: Restrict training to the most recent years for variant building.
-TRAIN_YEARS <- c(2023, 2024)  # Years to use for training (inclusive)
+TRAIN_YEARS <- 2024  # Years to use for training (inclusive)
 
 # Check for override from environment or pre-set variable
-if (!exists("PAENABLERALLEL_")) {
+if (!exists("PARALLEL_ENABLE")) {
   PARALLEL_ENABLE <- FALSE
 }
 
@@ -136,24 +93,27 @@ COMBO_PARALLEL_WORKERS <- max(1L, floor(PARALLEL_WORKERS/2))
 BATCH_PARALLEL_ENABLE <- TRUE  # Enable parallel batch processing
 BATCH_PARALLEL_WORKERS <- 3  # Number of batches to process in parallel
 
+# RMSE threshold factor for uncertainty estimation (keep models within this factor of best RMSE)
+RMSE_UNCERTAINTY_THRESHOLD_FACTOR <- 1.40
+
 # Memory monitoring utility function
 print_memory_usage <- function(label = "") {
-  if (label != "") label <- paste0(" [", label, "]")
-  mem_info <- gc(verbose = FALSE, full = FALSE)
-  used_mb <- sum(mem_info[, "used"])
-  max_mb <- sum(mem_info[, "(Mb)"])
-  cat(sprintf("Memory usage%s: %.1f MB used, %.1f MB max\n", label, used_mb, max_mb))
-  invisible(mem_info)
+  # if (label != "") label <- paste0(" [", label, "]")
+  # mem_info <- gc(verbose = FALSE, full = FALSE)
+  # used_mb <- sum(mem_info[, "used"])
+  # max_mb <- sum(mem_info[, "(Mb)"])
+  # cat(sprintf("Memory usage%s: %.1f MB used, %.1f MB max\n", label, used_mb, max_mb))
+  # invisible(mem_info)
 }
 
 ENABLE_DIAGNOSTICS <- TRUE
 MAX_VARIANTS_PER_VEG <- 10
 MIN_VARIANTS_PER_VEG <- 1
-MAX_COMBOS_FOR_FULL_SEARCH <- 5000
+MAX_COMBOS_FOR_FULL_SEARCH <- 6000
 
 MIN_ENDMEMBER_SAMPLES <- 5L
 
-ALLOWED_VEG <- c("populus", "tamarix", "phragmites")
+ALLOWED_VEG <- c("populus", "tamarix", "phragmites", "agriculture")
 
 OPTIMAL_INDICES <- c("WDVI", "WDVI_BY_SWIR1", "GVI", "NIRv", "PSRI", "MSAVI2", "NDMI", "PPI", "EVI", "NDTI", "SATVI", "CIG", "BSI", "NBR", "TCW", "TCB", "NDSI")
 # Indices to explicitly exclude from the MESMA fitter (do not use as features)
@@ -162,7 +122,7 @@ FITTER_EXCLUDE_INDICES <- c("PPI", "MSAVI2", "NIRv")
 # Outlier removal configuration: when TRUE, remove large per-location(/year) outliers
 ENABLE_OUTLIER_REMOVAL <- TRUE
 # Threshold in multiples of MAD; default 6 (conservative). Rows with |x - median| > THRESHOLD * MAD are removed.
-OUTLIER_MAD_THRESHOLD <- 6
+OUTLIER_MAD_THRESHOLD <- 3.5
 
 SKIP_INFERENCE <- FALSE
 
@@ -178,6 +138,7 @@ COMBO_SAFE_EXPAND_LIMIT <- 1e6    # fully expand combo grid up to this many comb
 COMBO_ABORT_LIMIT <- 5e7          # abort if combos exceed this hard limit
 
 BOOTSTRAP_B <- 100L              # Number of bootstrap iterations for location-based resampling
+MAX_INFERENCE_LOCATIONS <- 300L  # Maximum number of locations to use for inference (cap to reduce runtime)
 BOOTSTRAP_BLOCK_SIZE <- 5L       # Block size for Moving Block Bootstrap of residuals
 
 # Uncertainty handling
@@ -185,7 +146,7 @@ ENABLE_UNCERTAINTY <- TRUE
 DEBUG_UNCERTAINTY <- TRUE        # global debug flag for uncertainty diagnostics
 
 # Data quality thresholds
-MIN_OBS_PER_LOC_YEAR <- 1L
+MIN_OBS_PER_LOC_YEAR <- 3L
 MIN_UNIQUE_DOY_DEFAULT <- 5L
 MIN_UNIQUE_DOY_INFERENCE <- 1L
 MIN_INDEX_SD <- 0.05
@@ -203,7 +164,6 @@ GAM_GAMMA <- 1.0
 USE_INDICES_MIN <- 1L
 
 # Sample/cluster controls
-ENABLE_SAMPLE_BALANCING <- TRUE
 ENABLE_SOIL_PREPROCESS <- TRUE
 SOIL_PURE_THRESHOLD <- 0.95
 SOIL_MIN_SAMPLES <- 3L
@@ -223,7 +183,7 @@ BATCH_SIZE <- 6  # Default batch size for location-level processing (tunable)
 OUTPUT_XLSX <- NA
 # === PPI-BASED FRACTION ESTIMATION CONFIG ===
 PPI_ZERO_VEG_COVER <- 0.0  # PPI value assumed to correspond to 0% vegetation cover
-PPI_FULL_VEG_COVER <- 0.4  # PPI value assumed to correspond to 100% vegetation cover (top 95% median PPI)
+PPI_FULL_VEG_COVER <- 0.7  # PPI value assumed to correspond to 100% vegetation cover (top 95% median PPI)
 
 # === END GLOBAL CONFIG ===
 
@@ -300,6 +260,10 @@ normalize_band_names <- function(df, bands = RAW_BANDS) {
   }
   df
 }
+
+
+# Default SOIL_LINE_SLOPE if not yet defined
+if (!exists("SOIL_LINE_SLOPE")) SOIL_LINE_SLOPE <- 1.0
 
 compute_indices_from_bands <- function(df) {
   if (is.null(df) || nrow(df) == 0) return(df)
@@ -510,19 +474,7 @@ ENABLE_DIAGNOSTICS <- TRUE
 # See the "USER-TUNABLE PARAMETERS (centralized)" block for configuration.
 
 if (!file.exists(INPUT_CSV)) {
-  # Try plausible alternative filenames (previous versions)
-  alt_candidates <- c(
-    sub("\\(4\\)", "(3)", INPUT_CSV, fixed = TRUE),
-    sub("\\(4\\)", "(2)", INPUT_CSV, fixed = TRUE),
-    sub("landsat_timeseries_vegetation_filtered (4).csv", "landsat_timeseries_vegetation_filtered.csv", INPUT_CSV, fixed = TRUE)
-  )
-  alt_found <- alt_candidates[file.exists(alt_candidates)]
-  if (length(alt_found) > 0) {
-    INPUT_CSV <- alt_found[1]
-    cat(sprintf("[NOTICE] INPUT_CSV not found; using fallback: %s\n", INPUT_CSV))
-  } else {
-    stop(paste0("Required input CSV not found: ", INPUT_CSV, " (and no alternatives found)"))
-  }
+  stop(paste0("Required input CSV not found: ", INPUT_CSV))
 }
 raw_df <- tryCatch(
   {
@@ -563,7 +515,12 @@ if (TESTING_MODE) {
   cat(sprintf("Testing mode: subset to %d rows (50%% of original %d rows)\n", nrow(df), nrow(raw_df)))
 }
 # if ("PPI" %in% names(df)) df$PPI <- NULL
-if ("zenith.angle" %in% names(df)) df$zenith.angle <- NULL
+# Preserve zenith.angle if present (e.g. from metadata), otherwise allow recalculation
+if ("zenith.angle" %in% names(df)) {
+  cat("[NOTICE] Preserving existing 'zenith.angle' in input data.\n")
+} else {
+  df$zenith.angle <- NA_real_
+}
 
 df <- normalize_band_names(df)
 # If bands are present but indices are missing, compute indices from bands
@@ -664,13 +621,38 @@ remove_large_outliers <- function(df, candidates = NULL, mad_thresh = OUTLIER_MA
         finite_idx <- is.finite(colv) & is.finite(sub$doy)
         if (sum(finite_idx) < 5) next  # not enough for spline
         tryCatch({
-          # Fit spline
-          fit <- stats::smooth.spline(sub$doy[finite_idx], colv[finite_idx], df = min(5, sum(finite_idx)/2))
-          pred <- predict(fit, sub$doy[finite_idx])$y
-          residuals <- colv[finite_idx] - pred
+          # --- Iterative Spline Fitting for Robustness ---
+          # Pass 1: Initial fit to identify gross outliers
+          x <- sub$doy[finite_idx]
+          y <- colv[finite_idx]
+          
+          fit1 <- stats::smooth.spline(x, y, df = min(5, length(x)/2))
+          pred1 <- predict(fit1, x)$y
+          res1 <- y - pred1
+          mad1 <- stats::mad(res1, na.rm = TRUE)
+          
+          if (!is.finite(mad1) || mad1 <= 1e-6) stop("Invalid MAD in Pass 1")
+          
+          # Temporarily exclude gross outliers for the second pass (1.5x threshold)
+          keep_mask <- abs(res1 - stats::median(res1, na.rm = TRUE)) <= (mad_thresh * 1.5 * mad1)
+          
+          # Pass 2: Refit on cleaner data if we have enough points left
+          if (sum(keep_mask) >= 5) {
+            fit2 <- stats::smooth.spline(x[keep_mask], y[keep_mask], df = min(5, sum(keep_mask)/2))
+            # Predict against the refined trend for ALL points
+            pred_final <- predict(fit2, x)$y
+          } else {
+            # Fallback to first pass if too many points removed
+            pred_final <- pred1
+          }
+
+          # Final outlier detection against the robust trend
+          residuals <- y - pred_final
           med_res <- stats::median(residuals, na.rm = TRUE)
           mad_res <- stats::mad(residuals, na.rm = TRUE)
-          if (!is.finite(mad_res) || mad_res <= 0) next
+          
+          if (!is.finite(mad_res) || mad_res <= 0) stop("Invalid Final MAD")
+          
           # Flag outliers
           this_mask <- rep(FALSE, length(colv))
           this_mask[finite_idx] <- abs(residuals - med_res) > mad_thresh * mad_res
@@ -1040,8 +1022,8 @@ if ("NDSI" %in% names(df) && "NDDI" %in% names(df)) {
 
 # STEP 2: Calculate PPI on raw data, now that Veg column is available
 if (!"pheno_year" %in% names(df) && "date" %in% names(df)) df$pheno_year <- assign_pheno_year(as.Date(df$date))
-cat("Filtering training data to 1985-2025 (phenological years: March-February) before PPI baseline calculation...\n")
-  df <- df |> dplyr::filter(pheno_year >= 1985 & pheno_year <= 2025)
+cat("Filtering training data to 2024 (phenological years: March-February) before PPI baseline calculation...\n")
+  df <- df |> dplyr::filter(pheno_year >= 2024 & pheno_year <= 2024)
 if (nrow(df) == 0) cat("[NOTICE] Year filter removed all rows; PPI baseline calculation will proceed on empty data and likely be skipped.\n")
 if (exists("auto_add_ppi_columns")) {
   if (!"PPI" %in% names(df) || all(!is.finite(df$PPI))) {
@@ -1065,6 +1047,21 @@ if ("PPI" %in% names(df)) {
 norm_result <- normalize_mesma_data(df, lat_default = 40.2)
 df <- norm_result$df
 INDEX_SCALES <- norm_result$INDEX_SCALES
+
+# Ensure a clamped per-observation PPI normalization fraction is present for downstream use
+ppi_max <- if (exists("PPI_FULL_VEG_COVER")) get("PPI_FULL_VEG_COVER") else 0.4
+if (!"ppi_norm" %in% names(df)) df$ppi_norm <- NA_real_
+# Prefer backed-up raw values if available; otherwise fall back to 'PPI' with a warning
+if ("PPI_raw" %in% names(df) && any(is.finite(df$PPI_raw))) {
+  df$ppi_norm <- pmin(pmax(df$PPI_raw / ppi_max, 0), 1)
+  cat(sprintf("[PPI NORM] Created 'ppi_norm' from 'PPI_raw' and clamped to [0,1] using PPI_FULL_VEG_COVER=%.3f\n", ppi_max))
+} else if ("PPI" %in% names(df) && any(is.finite(df$PPI))) {
+  df$ppi_norm <- pmin(pmax(df$PPI / ppi_max, 0), 1)
+  warning("'PPI_raw' not found - computed 'ppi_norm' from 'PPI' (may be z-scored); values were clamped to [0,1]. Consider backing up raw PPI before normalization.")
+} else {
+  df$ppi_norm <- NA_real_
+  cat("[PPI NORM] No PPI or PPI_raw available to compute 'ppi_norm' (all NA)\n")
+}
 
 # Filter to only include selected vegetation types
 selected_vegs <- c("phragmites", "populus", "tamarix", "barren")
@@ -1119,9 +1116,60 @@ if (exists("TRAIN_YEARS") && !is.null(TRAIN_YEARS) && length(TRAIN_YEARS) > 0) {
   df_train <- df
 }
 cat(sprintf(
-  "Training dataset: %d rows from %d locations\n",
+  "Training dataset (Initial): %d rows from %d locations\n",
   nrow(df_train), length(unique(df_train$location_id))
 ))
+
+# --- STRATIFIED TRAIN/TEST SPLIT (80/20) ---
+if (nrow(df_train) > 0) {
+  cat("[SPLIT] Performing stratified 80/20 split based on location_id and Veg...\n")
+  set.seed(42)
+  
+  # Get unique location-Veg pairs. 
+  # Note: A location typically has one dominant veg type, but might vary. 
+  # We'll assign each location to its most frequent Veg type for stratification.
+  loc_veg_summary <- df_train %>%
+    dplyr::group_by(location_id, Veg) %>%
+    dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+    dplyr::arrange(location_id, dplyr::desc(n)) %>%
+    dplyr::group_by(location_id) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup()
+  
+  unique_vegs <- unique(loc_veg_summary$Veg)
+  test_locs_list <- vector("list", length(unique_vegs))
+  
+  for (i in seq_along(unique_vegs)) {
+    v <- unique_vegs[i]
+    v_locs <- loc_veg_summary$location_id[loc_veg_summary$Veg == v]
+    n_v <- length(v_locs)
+    n_test <- ceiling(n_v * 0.20)
+    
+    if (n_test > 0) {
+      selected <- sample(v_locs, n_test)
+      test_locs_list[[i]] <- data.frame(location_id = selected, Veg = v, stringsAsFactors = FALSE)
+    }
+  }
+  
+  test_locs_df <- do.call(rbind, test_locs_list)
+  
+  if (!is.null(test_locs_df) && nrow(test_locs_df) > 0) {
+    # Save validation locations
+    val_file <- file.path(OUT_DIR, "validation_locations.csv") # Assuming OUT_DIR is defined, or use "phenology_results/veg_mixture_fit"
+    # Ensure dir exists (OUT_DIR might be defined later, so safeguard)
+    if (!dir.exists(dirname(val_file))) dir.create(dirname(val_file), recursive = TRUE)
+    
+    write.csv(test_locs_df, val_file, row.names = FALSE)
+    cat(sprintf("[SPLIT] Saved %d validation locations to %s\n", nrow(test_locs_df), val_file))
+    
+    # Filter df_train to exclude test locations (Out-of-Bag)
+    df_train <- df_train[!df_train$location_id %in% test_locs_df$location_id, ]
+    cat(sprintf("[SPLIT] Filtered df_train: %d rows from %d locations (Training Set)\n", 
+                nrow(df_train), length(unique(df_train$location_id))))
+  } else {
+    cat("[SPLIT] Warning: No test locations selected.\n")
+  }
+}
 
 # Note: Snow/dust contamination filtering already applied early in the pipeline (before PPI baseline calculation)
 # See [EARLY FILTERING] section above for details
@@ -1207,8 +1255,8 @@ cleanup_memory <- function(verbose = TRUE, confirm = FALSE) {
   if (isTRUE(verbose)) cat(sprintf("[CLEANUP] Removing %d objects to free memory...\n", length(to_rm)))
   rm(list = to_rm, envir = .GlobalEnv)
   # Force garbage collection; call twice for robustness
-  gc(); gc()
-  if (isTRUE(verbose)) cat("[CLEANUP] Memory freed (gc called).\n")
+  # gc(); gc()
+  if (isTRUE(verbose)) cat("[CLEANUP] Memory freed.\n")
   invisible(to_rm)
 }
 
@@ -1622,7 +1670,7 @@ if (!"pheno_year" %in% names(df)) {
   }
 }
 
-df <- df |> filter(pheno_year >= 1985 & pheno_year <= 2025)
+df <- df |> filter(pheno_year >= 2024 & pheno_year <= 2024)
 
 if (!"Veg" %in% names(df)) df$Veg <- NA_character_
 
@@ -1650,6 +1698,13 @@ if (length(lon_candidates) > 0 && length(lat_candidates) > 0) {
 
 df$Veg <- tolower(df$Veg)
 
+# Merge vegetation categories: map 'herbs', 'halocnemum', 'salicornia' to 'phragmites', 'agri' to 'agriculture'
+df$Veg <- dplyr::case_when(
+  df$Veg %in% c("herbs", "halocnemum", "salicornia") ~ "phragmites",
+  df$Veg == "agri" ~ "agriculture",
+  TRUE ~ df$Veg
+)
+
 df_train$location_id <- as.character(df_train$location_id)
 df_train <- dplyr::left_join(df_train, gpts_map, by = "location_id", suffix = c("", ".geo"))
 if ("Veg.geo" %in% names(df_train)) {
@@ -1659,11 +1714,27 @@ if ("Veg.geo" %in% names(df_train)) {
 
 df_train$Veg <- tolower(df_train$Veg)
 
+# Merge vegetation categories: map 'herbs', 'halocnemum', 'salicornia' to 'phragmites', 'agri' to 'agriculture'
+df_train$Veg <- dplyr::case_when(
+  df_train$Veg %in% c("herbs", "halocnemum", "salicornia") ~ "phragmites",
+  df_train$Veg == "agri" ~ "agriculture",
+  TRUE ~ df_train$Veg
+)
+
 if (!"date" %in% names(df)) stop("Input CSV must contain a 'date' column")
 df$date <- as.Date(df$date)
 if (!"location_id" %in% names(df)) stop("Input CSV must contain a 'location_id' column")
 
 if ("Veg" %in% names(df)) df$Veg <- tolower(as.character(df$Veg))
+
+# Merge vegetation categories: map 'herbs', 'halocnemum', 'salicornia' to 'phragmites', 'agri' to 'agriculture'
+if ("Veg" %in% names(df)) {
+  df$Veg <- dplyr::case_when(
+    df$Veg %in% c("herbs", "halocnemum", "salicornia") ~ "phragmites",
+    df$Veg == "agri" ~ "agriculture",
+    TRUE ~ df$Veg
+  )
+}
 
 required_pkgs <- c("future", "future.apply")
 for (pkg in required_pkgs) {
@@ -2134,79 +2205,6 @@ vegs <- vegs[tolower(vegs) %in% c("phragmites", "populus", "tamarix", "barren")]
 # Filter lib_df to only include the selected vegetation types
 lib_df <- lib_df[tolower(lib_df$Veg) %in% tolower(vegs), ]
 
-if (ENABLE_SAMPLE_BALANCING) {
-  lib_df <- lib_df[!is.na(lib_df$Veg), ]
-  cat("Applying aggressive sample size balancing to training data...\n")
-  lib_df$doy_for_lib <- pheno_doy(lib_df$date)  # Use phenological DOY
-
-  veg_sample_sizes <- sapply(vegs, function(v) {
-    dveg <- lib_df[lib_df$Veg == v & is.finite(lib_df$doy_for_lib), , drop = FALSE]
-    nrow(dveg)
-  })
-
-  min_samples <- min(veg_sample_sizes)
-  max_samples <- max(veg_sample_sizes)
-  median_samples <- median(veg_sample_sizes)
-
-  cat(sprintf(
-    "Original sample sizes - Min: %.0f, Max: %.0f, Median: %.1f\n",
-    min_samples, max_samples, median_samples
-  ))
-
-  final_balancing_size <- max(veg_sample_sizes)
-  if (exists('TESTING_MAX_PER_VEG') && isTRUE(TESTING_MODE)) {
-    TESTING_MAX_PER_VEG <- max_samples
-    final_balancing_size <- min(as.integer(final_balancing_size), as.integer(TESTING_MAX_PER_VEG))
-  }
-
-  cat(sprintf("Final balancing size (maximum original sample size): %d\n", final_balancing_size))
-
-
-balanced_dfs <- list()
-for (v in vegs) {
-  dveg <- lib_df[lib_df$Veg == v & is.finite(lib_df$doy_for_lib), , drop = FALSE]
-  if (nrow(dveg) == 0) next
-  if (isTRUE(TESTING_MODE)) {
-    balanced_dfs[[v]] <- dveg
-  } else {
-    orig_n <- nrow(dveg)
-    target_for_class <- final_balancing_size
-
-    if (target_for_class > orig_n) {
-      augmented <- tryCatch(
-        {
-          augment_minority_class(dveg, target_for_class)
-        },
-        error = function(e) stop(sprintf("augment_minority_class failed for %s: %s", v, e$message))
-      )
-      balanced_dfs[[v]] <- augmented
-      cat(sprintf("Augmented %s from %d to %d samples\n", v, orig_n, nrow(augmented)))
-    } else {
-      if (orig_n > target_for_class) {
-        set.seed(123)
-        dveg <- dveg[sample(1:nrow(dveg), target_for_class), , drop = FALSE]
-        cat(sprintf("Downsampled %s from %d to %d samples\n", v, orig_n, target_for_class))
-      }
-      balanced_dfs[[v]] <- dveg
-      cat(sprintf("Using %s with %d samples\n", v, nrow(dveg)))
-    }
-  }
-}
-
-if (length(balanced_dfs) > 0) {
-  lib_df <- chunked_rbind(balanced_dfs, chunk_size = 50L)
-  if (is.matrix(lib_df)) {
-    lib_df <- as.data.frame(lib_df, stringsAsFactors = FALSE)
-  }
-  gc()
-  cat(sprintf(
-    "Training data balanced: %d total samples across %d vegetation types (exactly equal)\n",
-    nrow(lib_df), length(balanced_dfs)
-  ))
-}
-
-}  # end ENABLE_SAMPLE_BALANCING
-
 
 lib <- list()
 for (v in vegs) {
@@ -2306,7 +2304,6 @@ cat("Raw index library templates computed.\n")
 
 
 
-# Location-based bootstrap for PPI-normalized aggregation
 location_bootstrap_ppi <- function(all_coefs, df_tasks, B = BOOTSTRAP_B, seed = 123) {
   set.seed(seed)
   if (!requireNamespace("dplyr", quietly = TRUE)) {
@@ -2318,6 +2315,7 @@ location_bootstrap_ppi <- function(all_coefs, df_tasks, B = BOOTSTRAP_B, seed = 
   ppi_max <- if (exists("PPI_FULL_VEG_COVER")) get("PPI_FULL_VEG_COVER") else 0.4
   if (ppi_max <= 0) ppi_max <- 0.4
 
+  # Identify PPI column (prefer raw if available)
   ppi_col <- "PPI"
   if ("PPI_raw" %in% names(df_tasks) && any(!is.na(df_tasks$PPI_raw))) {
     ppi_col <- "PPI_raw"
@@ -2329,157 +2327,239 @@ location_bootstrap_ppi <- function(all_coefs, df_tasks, B = BOOTSTRAP_B, seed = 
     return(NULL)
   }
 
-  # Compute median PPI per location-year and normalize it
-  ppi_per_loc_year <- df_tasks |>
+  # Ensure temporal columns exist
+  if (!"month" %in% names(df_tasks)) {
+    if ("date" %in% names(df_tasks)) {
+      df_tasks$month <- as.integer(format(as.Date(df_tasks$date), "%m"))
+    } else {
+      df_tasks$month <- 1L 
+    }
+  }
+  if (!"doy" %in% names(df_tasks)) {
+    if ("date" %in% names(df_tasks)) {
+      df_tasks$doy <- as.numeric(format(as.Date(df_tasks$date), "%j"))
+    } else {
+      df_tasks$doy <- 150
+    }
+  }
+
+  # Helper: Return B bootstrapped medians from a vector
+  boot_median_vec <- function(x, n_boot) {
+    x <- x[is.finite(x)]
+    if (length(x) == 0) return(rep(NA_real_, n_boot))
+    if (length(x) < 3) return(rep(median(x), n_boot)) # Too few to bootstrap meaningfully
+    
+    # Fast vectorized bootstrap of median
+    replicate(n_boot, median(sample(x, length(x), replace = TRUE), na.rm = TRUE))
+  }
+
+  # --- STEP 1: Pre-calculate Detrended Summer PPI (Vectorized) ---
+  summer_df <- df_tasks |> 
+    dplyr::filter(month %in% 6:9, get(ppi_col) > 0)
+  
+  if (nrow(summer_df) > 50) {
+    tryCatch({
+      f <- as.formula(paste(ppi_col, "~ poly(doy, 3)"))
+      seasonal_model <- lm(f, data = summer_df)
+      summer_df$seasonal_trend <- predict(seasonal_model, newdata = summer_df)
+      global_seasonal_mean <- mean(summer_df$seasonal_trend, na.rm = TRUE)
+      summer_df$ppi_detrended <- summer_df[[ppi_col]] - (summer_df$seasonal_trend - global_seasonal_mean)
+      cat(sprintf("[PPI BOOTSTRAP] Computed detrended summer PPI (N=%d).\n", nrow(summer_df)))
+    }, error = function(e) {
+      cat(sprintf("[PPI BOOTSTRAP] Detrending failed: %s. Using raw PPI.\n", e$message))
+      summer_df$ppi_detrended <- summer_df[[ppi_col]]
+    })
+  } else {
+    summer_df$ppi_detrended <- summer_df[[ppi_col]]
+    cat("[PPI BOOTSTRAP] Insufficient summer data for detrending; using raw values.\n")
+  }
+
+  # --- STEP 2: Generate Bootstrap Replicates per Location-Year (SUMMER ONLY) ---
+  # We need a matrix: Rows = Location-Year ID, Cols = B replicates
+  # Strategy:
+  # 1. Summarize summer_df to get list of B replicates.
+  # 2. STRICTLY use summer data. No annual fallback.
+
+  # Summer Bootstrap
+  boot_combined <- summer_df |>
     dplyr::group_by(location_id, pheno_year) |>
     dplyr::summarize(
-      median_ppi = median(get(ppi_col), na.rm = TRUE),
+      ppi_boot_list = list(boot_median_vec(ppi_detrended, B)),
       .groups = "drop"
-    ) |>
-    dplyr::mutate(
-      # Normalize PPI to fraction [0, 1]
-      # Logic: PPI / PPI_MAX represents vegetation cover
-      # AGENT: Clamp to 1.0 to ensure fractions never exceed 100%
-      ppi_norm = pmin(pmax(median_ppi / ppi_max, 0), 1)
     )
 
-  merged <- dplyr::left_join(all_coefs, ppi_per_loc_year, by = c("location_id", "pheno_year"))
-  if (nrow(merged) == 0) return(NULL)
-
-  merged <- merged[!is.na(merged$ppi_norm), ]
+  # Expand list-columns into a matrix (or just lookup)
+  # We'll create a key -> index map and a large matrix
+  boot_combined$key <- paste(boot_combined$location_id, boot_combined$pheno_year, sep = "_")
   
-  # AGENT: Recalculate relative proportions of vegetation types to ensure we
-  # cleanly apply the new ppi_norm without double-scaling or inconsistencies.
-  # We filter out any 'Barren' rows that might exist in all_coefs.
-  merged_veg <- merged[!tolower(trimws(merged$Veg)) %in% c("barren"), ]
+  # Construct the matrix of PPI replicates
+  n_rows <- nrow(boot_combined)
+  ppi_boot_mat <- matrix(NA_real_, nrow = n_rows, ncol = B)
   
+  for (i in 1:n_rows) {
+    s_vec <- boot_combined$ppi_boot_list[[i]]
+    if (!is.null(s_vec) && !all(is.na(s_vec))) {
+      ppi_boot_mat[i, ] <- s_vec
+    }
+  }
+  
+  # Map (loc, yr) -> row index
+  # We attach the row index to the coefficient data
+  key_map <- setNames(seq_len(n_rows), boot_combined$key)
+  
+  # Prepare Coefficient Data
+  # Remove pre-existing Barren rows to avoid confusion (we calculate derived Barren)
+  merged_veg <- all_coefs[!tolower(trimws(all_coefs$Veg)) %in% c("barren"), ]
+  
+  # Create key for joining
+  merged_veg$key <- paste(merged_veg$location_id, merged_veg$pheno_year, sep = "_")
+  merged_veg$ppi_row_idx <- key_map[merged_veg$key]
+  
+  # Filter out rows with no PPI data
+  merged_veg <- merged_veg[!is.na(merged_veg$ppi_row_idx), ]
+  
+  # Calculate relative coefficients (fractions of vegetation)
   merged_veg <- merged_veg |>
     dplyr::group_by(location_id, pheno_year) |>
     dplyr::mutate(
-      sum_coef = sum(coef, na.rm = TRUE),
-      # If MESMA found 0 vegetation (sum_coef=0), relative fractions are 0
-      rel_coef = ifelse(sum_coef > 1e-6, coef / sum_coef, 0)
+      sum_veg_coef = sum(coef[tolower(Veg) != "barren"], na.rm = TRUE),
+      rel_coef = ifelse(sum_veg_coef > 1e-6, coef / sum_veg_coef, 0)
     ) |>
     dplyr::ungroup()
 
-  veg_types <- unique(merged_veg$Veg)
-  years <- sort(unique(merged$pheno_year[!is.na(merged$pheno_year)]))
-  locations <- unique(merged$location_id)
+  veg_types <- unique(merged_veg$Veg[tolower(merged_veg$Veg) != "barren"])
+  years <- sort(unique(merged_veg$pheno_year[!is.na(merged_veg$pheno_year)]))
+  locations <- unique(merged_veg$location_id)
   n_locs <- length(locations)
+  
+  # Pre-calculate unique loc-year list for Barren calculation
+  # Each unique loc-year needs a row index into ppi_boot_mat
+  unique_loc_years <- merged_veg |> 
+    dplyr::distinct(location_id, pheno_year, ppi_row_idx)
 
   results_list <- list()
+  
+  cat(sprintf("[PPI BOOTSTRAP] Running %d bootstrap iterations with per-location PPI uncertainty...\n", B))
 
-  # 1. Process Vegetation Classes (relative fraction * PPI cover)
-  for (veg in veg_types) {
-    veg_data <- merged_veg[merged_veg$Veg == veg, ]
-    if (nrow(veg_data) == 0) next
-
-    boot_means <- matrix(NA_real_, nrow = B, ncol = length(years))
-    colnames(boot_means) <- as.character(years)
-
-    for (b in seq_len(B)) {
-      boot_locs <- sample(locations, n_locs, replace = TRUE)
-      boot_data <- veg_data[veg_data$location_id %in% boot_locs, ]
-
-      for (i in seq_along(years)) {
-        yr <- years[i]
-        yr_data <- boot_data[boot_data$pheno_year == yr, ]
-        if (nrow(yr_data) > 0) {
-          # Value = Relative_Fraction * Total_Veg_Cover
-          # This ensures we respect the new ppi_norm (clamped to 1) 
-          vals <- yr_data$rel_coef * yr_data$ppi_norm
-          # AGENT: Calculate MEAN coverage across the bootstrap sample
-          boot_means[b, i] <- sum(vals, na.rm = TRUE) / n_locs
-        } else {
-          boot_means[b, i] <- 0
-        }
-      }
-    }
-
-    boot_result <- data.frame(
-      year = years,
-      Veg = veg,
-      n_locations = sapply(years, function(y) sum(veg_data$pheno_year == y)),
-      global_coef = apply(boot_means, 2, median, na.rm = TRUE),
-      se = apply(boot_means, 2, sd, na.rm = TRUE),
-      coef_025 = apply(boot_means, 2, quantile, 0.025, na.rm = TRUE),
-      coef_975 = apply(boot_means, 2, quantile, 0.975, na.rm = TRUE),
-      method = "location_bootstrap_ppi"
-    )
-
-    results_list[[veg]] <- boot_result
+  # We need to accumulate results. Instead of matrix of means, we can just run the loop B times
+  # and store the global mean for that iteration.
+  
+  # Initialize storage for global aggregates per veg/year
+  # veg_boot_res[[veg]][[year]] -> vector of B means
+  veg_boot_res <- list()
+  for (v in c(veg_types, "Barren")) {
+    veg_boot_res[[v]] <- matrix(NA_real_, nrow = B, ncol = length(years))
+    colnames(veg_boot_res[[v]]) <- as.character(years)
   }
 
-  # 2. Process Derived Barren Class (1 - PPI_norm)
-  # We use the unique location-years available in 'merged' to ensure consistency
-  unique_loc_years <- merged |> 
-    dplyr::distinct(location_id, pheno_year, ppi_norm)
-
-  if (nrow(unique_loc_years) > 0) {
-    boot_means_barren <- matrix(NA_real_, nrow = B, ncol = length(years))
-    colnames(boot_means_barren) <- as.character(years)
-
-    for (b in seq_len(B)) {
-      boot_locs <- sample(locations, n_locs, replace = TRUE)
-      # Efficient way to expand bootstrapped locations:
-      boot_idx <- unlist(lapply(boot_locs, function(loc) which(unique_loc_years$location_id == loc)))
-      boot_data_barren <- unique_loc_years[boot_idx, ]
+  for (b in seq_len(B)) {
+    # 1. Sample Locations (Spatial Bootstrap)
+    boot_locs <- sample(locations, n_locs, replace = TRUE)
+    
+    # 2. Get the PPI realization for this bootstrap iteration 'b'
+    # ppi_realization is a vector indexed by ppi_row_idx
+    # We take the b-th column of the pre-computed matrix
+    # And CLAMP it to [0, 1] after normalizing by ppi_max
+    raw_ppi_vals <- ppi_boot_mat[, b]
+    norm_ppi_vals <- pmin(pmax(raw_ppi_vals / ppi_max, 0), 1)
+    
+    # --- PROCESS VEGETATION ---
+    # Filter data to selected locations (expanding if sampled multiple times)
+    # Efficient join:
+    # count how many times each loc was sampled
+    loc_counts <- table(boot_locs)
+    sampled_locs <- names(loc_counts)
+    
+    # Subset data to relevant locations
+    sub_veg <- merged_veg[merged_veg$location_id %in% sampled_locs, ]
+    
+    if (nrow(sub_veg) > 0) {
+      # Attach the specific PPI value for this iteration
+      # Using the row index we mapped earlier
+      sub_veg$current_ppi_norm <- norm_ppi_vals[sub_veg$ppi_row_idx]
       
-      for (i in seq_along(years)) {
-        yr <- years[i]
-        yr_data <- boot_data_barren[boot_data_barren$pheno_year == yr, ]
-        if (nrow(yr_data) > 0) {
-          # Barren Fraction = 1 - Vegetation_Cover
-          vals <- 1.0 - yr_data$ppi_norm
-          # AGENT: Calculate MEAN barren fraction across the bootstrap sample
-          boot_means_barren[b, i] <- sum(vals, na.rm = TRUE) / n_locs
-        } else {
-          boot_means_barren[b, i] <- 0 # If no locations for this year in bootstrap, fraction is 0?
-          # Actually if no data for year, it should be NA? 
-          # But here we sample locations. Some years might be missing for some locations.
-          # We divide by n_locs (total locations sampled). 
-          # If a location has no data for year Y, it contributes 0? 
-          # Or should we divide by n_locs_with_data_for_year?
-          # Standard practice: average over all locations. Missing data = 0 coverage? 
-          # No, missing data = unknown.
-          # Let's align with location_bootstrap_aggregate: it divides by n_obs (number of available observations).
+      # Calculate absolute cover = relative_fraction * ppi_cover
+      sub_veg$abs_cover <- sub_veg$rel_coef * sub_veg$current_ppi_norm
+      
+      # Aggregate by Year and Veg
+      # We need to weight by the number of times the location was sampled (loc_counts)
+      # Or simply replicate the rows. Replicating rows is cleaner for logic but slower.
+      # Weighted aggregation:
+      sub_veg$weight <- as.integer(loc_counts[sub_veg$location_id])
+      
+      # Global Mean per Year/Veg = Sum(abs_cover * weight) / Total_Locations
+      # Total_Locations = n_locs (since we sampled n_locs with replace)
+      
+      agg_veg <- sub_veg |>
+        dplyr::group_by(pheno_year, Veg) |>
+        dplyr::summarize(
+          total_cover = sum(abs_cover * weight, na.rm = TRUE),
+          .groups = "drop"
+        )
+      
+      # Fill results matrix
+      for (i in 1:nrow(agg_veg)) {
+        v <- agg_veg$Veg[i]
+        y <- as.character(agg_veg$pheno_year[i])
+        if (v %in% veg_types && y %in% colnames(veg_boot_res[[v]])) {
+          veg_boot_res[[v]][b, y] <- agg_veg$total_cover[i] / n_locs
         }
       }
     }
     
-    # Correction: Use n_obs per year for denominator to handle missing years correctly
-    # Re-running the loop with proper denominator
-    for (b in seq_len(B)) {
-      boot_locs <- sample(locations, n_locs, replace = TRUE)
-      boot_idx <- unlist(lapply(boot_locs, function(loc) which(unique_loc_years$location_id == loc)))
-      boot_data_barren <- unique_loc_years[boot_idx, ]
+    # --- PROCESS BARREN ---
+    # Barren Fraction = 1 - current_ppi_norm
+    # Use unique_loc_years
+    sub_barren <- unique_loc_years[unique_loc_years$location_id %in% sampled_locs, ]
+    
+    if (nrow(sub_barren) > 0) {
+      sub_barren$current_ppi_norm <- norm_ppi_vals[sub_barren$ppi_row_idx]
+      sub_barren$barren_frac <- 1.0 - sub_barren$current_ppi_norm
+      sub_barren$weight <- as.integer(loc_counts[sub_barren$location_id])
       
-      for (i in seq_along(years)) {
-        yr <- years[i]
-        yr_data <- boot_data_barren[boot_data_barren$pheno_year == yr, ]
-        n_obs_yr <- nrow(yr_data)
-        if (n_obs_yr > 0) {
-          vals <- 1.0 - yr_data$ppi_norm
-          boot_means_barren[b, i] <- sum(vals, na.rm = TRUE) / n_obs_yr
-        } else {
-          boot_means_barren[b, i] <- NA 
+      agg_barren <- sub_barren |>
+        dplyr::group_by(pheno_year) |>
+        dplyr::summarize(
+          total_barren = sum(barren_frac * weight, na.rm = TRUE),
+          # Use sum of weights for denominator in case some years are missing in some locations
+          n_obs_year = sum(weight, na.rm = TRUE),
+          .groups = "drop"
+        )
+        
+      for (i in 1:nrow(agg_barren)) {
+        y <- as.character(agg_barren$pheno_year[i])
+        if (y %in% colnames(veg_boot_res[["Barren"]])) {
+          # Use n_obs_year as denominator (average of available observations)
+          # consistent with previous logic
+          veg_boot_res[["Barren"]][b, y] <- agg_barren$total_barren[i] / agg_barren$n_obs_year[i]
         }
       }
     }
+  } # End Bootstrap Loop
 
-    results_list[["Barren"]] <- data.frame(
-      year = years,
-      Veg = "Barren",
-      n_locations = sapply(years, function(y) sum(unique_loc_years$pheno_year == y)),
-      global_coef = apply(boot_means_barren, 2, median, na.rm = TRUE),
-      se = apply(boot_means_barren, 2, sd, na.rm = TRUE),
-      coef_025 = apply(boot_means_barren, 2, quantile, 0.025, na.rm = TRUE),
-      coef_975 = apply(boot_means_barren, 2, quantile, 0.975, na.rm = TRUE),
-      method = "location_bootstrap_ppi"
+  # Compile Final Results
+  final_results <- list()
+  for (v in names(veg_boot_res)) {
+    mat <- veg_boot_res[[v]]
+    # Handle columns with all NAs (years with no data)
+    
+    df_res <- data.frame(
+      year = as.integer(colnames(mat)),
+      Veg = v,
+      global_coef = apply(mat, 2, median, na.rm = TRUE),
+      se = apply(mat, 2, sd, na.rm = TRUE),
+      coef_025 = apply(mat, 2, quantile, 0.025, na.rm = TRUE),
+      coef_975 = apply(mat, 2, quantile, 0.975, na.rm = TRUE),
+      method = "location_bootstrap_ppi_uncertainty"
     )
+    # Add n_locations count (approximate based on original data)
+    n_locs_per_year <- sapply(years, function(y) sum(unique_loc_years$pheno_year == y))
+    df_res$n_locations <- n_locs_per_year[match(df_res$year, years)]
+    
+    final_results[[v]] <- df_res
   }
 
-  dplyr::bind_rows(results_list)
+  dplyr::bind_rows(final_results)
 }
 
 # Location-based bootstrap for global aggregation
@@ -2515,13 +2595,6 @@ location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123)
     # Use median of yearly SDs as the "typical spatial variability" for this class
     pooled_sd <- median(sd_by_year, na.rm = TRUE)
     
-    # Fallback 1: If no years have >=3 points, use global SD
-    if (is.na(pooled_sd) || pooled_sd == 0) {
-      pooled_sd <- sd(veg_data$coef, na.rm = TRUE)
-    }
-    # Fallback 2: If strictly 1 point globally, assume a conservative default (e.g. 10%)
-    if (is.na(pooled_sd) || pooled_sd == 0) pooled_sd <- 0.1 
-    
     cat(sprintf("[BOOTSTRAP] Veg '%s': Pooled Spatial SD = %.4f (used for N < 8)\n", veg, pooled_sd))
     
     boot_means <- matrix(NA_real_, nrow = B, ncol = length(years))
@@ -2537,14 +2610,48 @@ location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123)
       # Estimate spatial autocorrelation rho from data
       rho_est <- 0.5  # default
       if (n_obs >= 3) {
-        parts <- strsplit(yr_data$location_id, "_")
-        lon <- as.numeric(sapply(parts, `[`, 1))
-        lat <- as.numeric(sapply(parts, `[`, 2))
-        ord <- order(lat, lon)
-        coef_sorted <- yr_data$coef[ord]
-        acf_res <- acf(coef_sorted, lag.max = 1, plot = FALSE, na.action = na.pass)
-        rho_est <- Re(acf_res$acf[2])  # Take real part in case of complex
-        if (is.na(rho_est) || rho_est < 0) rho_est <- 0
+        # Check for pre-existing coordinates
+        if (all(c("lat", "lon") %in% names(yr_data))) {
+          lat <- yr_data$lat
+          lon <- yr_data$lon
+        } else if (all(c("latitude", "longitude") %in% names(yr_data))) {
+          lat <- yr_data$latitude
+          lon <- yr_data$longitude
+        } else {
+          # Fallback to parsing location_id
+          parts <- strsplit(as.character(yr_data$location_id), "_")
+          lon_str <- sapply(parts, function(x) if (length(x) >= 2) x[length(x)-1] else NA_character_)
+          lat_str <- sapply(parts, function(x) if (length(x) >= 1) x[length(x)] else NA_character_)
+          lon <- suppressWarnings(as.numeric(lon_str))
+          lat <- suppressWarnings(as.numeric(lat_str))
+        }
+
+        # If we have NAs, try to fill them from gpts_map global if available
+        if ((any(is.na(lon)) || any(is.na(lat))) && exists("gpts_map", envir = globalenv())) {
+           gpts <- get("gpts_map", envir = globalenv())
+           if (all(c("location_id", "lat", "lon") %in% names(gpts))) {
+             # Match missing
+             missing_idx <- which(is.na(lon) | is.na(lat))
+             m_ids <- as.character(yr_data$location_id[missing_idx])
+             match_idx <- match(m_ids, as.character(gpts$location_id))
+             
+             lon[missing_idx] <- ifelse(is.na(match_idx), lon[missing_idx], gpts$lon[match_idx])
+             lat[missing_idx] <- ifelse(is.na(match_idx), lat[missing_idx], gpts$lat[match_idx])
+           }
+        }
+
+        if (all(is.na(lon)) || all(is.na(lat))) {
+          # If no coordinates available, assume no spatial info -> rho=0
+          rho_est <- 0
+          # cat(sprintf("[DEBUG] No coords for year %s veg %s; assuming rho=0\n", yr, veg))
+        } else {
+          # Use whatever coords we have (NAs sort to end)
+          ord <- order(lat, lon, na.last = TRUE)
+          coef_sorted <- yr_data$coef[ord]
+          acf_res <- acf(coef_sorted, lag.max = 1, plot = FALSE, na.action = na.pass)
+          rho_est <- Re(acf_res$acf[2])
+          if (is.na(rho_est) || rho_est < 0) rho_est <- 0
+        }
       }
       rho_vec[i] <- rho_est
       
@@ -2627,6 +2734,17 @@ location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123)
       rho = rho_vec,
       method = "robust_location_bootstrap"
     )
+
+    # Print summary of spatial autocorrelation (rho) for diagnostics
+    if (all(is.na(rho_vec))) {
+      cat(sprintf("[BOOTSTRAP] Veg '%s': spatial autocorrelation rho could not be estimated (all NA across years)\n", veg))
+    } else {
+      rho_mean <- mean(rho_vec, na.rm = TRUE)
+      rho_med <- median(rho_vec, na.rm = TRUE)
+      rho_min <- min(rho_vec, na.rm = TRUE)
+      rho_max <- max(rho_vec, na.rm = TRUE)
+      cat(sprintf("[BOOTSTRAP] Veg '%s': spatial autocorrelation rho across years — mean=%.3f, median=%.3f, min=%.3f, max=%.3f\n", veg, rho_mean, rho_med, rho_min, rho_max))
+    }
     
     # Correct SE for spatial autocorrelation using estimated rho
     # Effective variance increases by factor (1 + 2*rho) for correlated samples
@@ -2647,6 +2765,9 @@ location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123)
 
     boot_result$coef_025 <- pmax(0, boot_result$coef_025)
     boot_result$coef_975 <- pmin(1, boot_result$coef_975)
+    
+    # Clamp the median to prevent negative coverages
+    boot_result$global_coef <- pmax(0, boot_result$global_coef)
     
     results_list[[veg]] <- boot_result
   }
@@ -2718,6 +2839,11 @@ load_and_prepare_inference_data <- function() {
         if ("location_id" %in% names(df_inf)) {
           cat(sprintf("Found %d unique inference location IDs.\n", length(unique(df_inf$location_id))))
           df_inf$location_id_orig <- as.character(df_inf$location_id)
+          # Add Veg from gpts_map if available
+          if (exists("gpts_map") && "Veg" %in% names(gpts_map)) {
+            df_inf <- df_inf |> left_join(gpts_map |> select(location_id, Veg), by = "location_id")
+            cat(sprintf("[NOTICE] Added Veg column to inference data from gpts_map.\n"))
+          }
         } else {
           cat("WARNING: 'location_id' column missing from inference file.\n")
         }
@@ -2791,30 +2917,7 @@ load_and_prepare_inference_data <- function() {
         cat("[PPI DEBUG] Attempting to auto-add PPI to inference data.\n")
         cat(sprintf("[PPI DEBUG] GLOBAL_TRAINING_DVI_SOIL (guaranteed) is: %.6f\n", dvi_soil_arg))
         
-        # Secondary fallback: Calculate from raw_templates.rds if metadata failed
-        if (!exists("GLOBAL_TRAINING_DVI_SOIL", envir = globalenv()) && !is.null(cd) && file.exists(file.path(cd, "raw_templates.rds"))) {
-           tryCatch({
-             raw_tpl <- readRDS(file.path(cd, "raw_templates.rds"))
-             if (!is.null(raw_tpl[["barren"]])) {
-                barren_raw <- raw_tpl[["barren"]]
-                # extracted raw templates usually have 'nir' and 'red' columns
-                dvi_vals <- NULL
-                if (is.data.frame(barren_raw) || is.matrix(barren_raw)) {
-                   if ("DVI" %in% colnames(barren_raw)) {
-                      dvi_vals <- barren_raw[, "DVI"]
-                   } else if ("nir" %in% colnames(barren_raw) && "red" %in% colnames(barren_raw)) {
-                      dvi_vals <- barren_raw[, "nir"] - barren_raw[, "red"]
-                   }
-                }
-                
-                if (!is.null(dvi_vals) && length(dvi_vals) > 0) {
-                   dvi_soil_est <- median(dvi_vals, na.rm=TRUE)
-                   assign("GLOBAL_TRAINING_DVI_SOIL", dvi_soil_est, envir = globalenv())
-                   cat(sprintf("[PPI] Computed fallback GLOBAL_TRAINING_DVI_SOIL=%.6f from cached raw 'barren' templates\n", dvi_soil_est))
-                }
-             }
-           }, error = function(e) {})
-        }
+
       }
 
       # If PPI not in df_inf, try to add it
@@ -2900,15 +3003,23 @@ load_and_prepare_inference_data <- function() {
         df_inf <- inf_norm_result$df 
       }
 
-      # Do NOT restrict inference dataset by year - use all available years from the inference input
-      cat("[NOTICE] Not applying year-based filtering to inference dataset (using all years present in the input)\n")
-      for (col in avail) { if (col %in% names(df_inf)) df_inf[[col]] <- as.numeric(df_inf[[col]]) }
+      # Create a clamped per-observation PPI normalization fraction for inference
+      ppi_max_inf <- if (exists("PPI_FULL_VEG_COVER")) get("PPI_FULL_VEG_COVER") else 0.4
+      if (!"ppi_norm" %in% names(df_inf)) df_inf$ppi_norm <- NA_real_
+      if ("PPI_raw" %in% names(df_inf) && any(is.finite(df_inf$PPI_raw))) {
+        df_inf$ppi_norm <- pmin(pmax(df_inf$PPI_raw / ppi_max_inf, 0), 1)
+        cat(sprintf("[PPI NORM] Inference: created 'ppi_norm' from 'PPI_raw' and clamped to [0,1] using PPI_FULL_VEG_COVER=%.3f\n", ppi_max_inf))
+      } else if ("PPI" %in% names(df_inf) && any(is.finite(df_inf$PPI))) {
+        df_inf$ppi_norm <- pmin(pmax(df_inf$PPI / ppi_max_inf, 0), 1)
+        warning("Inference: 'PPI_raw' not found - computed 'ppi_norm' from 'PPI' (may be z-scored); values were clamped to [0,1]. Consider backing up raw PPI before normalization.")
+      } else {
+        df_inf$ppi_norm <- NA_real_
+        cat("[PPI NORM] Inference: No PPI or PPI_raw available to compute 'ppi_norm' (all NA)\n")
+      }
 
       assign("df_tasks_inference", df_inf, envir = globalenv())
-      cat(sprintf("Created separate inference task list with %d rows from %d locations.\n", nrow(df_tasks_inference), length(unique(df_tasks_inference$location_id))))
 
-      if (!"pheno_year" %in% names(df_tasks_inference) && "date" %in% names(df_tasks_inference)) assign("df_tasks_inference", within(df_tasks_inference, pheno_year <- assign_pheno_year(date)), envir = globalenv())
-      n_infer_loc_years <- nrow(unique(get("df_tasks_inference", envir = globalenv())[c("location_id", "pheno_year")] ))
+      n_infer_loc_years <- nrow(unique(df_inf[c("location_id", "pheno_year")] ))
       if (exists("df_train") && !is.null(df_train) && nrow(df_train) > 0) { if (!"pheno_year" %in% names(df_train) && "date" %in% names(df_train)) df_train$pheno_year <- assign_pheno_year(df_train$date); n_train_loc_years <- nrow(unique(df_train[c("location_id", "pheno_year")])) } else { n_train_loc_years <- 0 }
       cat(sprintf("(NOTICE) Inference dataset location-years: %d\n", n_infer_loc_years))
       cat(sprintf("(NOTICE) Training dataset location-years: %d\n", n_train_loc_years))
@@ -2968,6 +3079,11 @@ load_and_prepare_inference_data <- function() {
     if (is.null(res)) return(list(w = rep(1 / ncol(E_fit), ncol(E_fit)), rmse = Inf, residuals = rep(NA_real_, length(y_fit))))
 
     w <- res$x
+    if (sum(w) > 0) w <- w / sum(w)
+
+    # Enforce minimum fraction of 10% for vegetation types
+    min_frac <- 0.1
+    w[w < min_frac] <- 0
     if (sum(w) > 0) w <- w / sum(w)
 
     pred <- as.numeric(E_fit %*% w)
@@ -3445,13 +3561,18 @@ if ("pheno_year" %in% names(test_dly)) {
     sorted_candidates <- candidate_results[order(sapply(candidate_results, function(x) x$rmse))]
     
     # Filter to keep "low RMSE" models for uncertainty estimation
-    # Strategy: Keep models within 10% of the best RMSE, or at least top 50 (to ensure some variance is captured if all are close)
-    rmse_threshold <- best_rmse * 1.10
-    top_models <- Filter(function(x) x$rmse <= rmse_threshold, sorted_candidates)
+    # Strategy: threshold derived from the data distribution (Min + 2 * (Q25 - Min))
+    # This adapts to the flatness of the objective function near the minimum, keeping models
+    # that are statistically comparable to the best fit within the observed spread.
+    all_rmses <- sapply(sorted_candidates, function(x) x$rmse)
+    q25 <- quantile(all_rmses, 0.25, na.rm = TRUE)
+    spread_metric <- q25 - best_rmse
     
-    if (length(top_models) < 50) {
-       top_models <- head(sorted_candidates, 50)
-    }
+
+    
+    rmse_threshold <- best_rmse + (2.0 * spread_metric)
+    
+    top_models <- Filter(function(x) x$rmse <= rmse_threshold, sorted_candidates)
 
     return(list(w = best_result$w, rmse = best_rmse, ids = best_result$ids, residuals = best_result$residuals, top_models = top_models))
   }
@@ -3801,7 +3922,9 @@ if ("pheno_year" %in% names(test_dly)) {
         }
         
         accs <- c()
-        for(vc in valid_classes) if(total_by_class[[vc]] > 0) accs <- c(accs, correct_by_class[[vc]]/total_by_class[[vc]])
+        # Evaluate optimization metric based only on vegetation discrimination (excluding barren class performance)
+        veg_classes_only <- setdiff(valid_classes, "barren")
+        for(vc in veg_classes_only) if(total_by_class[[vc]] > 0) accs <- c(accs, correct_by_class[[vc]]/total_by_class[[vc]])
         macro_acc <- if(length(accs)>0) mean(accs) else 0
         
         if (macro_acc > best_score) {
@@ -4146,6 +4269,12 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
     loc <- as.character(task_data$location_id[1])
     yr <- as.integer(task_data$pheno_year[1])
 
+    # Extract lat/lon if available
+    lat_val <- NA_real_
+    lon_val <- NA_real_
+    if ("lat" %in% names(task_data)) lat_val <- as.numeric(task_data$lat[1]) else if ("latitude" %in% names(task_data)) lat_val <- as.numeric(task_data$latitude[1])
+    if ("lon" %in% names(task_data)) lon_val <- as.numeric(task_data$lon[1]) else if ("longitude" %in% names(task_data)) lon_val <- as.numeric(task_data$longitude[1])
+
     # Use single-stage parameters (two-stage processing removed)
     PARAMS <- SINGLE_STAGE_PARAMS
     raw_mat <- build_pentad_matrix(task_data, PARAMS$indices)
@@ -4308,6 +4437,8 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
       coef_df <- data.frame(
         location_id = loc,
         pheno_year = yr,
+        lat = lat_val,
+        lon = lon_val,
         Veg = sapply(strsplit(chosen_ids, "_v"), `[`, 1),
         variant_id = chosen_ids,
         coef = coefs,
@@ -4472,13 +4603,15 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
         barren_row_df[] <- NA 
         barren_row_df$location_id <- loc
         barren_row_df$pheno_year <- yr
+        barren_row_df$lat <- lat_val
+        barren_row_df$lon <- lon_val
         barren_row_df$Veg <- "barren"
         barren_row_df$variant_id <- "barren_ppi"
         barren_row_df$coef <- barren_fraction
         coef_df <- rbind(coef_df, barren_row_df)
       } else {
         coef_df <- data.frame(
-           location_id = loc, pheno_year = yr, Veg = "barren", 
+           location_id = loc, pheno_year = yr, lat = lat_val, lon = lon_val, Veg = "barren", 
            variant_id = "barren_ppi", coef = barren_fraction, 
            stringsAsFactors = FALSE
         )
@@ -5106,6 +5239,15 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
 
   bootstrap_trend_ci <- function(all_coefs, B = 200, seed = 123) {
   set.seed(seed)
+  cat(sprintf("[DEBUG] bootstrap_trend_ci called with %d rows\n", nrow(all_coefs)))
+  if ("coef_sd" %in% names(all_coefs)) {
+      sd_vals <- all_coefs$coef_sd
+      cat(sprintf("[DEBUG] coef_sd stats: Mean=%.6f, Max=%.6f, N_NA=%d\n", 
+                  mean(sd_vals, na.rm=TRUE), max(sd_vals, na.rm=TRUE), sum(is.na(sd_vals))))
+  } else {
+      cat("[DEBUG] coef_sd column NOT found in all_coefs\n")
+  }
+
   if (!requireNamespace("lme4", quietly = TRUE)) {
     warning("lme4 package not found, trend CI calculation will be skipped.")
     return(NULL)
@@ -5136,7 +5278,7 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
       })
       boot_data <- do.call(rbind, boot_data_list)
       model <- tryCatch({
-        lme4::lmer(coef ~ pheno_year + (1|boot_id), data = boot_data)
+        lme4::lmer(coef ~ pheno_year + (1|boot_id), data = boot_data, control = lme4::lmerControl(check.conv.singular = "ignore"))
       }, error = function(e) { NULL })
       if (is.null(model)) {
         return(NA_real_)
@@ -5297,10 +5439,11 @@ flush.console()
 
     # Aggressive memory cleanup after each batch
     rm(batch_df, batch_location_list, batch_results)
-    gc(verbose = FALSE, full = TRUE)
+    # gc(verbose = FALSE, full = TRUE)
 
-    cat(sprintf("  [Batch %d/%d complete]\n", i, n_batches))
+    cat(sprintf("\r  [Batch %d/%d complete]  ", i, n_batches))
   }
+  cat("\n")
 
   end_time <- Sys.time()
   processing_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
@@ -5316,6 +5459,28 @@ flush.console()
   all_coefs <- do.call(rbind, lapply(training_results_list, function(r) {
     if (!is.null(r$coef_df)) r$coef_df else NULL
   }))
+
+  # Defensive: ensure certain columns are numeric (avoid coercion warnings later)
+  if (!is.null(all_coefs) && nrow(all_coefs) > 0) {
+    num_cols <- c("coef", "coef_sd", "coef_025", "coef_975", "pheno_year")
+    for (nc in num_cols) {
+      if (nc %in% names(all_coefs)) {
+        if (!is.numeric(all_coefs[[nc]])) {
+          before_na <- sum(is.na(all_coefs[[nc]]))
+          all_coefs[[nc]] <- suppressWarnings(as.numeric(as.character(all_coefs[[nc]])))
+          after_na <- sum(is.na(all_coefs[[nc]]))
+          if (after_na > before_na) {
+            warning(sprintf("Coerced column '%s' to numeric; NAs increased by %d", nc, after_na - before_na))
+          }
+        }
+      }
+    }
+  }
+
+  if (!is.null(all_coefs) && nrow(all_coefs) > 0) {
+      cat(sprintf("Saving training results to: %s\n", file.path(OUT_DIR, "training_results.csv")))
+      write.csv(all_coefs, file.path(OUT_DIR, "training_results.csv"), row.names = FALSE)
+  }
 
   # Calculate total number of year results processed
   n_year_results <- if (!is.null(all_coefs) && nrow(all_coefs) > 0) {
@@ -5340,16 +5505,7 @@ flush.console()
 
       cat("[INFO] Aggregating training coefficients for global plots...\n")
       gp <- tryCatch({
-        if (exists("aggregate_to_global_pattern", mode = "function")) {
-          aggregate_to_global_pattern(all_coefs, method = "location_bootstrap")
-        } else {
-          # Fallback: rename year -> pheno_year if needed and call location bootstrap directly
-          if ("year" %in% names(all_coefs) && !"pheno_year" %in% names(all_coefs)) {
-            all_coefs$pheno_year <- all_coefs$year
-          }
-          Bval <- if (exists("BOOTSTRAP_B")) BOOTSTRAP_B else 100
-          location_bootstrap_aggregate(all_coefs, B = Bval)
-        }
+        aggregate_to_global_pattern(all_coefs, method = "location_bootstrap")
       }, error = function(e) { cat(sprintf("[ERROR] aggregate_to_global_pattern fallback failed: %s\n", e$message)); NULL })
 
       gp2_available <- FALSE
@@ -5630,11 +5786,254 @@ flush.console()
   # Ensure GLOBAL_TRAINING_DVI_SOIL baseline is established
   ensure_global_dvi_soil_baseline()
 
-  # Load and filter inference data only after the variant similarity heatmap has been generated
-  load_and_prepare_inference_data()
+  # Helper to report validation accuracy (including artificial mixes) to avoid duplication
+  report_validation_accuracy <- function(val_coefs, label = "") {
+    if (is.null(val_coefs) || nrow(val_coefs) == 0) {
+      cat("[NOTICE] No validation coefficients found (validation locations not in results).\n")
+      return(invisible(NULL))
+    }
 
-  # Clean up training-related objects to free memory before inference
-  cleanup_memory()
+    prefix <- if (nzchar(label)) paste0(" (", label, ")") else ""
+    
+    # --- 1. Identify Valid Locations and Get True Labels ---
+    labels_df <- NULL
+    
+    # Try df_tasks_inference first (most likely to have labels for inference set if loaded from file with labels)
+    if (exists("df_tasks_inference") && !is.null(df_tasks_inference) && "Veg" %in% names(df_tasks_inference)) {
+       labels_df <- df_tasks_inference %>% dplyr::select(location_id, Veg) %>% dplyr::distinct()
+    } else if (exists("df_tasks") && !is.null(df_tasks) && "Veg" %in% names(df_tasks)) {
+       # Fallback to df_tasks (training data)
+       labels_df <- df_tasks %>% dplyr::select(location_id, Veg) %>% dplyr::distinct()
+    }
+    
+    if (is.null(labels_df)) {
+       # Try to read validation_locations.csv if it exists
+       if (file.exists("validation_locations.csv")) {
+          vloc <- tryCatch(read.csv("validation_locations.csv"), error = function(e) NULL)
+          if (!is.null(vloc) && "location_id" %in% names(vloc) && "Veg" %in% names(vloc)) {
+             labels_df <- vloc %>% dplyr::select(location_id, Veg) %>% dplyr::distinct()
+          }
+       }
+    }
+
+    if (is.null(labels_df)) {
+       cat("[NOTICE] Could not find ground truth labels (Veg column in df_tasks_inference or df_tasks). Cannot compute accuracy.\n")
+       return(invisible(NULL))
+    }
+    
+    # Normalize labels
+    labels_df$Veg <- tolower(trimws(as.character(labels_df$Veg)))
+    labels_df <- labels_df %>% dplyr::rename(true_veg = Veg)
+    
+    # Filter validation coefficients to only those with labels
+    # We join first to filter efficiently
+    val_coefs_labeled <- val_coefs %>% 
+       dplyr::inner_join(labels_df, by = "location_id")
+       
+    if (nrow(val_coefs_labeled) == 0) {
+       cat("[NOTICE] No overlap between coefficients and labeled locations.\n")
+       return(invisible(NULL))
+    }
+    
+    cat(sprintf("\n=== VALIDATION ACCURACY ON HELD-OUT SET%s ===\n", prefix))
+    cat(sprintf("Validation set: %d locations, %d location-year pairs\n", 
+                length(unique(val_coefs_labeled$location_id)), 
+                length(unique(paste(val_coefs_labeled$location_id, val_coefs_labeled$pheno_year)))))
+
+    # --- 2. Pivot Long to Wide (Correctly) ---
+    # Determine which column holds the value
+    measure_col <- dplyr::case_when(
+      "coef" %in% names(val_coefs_labeled) ~ "coef",
+      "pred_coef_rel" %in% names(val_coefs_labeled) ~ "pred_coef_rel",
+      TRUE ~ NA_character_
+    )
+    
+    val_coefs_wide <- NULL
+    
+    if (is.na(measure_col)) {
+       # If no single value column, check if it's already wide (has frac_* columns)
+       veg_cols <- grep("^frac_", names(val_coefs_labeled), value = TRUE)
+       if(length(veg_cols) > 0) {
+          # Already wide, just ensure true_veg is present (it is, from the join)
+          val_coefs_wide <- val_coefs_labeled
+       } else {
+          cat("[ERROR] Could not identify coefficient column (coef) or fraction columns (frac_*) in input.\n")
+          return(invisible(NULL))
+       }
+    } else {
+       # Pivot
+       # We strictly use location_id, pheno_year, and true_veg as keys. 
+       # 'Veg' in val_coefs is the PREDICTED class (if present).
+       # Note: pivot_wider will take 'Veg' (predicted) values to make columns.
+       
+       # Ensure 'Veg' exists for pivoting
+       if (!"Veg" %in% names(val_coefs_labeled)) {
+          cat("[ERROR] 'Veg' column (predicted class) missing for pivoting.\n")
+          return(invisible(NULL))
+       }
+       
+       val_coefs_wide <- val_coefs_labeled %>%
+         dplyr::select(location_id, pheno_year, true_veg, Veg, dplyr::all_of(measure_col)) %>%
+         tidyr::pivot_wider(names_from = Veg, values_from = dplyr::all_of(measure_col), values_fill = 0, names_prefix = "frac_")
+    }
+
+    veg_cols <- grep("^frac_", names(val_coefs_wide), value = TRUE)
+    
+    # --- 3. Compute Mean Predicted Fraction ---
+    if (length(veg_cols) > 0) {
+      for (v in unique(val_coefs_wide$true_veg)) {
+        sub <- val_coefs_wide[val_coefs_wide$true_veg == v, ]
+        if (nrow(sub) > 0) {
+          frac_col <- paste0("frac_", v) # e.g. frac_populus
+          
+          if (frac_col %in% names(sub)) {
+            if (v == "barren") {
+              mean_frac <- mean(sub[[frac_col]], na.rm = TRUE)
+            } else {
+              # Relative vegetation fraction
+              barren_col <- "frac_barren"
+              veg_frac_cols <- veg_cols[veg_cols != barren_col]
+              
+              rescaled_fracs <- sapply(1:nrow(sub), function(i) {
+                vals <- unlist(sub[i, veg_frac_cols])
+                total_veg <- sum(vals, na.rm = TRUE)
+                if (total_veg > 1e-9) {
+                  as.numeric(sub[i, frac_col]) / total_veg
+                } else {
+                  NA_real_
+                }
+              })
+              mean_frac <- mean(rescaled_fracs, na.rm = TRUE)
+            }
+            cat(sprintf("  %s: mean predicted fraction = %.3f\n", v, mean_frac))
+          } else {
+             # If the column doesn't exist, it means the model NEVER predicted this class
+             cat(sprintf("  %s: mean predicted fraction = 0.000 (never predicted)\n", v))
+          }
+        }
+      }
+    }
+
+    # --- 4. Confusion Matrix (Average Predicted Fractions) ---
+    if (length(veg_cols) > 0) {
+      cat("\n--- CONFUSION MATRIX (Average Predicted Fractions) ---\n")
+      cat("Rows: True Class | Columns: Mean Predicted Fraction\n\n")
+      
+      # Group by true_veg and calculate means for all frac_ columns
+      avg_fractions <- val_coefs_wide %>%
+        dplyr::group_by(true_veg) %>%
+        dplyr::summarize(dplyr::across(dplyr::all_of(veg_cols), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+      
+      # Clean up column names (remove frac_)
+      colnames(avg_fractions) <- sub("^frac_", "", colnames(avg_fractions))
+      
+      # Convert to matrix for nice printing
+      mat_data <- as.matrix(avg_fractions[, -1]) # exclude true_veg column
+      rownames(mat_data) <- avg_fractions$true_veg
+      
+      # Sort rows and columns alphabetically
+      sorted_classes <- sort(union(rownames(mat_data), colnames(mat_data)))
+      
+      # Ensure all classes exist in both dimensions (add missing cols with 0)
+      missing_cols <- setdiff(sorted_classes, colnames(mat_data))
+      if(length(missing_cols) > 0) {
+        for(mc in missing_cols) {
+          mat_data <- cbind(mat_data, 0)
+          colnames(mat_data)[ncol(mat_data)] <- mc
+        }
+      }
+      
+      # Reorder
+      mat_data <- mat_data[match(sorted_classes, rownames(mat_data)), match(sorted_classes, colnames(mat_data))]
+      rownames(mat_data) <- sorted_classes # Restore rownames after subsetting/ordering might have dropped them if NAs
+      
+      # Print with 3 decimal places
+      print(round(mat_data, 3))
+    }
+
+    # --- 5. Artificial Mix Logic ---
+    if (length(veg_cols) > 0) {
+      # --- INTER-CLASS MIXTURE DISCRIMINATION TEST ---
+      # Mix different vegetation classes to test if the model coefficients reflect the mix.
+      # Note: This averages predictions (coefficients), so it tests linearity of the output space.
+      
+      veg_classes_only <- unique(val_coefs_wide$true_veg[tolower(val_coefs_wide$true_veg) != "barren"])
+      
+      if (length(veg_classes_only) >= 2) {
+        cat("\n--- INTER-CLASS MIXTURE DISCRIMINATION (Synthetic 50/50 Mixes) ---\n")
+        
+        # Generate all unique pairs of different vegetation classes
+        class_pairs <- utils::combn(veg_classes_only, 2, simplify = FALSE)
+        
+        for (pair in class_pairs) {
+          class_a <- pair[1]
+          class_b <- pair[2]
+          
+          sub_a <- val_coefs_wide[val_coefs_wide$true_veg == class_a, ]
+          sub_b <- val_coefs_wide[val_coefs_wide$true_veg == class_b, ]
+          
+          if (nrow(sub_a) > 0 && nrow(sub_b) > 0) {
+             # Sample pairs to create mixes
+             n_mix <- min(nrow(sub_a), nrow(sub_b), 100)
+             idx_a <- sample(nrow(sub_a), n_mix, replace = TRUE)
+             idx_b <- sample(nrow(sub_b), n_mix, replace = TRUE)
+             
+             # Create mixed coefficients (average of A and B predictions)
+             mixed_coefs <- (sub_a[idx_a, veg_cols] + sub_b[idx_b, veg_cols]) / 2
+             
+             # Calculate relative fraction of Class A in the mix
+             # Ideally should be 0.5 if A was 1.0 and B was 0.0 for A
+             
+             frac_col_a <- paste0("frac_", tolower(class_a))
+             
+             if (frac_col_a %in% names(mixed_coefs)) {
+               # Rescale to total vegetation
+               barren_col <- "frac_barren"
+               veg_frac_cols_local <- veg_cols[veg_cols != barren_col]
+               
+               # Calculate sum of mixed veg fractions
+               sum_mixed <- sapply(1:nrow(mixed_coefs), function(i) {
+                 total_veg <- sum(unlist(mixed_coefs[i, veg_frac_cols_local]), na.rm = TRUE)
+                 if (total_veg > 0) {
+                   as.numeric(mixed_coefs[i, frac_col_a]) + as.numeric(mixed_coefs[i, paste0("frac_", tolower(class_b))])
+                 } else {
+                   NA_real_
+                 }
+               })
+               mean_sum <- mean(sum_mixed, na.rm = TRUE)
+               
+               # Calculate relative to excluded veg
+               third_veg <- setdiff(veg_classes_only, c(class_a, class_b))
+               frac_excluded <- sapply(1:nrow(mixed_coefs), function(i) {
+                 total_veg <- sum(unlist(mixed_coefs[i, veg_frac_cols_local]), na.rm = TRUE)
+                 if (total_veg > 0) {
+                   as.numeric(mixed_coefs[i, paste0("frac_", tolower(third_veg))])
+                 } else {
+                   NA_real_
+                 }
+               })
+               mean_excluded <- mean(frac_excluded, na.rm = TRUE)
+               
+               cat(sprintf("  Mix %s + %s: Mean sum of mixed veg fractions = %.3f (Expected ~1.000), mean relative to %s fraction = %.3f (Expected ~0.000)\n", 
+                           class_a, class_b, mean_sum, third_veg, mean_excluded))
+             }
+          }
+        }
+      }
+    }
+
+    cat("Validation accuracy computed", prefix, ".\n", sep = "")
+  }
+
+  # [CLEANUP] Removed misleading "validation" check on full training dataset (all_coefs).
+  # Validation is now strictly performed on the held-out set (validation_locations.csv) in the block above.
+
+  # Compute accuracy on out-of-bag training data directly after training, before inference
+  if (exists("all_coefs") && !is.null(all_coefs) && nrow(all_coefs) > 0) {
+    # Use training data for OOB validation
+    val_coefs <- all_coefs
+    report_validation_accuracy(val_coefs, "OOB training data")
+  }
 
   if (isTRUE(TESTING_MODE)) {
     cat("[TESTING MODE] Skipping inference processing for faster testing\n")
@@ -7114,11 +7513,12 @@ flush.console()
         loc_data <- veg_data[veg_data$location_id == boot_locs_sampled[i], ]
         loc_data$boot_id <- paste0(boot_locs_sampled[i], "_", i)
         
-        # Propagate uncertainty if available: perturb coefs using coef_sd
         if ("coef_sd" %in% names(loc_data) && !all(is.na(loc_data$coef_sd))) {
            sds <- loc_data$coef_sd
            sds[is.na(sds) | sds < 0] <- 0
            if (any(sds > 0)) {
+             # Debug perturbation for the first iteration of the first location
+             if (i == 1 && runif(1) < 0.001) cat(sprintf("[DEBUG] Perturbing coefs for loc %s. Max SD: %.6f\n", boot_locs_sampled[i], max(sds)))
              loc_data$coef <- rnorm(nrow(loc_data), mean = loc_data$coef, sd = sds)
            }
         }
@@ -7130,7 +7530,7 @@ flush.console()
       # Fit a linear mixed-effects model to the bootstrap sample
       # Use boot_id as the random effect to handle repeated locations
       model <- tryCatch({
-        lme4::lmer(coef ~ pheno_year + (1|boot_id), data = boot_data)
+        lme4::lmer(coef ~ pheno_year + (1|boot_id), data = boot_data, control = lme4::lmerControl(check.conv.singular = "ignore"))
       }, error = function(e) { NULL })
       
       if (is.null(model)) {
@@ -7382,6 +7782,8 @@ process_batches <- function(BATCH_SIZE = 6, overwrite_wb = FALSE) {
 }
 
 process_inference <- function(BATCH_SIZE = BATCH_SIZE) {  # Reduced to 6 for memory efficiency
+  load_and_prepare_inference_data()
+  
   # cat(sprintf("[INFO] process_inference: starting (BATCH_SIZE=%d)\n", BATCH_SIZE)); flush.console()
   if (!(exists("df_tasks_inference") && !is.null(df_tasks_inference) && nrow(df_tasks_inference) > 0)) {
     # cat("[INFO] No inference dataset present\n"); 
@@ -7394,9 +7796,19 @@ process_inference <- function(BATCH_SIZE = BATCH_SIZE) {  # Reduced to 6 for mem
   inference_available_keys <- unique(df_tasks_inference$task_key)
   inference_target_keys <- intersect(inference_target_keys, inference_available_keys)
   
-  # Process all inference LOCATIONS (no limit)
+  # Process inference LOCATIONS (apply optional cap)
   unique_locs <- unique(inference_loc_years$location_id)
-  cat(sprintf("[DEBUG process_inference] Processing all %d unique locations (%d location-year tasks)\n", length(unique_locs), length(inference_target_keys)))
+  # Cap total number of locations to MAX_INFERENCE_LOCATIONS to limit runtime and memory
+  if (exists("MAX_INFERENCE_LOCATIONS") && length(unique_locs) > MAX_INFERENCE_LOCATIONS) {
+    set.seed(123) # deterministic sampling for reproducibility
+    selected_locs <- sample(unique_locs, MAX_INFERENCE_LOCATIONS, replace = FALSE)
+    inference_loc_years <- inference_loc_years[inference_loc_years$location_id %in% selected_locs, ]
+    inference_target_keys <- paste(inference_loc_years$location_id, inference_loc_years$pheno_year, sep = "_")
+    inference_target_keys <- intersect(inference_target_keys, inference_available_keys)
+    unique_locs <- unique(inference_loc_years$location_id)
+    cat(sprintf("[INFO process_inference] Reduced inference locations to %d (random sample of %d)\n", length(unique_locs), MAX_INFERENCE_LOCATIONS))
+  }
+  cat(sprintf("[DEBUG process_inference] Processing %d unique locations (%d location-year tasks)\n", length(unique_locs), length(inference_target_keys)))
 
   if (length(inference_target_keys) == 0) { # cat("[INFO] No valid inference tasks\n"); 
     return(list(results = list(), all_coefs = NULL)) }
@@ -7436,6 +7848,37 @@ process_inference <- function(BATCH_SIZE = BATCH_SIZE) {  # Reduced to 6 for mem
   }
 
   all_coefs_local <- combine_results_from_list(inference_results_list)
+
+  # Save inference results as CSV (explicitly for rf_classifier.py compatibility)
+  inf_csv_dir <- "inference_results"
+  if (!dir.exists(inf_csv_dir)) dir.create(inf_csv_dir, recursive = TRUE)
+  inf_csv_path <- file.path(inf_csv_dir, "inference_results.csv")
+  
+  if (!is.null(all_coefs_local) && nrow(all_coefs_local) > 0) {
+    if (requireNamespace("readr", quietly = TRUE)) {
+      readr::write_csv(all_coefs_local, inf_csv_path)
+    } else {
+      write.csv(all_coefs_local, inf_csv_path, row.names = FALSE)
+    }
+    cat(sprintf("[INFO] Saved inference results CSV to: %s\n", inf_csv_path))
+  } else {
+    cat("[WARN] No inference coefficients to save to CSV.\n")
+  }
+
+  
+  # Save inference results as GeoJSON
+  if (exists("df_tasks_inference") && !is.null(df_tasks_inference) && nrow(all_coefs_local) > 0) {
+    all_coefs_geo <- dplyr::left_join(all_coefs_local, df_tasks_inference |> dplyr::select(location_id, lat, lon), by = "location_id") |> dplyr::distinct()
+    if (nrow(all_coefs_geo) > 0 && "lat" %in% names(all_coefs_geo) && "lon" %in% names(all_coefs_geo) && !all(is.na(all_coefs_geo$lat)) && !all(is.na(all_coefs_geo$lon))) {
+      sf_obj <- sf::st_as_sf(all_coefs_geo, coords = c("lon", "lat"), crs = 4326)
+      geojson_path <- file.path(OUT_DIR, "inference_results.geojson")
+      sf::st_write(sf_obj, geojson_path, driver = "GeoJSON", delete_dsn = TRUE)
+      cat(sprintf("Saved inference results as GeoJSON to: %s\n", geojson_path))
+    } else {
+      cat("[WARN] Could not create GeoJSON: missing or invalid lat/lon in inference data\n")
+    }
+  }
+  
   inference_result <- list(results = inference_results_list, all_coefs = all_coefs_local)
 
   # Add inference results to wb and generate plot
@@ -7627,6 +8070,8 @@ if (exists("process_batches") && exists("process_inference") && exists("aggregat
       }
     }
 }
+
+
 
 # Final memory cleanup
 cleanup_memory()

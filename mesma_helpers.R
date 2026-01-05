@@ -115,16 +115,19 @@ analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor,
   }
 
   n_v <- length(all_vecs)
-  sim_mat <- matrix(NA_real_, n_v, n_v)
+  
+  # Vectorized Similarity Calculation
+  vec_mat <- do.call(rbind, all_vecs)
+  vec_mat[!is.finite(vec_mat)] <- 0
+  row_norms <- sqrt(rowSums(vec_mat^2))
+  row_norms[row_norms == 0] <- 1
+  vec_mat_norm <- vec_mat / row_norms
+  sim_mat <- tcrossprod(vec_mat_norm)
+  sim_mat[sim_mat > 1.01] <- 1.01
+  sim_mat[sim_mat < -0.01] <- -0.01
+  
   rownames(sim_mat) <- all_ids
   colnames(sim_mat) <- all_ids
-
-  for (i in seq_len(n_v)) {
-    for (j in seq_len(n_v)) {
-      sim_val <- tryCatch({ cos_sim(all_vecs[[i]], all_vecs[[j]]) }, error = function(e) { NA_real_ })
-      sim_mat[i, j] <- ifelse(is.na(sim_val), NA_real_, pmax(pmin(sim_val, 1.01), -0.01))
-    }
-  }
 
   sim_df <- as.data.frame(as.table(sim_mat))
   colnames(sim_df) <- c("Var1", "Var2", "Similarity")

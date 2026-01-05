@@ -18,13 +18,13 @@ make_location_id <- function(lon, lat) {
   
   if (length(lon) == 1 && length(lat) == 1) {
     if (!is.finite(lon) || !is.finite(lat)) return(NA_character_)
-    sprintf("L_%0.4f_%0.4f", round(lon, 4), round(lat, 4))
+    sprintf("L_%0.6f_%0.6f", round(lat, 6), round(lon, 6))
   } else {
     # Vectorized approach
     res <- rep(NA_character_, length(lon))
     valid <- is.finite(lon) & is.finite(lat)
     if (any(valid)) {
-      res[valid] <- sprintf("L_%0.4f_%0.4f", round(lon[valid], 4), round(lat[valid], 4))
+      res[valid] <- sprintf("L_%0.6f_%0.6f", round(lat[valid], 6), round(lon[valid], 6))
     }
     res
   }

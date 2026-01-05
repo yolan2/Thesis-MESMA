@@ -130,104 +130,98 @@ if("DUSTI" %in% names(dt)) {
   }
 }
 
-# --- Spline-based outlier detection: removed by default ---
-# Configuration toggle: outlier detection
-# Set to TRUE to re-enable spline-based outlier filtering
-ENABLE_OUTLIER_DETECTION <- FALSE
-if (!isTRUE(ENABLE_OUTLIER_DETECTION)) {
-  cat("Spline-based outlier detection disabled by configuration (ENABLE_OUTLIER_DETECTION = FALSE)\n")
-}
-if (isTRUE(ENABLE_OUTLIER_DETECTION) && all(c("DVI", "date", "doy") %in% names(dt))) {
-  # Define the detect_spline_outliers function
-  detect_spline_outliers <- function(values, doys, window_size = 45, outlier_threshold = 4.0) {
-    if(length(values) < 10 || length(unique(doys)) < 5) {
-      return(rep(FALSE, length(values)))  # Not enough data for reliable spline fitting
-    }
-    
-    # Sort by DOY for proper spline fitting
+# --- Spline-based outlier detection (robust 2-pass with MAD fallback) ---
+# Unified behavior: use the same iterative 2-pass spline + MAD logic as the training pipeline.
+# Requires at least 10 observations per group and >=5 finite points for fitting.
+if (all(c("DVI", "date", "doy") %in% names(dt))) {
+  if (!exists("OUTLIER_MAD_THRESHOLD")) OUTLIER_MAD_THRESHOLD <- 3.5
+
+  detect_spline_outliers <- function(values, doys, mad_thresh = OUTLIER_MAD_THRESHOLD) {
+    # Quick checks for sufficient data
+    if (length(values) < 5 || length(unique(doys)) < 3) return(rep(FALSE, length(values)))
+
     ord <- order(doys)
     vals_sorted <- values[ord]
     doys_sorted <- doys[ord]
-    
-    # Remove any remaining NAs for spline fitting
+
+    # Remove non-finite pairs
     valid_idx <- is.finite(vals_sorted) & is.finite(doys_sorted)
-    vals_clean <- vals_sorted[valid_idx]
-    doys_clean <- doys_sorted[valid_idx]
-    
-    if(length(vals_clean) < 5) {
-      return(rep(FALSE, length(values)))
-    }
-    
+    if (sum(valid_idx) < 5) return(rep(FALSE, length(values)))
+
+    x <- doys_sorted[valid_idx]
+    y <- vals_sorted[valid_idx]
+
     tryCatch({
-      # Fit a smooth spline to the time series
-      spline_fit <- stats::smooth.spline(doys_clean, vals_clean, df = min(length(vals_clean)/3, 10))
-      
-      # Predict values for all DOYs
-      predicted <- stats::predict(spline_fit, doys_clean)$y
-      
-      # Calculate residuals
-      residuals <- vals_clean - predicted
-      
-      # Calculate robust scale estimate (MAD)
-      mad_residuals <- stats::mad(residuals, na.rm = TRUE, constant = 1.4826)
-      
-      if(!is.finite(mad_residuals) || mad_residuals <= 0) {
-        return(rep(FALSE, length(values)))
+      # Pass 1: initial fit
+      fit1 <- stats::smooth.spline(x, y, df = min(5, length(x)/2))
+      pred1 <- predict(fit1, x)$y
+      res1 <- y - pred1
+      mad1 <- stats::mad(res1, na.rm = TRUE)
+      if (!is.finite(mad1) || mad1 <= 1e-6) stop("Invalid MAD in Pass 1")
+
+      # Exclude gross outliers (1.5x scaled threshold) for robust refit
+      keep_mask <- abs(res1 - stats::median(res1, na.rm = TRUE)) <= (mad_thresh * 1.5 * mad1)
+
+      # Pass 2: refit if enough points left, otherwise fallback to pass1 predictions
+      if (sum(keep_mask) >= 5) {
+        fit2 <- stats::smooth.spline(x[keep_mask], y[keep_mask], df = min(5, sum(keep_mask)/2))
+        pred_final <- predict(fit2, x)$y
+      } else {
+        pred_final <- pred1
       }
-      
-      # Identify outliers
-      outlier_flags_clean <- abs(residuals) > outlier_threshold * mad_residuals
-      
-      # Map back to original indices
-      outlier_flags <- rep(FALSE, length(vals_sorted))
-      outlier_flags[valid_idx] <- outlier_flags_clean
-      
-      # Map back to original order
+
+      # Final residual-based outlier detection using MAD
+      residuals <- y - pred_final
+      med_res <- stats::median(residuals, na.rm = TRUE)
+      mad_res <- stats::mad(residuals, na.rm = TRUE)
+      if (!is.finite(mad_res) || mad_res <= 0) stop("Invalid Final MAD")
+
+      this_mask <- rep(FALSE, length(vals_sorted))
+      this_mask[valid_idx] <- abs(residuals - med_res) > mad_thresh * mad_res
+
       result <- rep(FALSE, length(values))
-      result[ord] <- outlier_flags
-      
+      result[ord] <- this_mask
       return(result)
     }, error = function(e) {
-      # If spline fitting fails, return no outliers
-      cat(sprintf("Warning: Spline fitting failed for outlier detection: %s\n", e$message))
+      # Fallback: use simple MAD-based outlier detection on raw values
+      med <- stats::median(vals_sorted, na.rm = TRUE)
+      m <- stats::mad(vals_sorted, na.rm = TRUE)
+      if (is.finite(m) && m > 0) {
+        out_flags <- abs(vals_sorted - med) > mad_thresh * m
+        res <- rep(FALSE, length(values))
+        res[ord] <- out_flags
+        return(res)
+      }
       return(rep(FALSE, length(values)))
     })
   }
-  
-  # Get list of spectral indices to check for outliers
+
+  # Spectral indices to check (intersection with available columns)
   spectral_indices <- intersect(OPTIMAL_INDICES, names(dt))
-  
-  # Apply outlier detection to each spectral index per location-year
-  dt[, outlier_mask := FALSE]  # Initialize outlier mask
-  
-  for(idx in spectral_indices) {
-    if(idx %in% c("location_id", "year", "date", "doy")) next
-    
+
+  # Initialize mask and run detection per (location_id, year)
+  dt[, outlier_mask := FALSE]
+  for (idx in spectral_indices) {
+    if (idx %in% c("location_id", "year", "date", "doy")) next
     dt[, {
-      if(.N >= 10) {  # Need minimum observations for spline fitting
+      if (.N >= 10) {
         values <- get(idx)
         doys <- doy
-        
-        # Detect outliers for this index
         idx_outliers <- detect_spline_outliers(values, doys)
-        
-        # Update overall outlier mask
         outlier_mask <<- outlier_mask | idx_outliers
       }
     }, by = .(location_id, year)]
   }
-  
-  # Remove detected outliers from the dataset
+
+  # Remove detected outliers
   n_total_outliers <- sum(dt$outlier_mask, na.rm = TRUE)
-  if(n_total_outliers > 0) {
+  if (n_total_outliers > 0) {
     cat(sprintf("Spline-based outlier detection removed %d observations\n", n_total_outliers))
     dt <- dt[!outlier_mask, ]
   }
-  
-  # Clean up temporary column
   dt[, outlier_mask := NULL]
 } else {
-  # outlier detection skipped (disabled by configuration)
+  # Required columns for spline-based detection missing; skipping
 }
 
 # Minimal metadata expected by the fit script
