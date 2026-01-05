@@ -1,1 +1,0 @@
-Rscript fit_veg_mixture_mesma.R > run_log.txt 2>&1
