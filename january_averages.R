@@ -817,11 +817,26 @@ if (exists("index_snr") && length(index_snr) > 0) {
 
 cat("\nResults saved to:", file.path(output_dir, "phenology_averages.xlsx"), "\n")
 
-# Plot mean June-September PPI from 2000 to 2025 across all locations with bootstrapping
-summer_data <- df |> dplyr::filter(month %in% 6:9, PPI > 0)
+# Plot timeseries for all indices with seasonal normalization and bootstrapping
+indices_to_plot <- INDICES_OF_INTEREST
 
-if (nrow(summer_data) > 0) {
-  cat("Generating summer trend plot with", nrow(summer_data), "observations...\n")
+plot_data_mean <- list()
+plot_data_median <- list()
+
+for (idx in indices_to_plot) {
+  cat(sprintf("Processing summer trend data for %s...\n", idx))
+  
+  # Filter summer data
+  if (idx == "PPI") {
+    summer_data <- df |> dplyr::filter(month %in% 6:9, .data[[idx]] > 0)
+  } else {
+    summer_data <- df |> dplyr::filter(month %in% 6:9, is.finite(.data[[idx]]))
+  }
+  
+  if (nrow(summer_data) == 0) {
+    cat(sprintf("Warning: No summer %s data found. Skipping.\n", idx))
+    next
+  }
   
   # --- Normalization Step ---
   # Calculate Day of Year (DOY) if not present
@@ -829,10 +844,8 @@ if (nrow(summer_data) > 0) {
     summer_data$doy <- lubridate::yday(summer_data$date)
   }
   
-  cat("Normalizing summer PPI for seasonal trend (June-Sept) using polynomial fit...\n")
   # Fit a 3rd degree polynomial to capture the seasonal curve across the summer months
-  # This fits a curve through the data to model the typical seasonal pattern
-  seasonal_model <- lm(PPI ~ poly(doy, 3), data = summer_data)
+  seasonal_model <- lm(as.formula(paste(idx, "~ poly(doy, 3)")), data = summer_data)
   
   # Predict the seasonal trend for each observation
   summer_data$seasonal_trend <- predict(seasonal_model, newdata = summer_data)
@@ -841,92 +854,97 @@ if (nrow(summer_data) > 0) {
   global_seasonal_mean <- mean(summer_data$seasonal_trend, na.rm = TRUE)
   
   # Normalize: Subtract the seasonal deviation from the global mean
-  # If a day typically has low PPI (trend < mean), we add the difference (correct upwards).
-  # This "warps" the data to make the seasonal curve flat.
-  summer_data$PPI_norm <- summer_data$PPI - (summer_data$seasonal_trend - global_seasonal_mean)
+  summer_data[[paste0(idx, "_norm")]] <- summer_data[[idx]] - (summer_data$seasonal_trend - global_seasonal_mean)
   
   # --- Bootstrapping with Normalized Data ---
-  # Bootstrap means for each year using PPI_norm
+  # Bootstrap means for each year using the normalized index
   summer_yearly_boot <- summer_data |> 
     dplyr::group_by(pheno_year) |> 
     dplyr::do({
-      # Note: We pass PPI_norm as the metric to bootstrap
-      res <- bootstrap_hierarchical_means(., metrics = c("PPI_norm"), B = B)
+      # Note: We pass the normalized metric to bootstrap
+      norm_metric <- paste0(idx, "_norm")
+      res <- bootstrap_hierarchical_means(., metrics = c(norm_metric), B = B)
       
-      # Compute point estimate as mean of location-level means using PPI_norm
+      # Compute point estimate as mean of location-level means using normalized
       loc_means <- sapply(unique(.$location_id), function(id) {
         sub <- .[.$location_id == id, ]
-        mean(sub$PPI_norm, na.rm = TRUE)
+        mean(sub[[norm_metric]], na.rm = TRUE)
       })
-      mean_PPI <- mean(loc_means, na.rm = TRUE)
+      mean_val <- mean(loc_means, na.rm = TRUE)
       
       data.frame(
-        mean_PPI = mean_PPI,
-        PPI_ci_lower = res[1],
-        PPI_ci_upper = res[2]
+        mean_val = mean_val,
+        ci_lower = res[1],
+        ci_upper = res[2]
       )
     }) |> 
     dplyr::ungroup()
   
-  # Use the phenological year column that was used to aggregate (pheno_year)
-  p <- ggplot(summer_yearly_boot, aes(x = pheno_year, y = mean_PPI)) +
-    geom_line(color = "blue") +
-    geom_point(color = "red") +
-    geom_ribbon(aes(ymin = PPI_ci_lower, ymax = PPI_ci_upper), alpha = 0.2, fill = "blue") +
-    labs(title = "Mean Seasonally-Normalized June-Sept PPI (1985-2025)",
-         subtitle = "Normalization: PPI - SeasonalTrend(doy) + Mean(SeasonalTrend)",
-         x = "Year",
-         y = "Mean Normalized PPI") +
-    theme_minimal()
+  summer_yearly_boot$index <- idx
+  plot_data_mean[[idx]] <- summer_yearly_boot
   
-  print(p)
-  
-  # Save the plot
-  ggsave(file.path(output_dir, "june_september_ppi_trend_normalized.png"), plot = p, width = 8, height = 6)
-  cat("Saved plot to:", file.path(output_dir, "june_september_ppi_trend_normalized.png"), "\n")
-  
-  # --- Median Graph ---
-  cat("Generating summer trend plot (MEDIAN) with", nrow(summer_data), "observations...\n")
-  
-  # Bootstrap medians for each year using PPI_norm
+  # --- Median Bootstrapping ---
   summer_yearly_boot_median <- summer_data |> 
     dplyr::group_by(pheno_year) |> 
     dplyr::do({
-      # Use hierarchical median bootstrap for median CI
-      res <- bootstrap_hierarchical_medians(., metrics = c("PPI_norm"), B = B)
+      norm_metric <- paste0(idx, "_norm")
+      res <- bootstrap_hierarchical_medians(., metrics = c(norm_metric), B = B)
       
-      # Compute point estimate as median of location-level medians using PPI_norm
+      # Compute point estimate as median of location-level medians using normalized
       loc_medians <- sapply(unique(.$location_id), function(id) {
         sub <- .[.$location_id == id, ]
-        median(sub$PPI_norm, na.rm = TRUE)
+        median(sub[[norm_metric]], na.rm = TRUE)
       })
-      median_PPI <- median(loc_medians, na.rm = TRUE)
+      median_val <- median(loc_medians, na.rm = TRUE)
       
       data.frame(
-        median_PPI = median_PPI,
-        PPI_ci_lower = res[1],
-        PPI_ci_upper = res[2]
+        median_val = median_val,
+        ci_lower = res[1],
+        ci_upper = res[2]
       )
     }) |> 
     dplyr::ungroup()
   
-  # Use pheno_year for x-axis; if consumers want a 'year' column, they can rename
-  p_med <- ggplot(summer_yearly_boot_median, aes(x = pheno_year, y = median_PPI)) +
-    geom_line(color = "darkgreen") +
-    geom_point(color = "orange") +
-    geom_ribbon(aes(ymin = PPI_ci_lower, ymax = PPI_ci_upper), alpha = 0.2, fill = "darkgreen") +
-    labs(title = "Median Seasonally-Normalized June-Sept PPI (1985-2025)",
-         subtitle = "Normalization: PPI - SeasonalTrend(doy) + Mean(SeasonalTrend)",
-         x = "Year",
-         y = "Median Normalized PPI") +
-    theme_minimal()
-  
-  print(p_med)
-  
-  # Save the plot
-  ggsave(file.path(output_dir, "june_september_ppi_trend_normalized_median.png"), plot = p_med, width = 8, height = 6)
-  cat("Saved median plot to:", file.path(output_dir, "june_september_ppi_trend_normalized_median.png"), "\n")
-  
-} else {
-  cat("Warning: No summer PPI data > 0 found. Skipping trend plot.\n")
+  summer_yearly_boot_median$index <- idx
+  plot_data_median[[idx]] <- summer_yearly_boot_median
 }
+
+# Combine data
+plot_data_mean <- do.call(rbind, plot_data_mean)
+plot_data_median <- do.call(rbind, plot_data_median)
+
+# Plot mean
+p <- ggplot(plot_data_mean, aes(x = pheno_year, y = mean_val)) +
+  geom_line(color = "blue") +
+  geom_point(color = "red") +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.2, fill = "blue") +
+  facet_wrap(~ index, scales = "free_y") +
+  labs(title = "Mean Seasonally-Normalized June-Sept Vegetation Indices (1985-2025)",
+       subtitle = "Normalization: Index - SeasonalTrend(doy) + Mean(SeasonalTrend)",
+       x = "Year",
+       y = "Mean Normalized Value") +
+  theme_minimal()
+
+print(p)
+
+# Save the plot
+ggsave(file.path(output_dir, "all_indices_summer_trend_normalized_mean.png"), plot = p, width = 16, height = 12)
+cat("Saved mean plot to:", file.path(output_dir, "all_indices_summer_trend_normalized_mean.png"), "\n")
+
+# Plot median
+p_med <- ggplot(plot_data_median, aes(x = pheno_year, y = median_val)) +
+  geom_line(color = "darkgreen") +
+  geom_point(color = "orange") +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.2, fill = "darkgreen") +
+  facet_wrap(~ index, scales = "free_y") +
+  labs(title = "Median Seasonally-Normalized June-Sept Vegetation Indices (1985-2025)",
+       subtitle = "Normalization: Index - SeasonalTrend(doy) + Mean(SeasonalTrend)",
+       x = "Year",
+       y = "Median Normalized Value") +
+  theme_minimal()
+
+print(p_med)
+
+# Save the plot
+ggsave(file.path(output_dir, "all_indices_summer_trend_normalized_median.png"), plot = p_med, width = 16, height = 12)
+cat("Saved median plot to:", file.path(output_dir, "all_indices_summer_trend_normalized_median.png"), "\n")

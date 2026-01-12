@@ -7,6 +7,30 @@ library(ggplot2)
 library(dplyr)
 library(lubridate)
 
+options(warn = -1)
+
+# Raw spectral bands (optional - included if present)
+RAW_BANDS <- c("blue", "green", "red", "nir", "swir1", "swir2")
+
+# Normalize known raw band column names (case and prefix variants) to canonical lower-case names
+normalize_band_names <- function(df, bands = RAW_BANDS) {
+  if (is.null(df) || nrow(df) == 0) return(df)
+  current_names <- names(df)
+  for (b in bands) {
+    # Candidate variations to match
+    candidates <- c(b, toupper(b), tools::toTitleCase(b), paste0('band_', b), toupper(paste0('band_', b)), paste0('Band_', b))
+    for (cand in candidates) {
+      if (cand %in% current_names && !(b %in% current_names)) {
+        names(df)[names(df) == cand] <- b
+        cat(sprintf("[NOTICE] Normalized band column '%s' -> '%s'\n", cand, b))
+        current_names <- names(df)
+        break
+      }
+    }
+  }
+  df
+}
+
 # ==============================================================================
 # 0. Load Real Data and Extract Endmembers
 # ==============================================================================
@@ -16,6 +40,7 @@ cat("Loading real phenology data to extract true endmembers...\n")
 # Try to load from common data file locations
 data_file <- NULL
 possible_paths <- c(
+  "C:\\Users\\yolan\\Downloads\\LS_S2_Harmonized_Timeseries.csv",
   "C:\\Users\\yolan\\OneDrive\\Documenten\\UGENT\\Master\\masterproef\\GIS\\landsat_lower.csv",
   "../masterproef/GIS/landsat_lower.csv",
   "landsat_lower.csv"
@@ -34,6 +59,9 @@ if (is.null(data_file)) {
 
 cat(sprintf("Loading data from: %s\n", data_file))
 df_raw <- fread(data_file)
+
+# Normalize band names to canonical lower-case
+df_raw <- normalize_band_names(df_raw)
 
 # GeoJSON support removed: expect Veg to be provided in the CSV
 if ("vegetation" %in% names(df_raw) && !"Veg" %in% names(df_raw)) {
@@ -161,9 +189,12 @@ calculate_indices <- function(df) {
     # New Additions
     NDVI   = (nir - red) / (nir + red + eps),
     MSAVI2 = (2 * nir + 1 - sqrt(pmax(0, (2 * nir + 1)^2 - 8 * (nir - red)))) / 2,
+    MSAVI  = (2 * nir + 1 - sqrt(pmax(0, (2 * nir + 1)^2 - 8 * (nir - red)))) / 2,
     NDMI   = (nir - swir1) / (nir + swir1 + eps),
     TCB    = 0.3029 * blue + 0.2786 * green + 0.4733 * red + 0.5599 * nir + 0.508 * swir1 + 0.1872 * swir2,
-    GVI    = -0.2941 * blue - 0.243 * green - 0.5424 * red + 0.7276 * nir + 0.0713 * swir1 - 0.1608 * swir2
+    GVI    = -0.2941 * blue - 0.243 * green - 0.5424 * red + 0.7276 * nir + 0.0713 * swir1 - 0.1608 * swir2,
+    SATVI  = (swir1 - red) / (swir1 + red + 0.5) * (1 + 0.5),
+    EVI    = 2.5 * (nir - red) / (nir + 6 * red - 7.5 * blue + 1)
   )]
 
   # Add PPI if ppi helpers are available
@@ -205,6 +236,12 @@ linearize_indices <- function(df) {
     cat("  Linearizing MSAVI2 (log(x+1))...\n")
     df$MSAVI2 <- log(df$MSAVI2 + 1)
   }
+
+  # MSAVI: same treatment as MSAVI2 for comparability
+  if ("MSAVI" %in% names(df)) {
+    cat("  Linearizing MSAVI (log(x+1))...\n")
+    df$MSAVI <- log(df$MSAVI + 1)
+  }
   
   # PSRI: Signed Sqrt
   if ("PSRI" %in% names(df)) {
@@ -225,25 +262,6 @@ linearize_indices <- function(df) {
 
 # Raw spectral bands (optional - included if present)
 RAW_BANDS <- c("blue", "green", "red", "nir", "swir1", "swir2")
-
-# Normalize known raw band column names (case and prefix variants) to canonical lower-case names
-normalize_band_names <- function(df, bands = RAW_BANDS) {
-  if (is.null(df) || nrow(df) == 0) return(df)
-  current_names <- names(df)
-  for (b in bands) {
-    # Candidate variations to match
-    candidates <- c(b, toupper(b), tools::toTitleCase(b), paste0('band_', b), toupper(paste0('band_', b)), paste0('Band_', b))
-    for (cand in candidates) {
-      if (cand %in% current_names && !(b %in% current_names)) {
-        names(df)[names(df) == cand] <- b
-        cat(sprintf("[NOTICE] Normalized band column '%s' -> '%s'\n", cand, b))
-        current_names <- names(df)
-        break
-      }
-    }
-  }
-  df
-}
 
 # Compute a set of spectral indices from raw bands (compatible with R_extract_hls.R's formulae)
 compute_indices_from_bands <- function(df) {
@@ -267,6 +285,7 @@ compute_indices_from_bands <- function(df) {
   }
   if (all(c('nir','red') %in% names(df))) df$NDVI <- (as.numeric(df$nir) - as.numeric(df$red)) / (as.numeric(df$nir) + as.numeric(df$red) + eps)
   if (all(c('nir','red') %in% names(df))) df$MSAVI2 <- (2 * as.numeric(df$nir) + 1 - sqrt(pmax(0, (2 * as.numeric(df$nir) + 1)^2 - 8 * (as.numeric(df$nir) - as.numeric(df$red))))) / 2
+  if (all(c('nir','red') %in% names(df))) df$MSAVI <- (2 * as.numeric(df$nir) + 1 - sqrt(pmax(0, (2 * as.numeric(df$nir) + 1)^2 - 8 * (as.numeric(df$nir) - as.numeric(df$red))))) / 2
   if (all(c('nir','swir1') %in% names(df))) df$NDMI <- (as.numeric(df$nir) - as.numeric(df$swir1)) / (as.numeric(df$nir) + as.numeric(df$swir1) + eps)
 
   # Apply kNDVI-like tweak used in extractor (NIRv * 1.3)
@@ -353,7 +372,7 @@ for (b in bands) {
 mixtures <- calculate_indices(mixtures)
 
 # Linearize indices
-mixtures <- linearize_indices(mixtures)
+# mixtures <- linearize_indices(mixtures)
 
 # ==============================================================================
 # 4. Evaluate Linearity
@@ -361,10 +380,41 @@ mixtures <- linearize_indices(mixtures)
 
 # Reshape to long format for plotting and analysis
 indices <- c("DVI", "OSAVI", "MCARI", "NIRv", "PSRI", "NBR",
-             "TCW", "NDVI", "MSAVI2", "NDMI", "TCB", "GVI", "PPI")
+             "TCW", "NDVI", "MSAVI2", "MSAVI", "NDMI", "TCB", "GVI", "PPI", "SATVI", "EVI")
 
 long_res <- melt(mixtures, id.vars = "fraction_veg", measure.vars = indices, 
                  variable.name = "Index", value.name = "Value")
+
+target_aic_indices <- c("PPI", "NIRv", "OSAVI", "NDMI", "MSAVI", "NDVI", "SATVI", "EVI")
+
+compute_aic_table <- function(long_dt, response_col = "fraction_veg", value_col = "Value", index_col = "Index", targets = target_aic_indices) {
+  if (!data.table::is.data.table(long_dt)) long_dt <- as.data.table(long_dt)
+
+  results <- lapply(targets, function(idx) {
+    sub <- long_dt[get(index_col) == idx]
+    sub <- sub[is.finite(get(response_col)) & is.finite(get(value_col))]
+    n_obs <- nrow(sub)
+
+    if (n_obs < 3) {
+      return(data.table(Index = idx, AIC = NA_real_, LogLik = NA_real_, Df = NA_integer_, N = n_obs, Note = "insufficient data"))
+    }
+
+    fit <- tryCatch({
+      lm_out <- lm(sub[[response_col]] ~ sub[[value_col]])
+      list(aic = AIC(lm_out), loglik = as.numeric(logLik(lm_out)), df = length(coef(lm_out)))
+    }, error = function(e) NULL)
+
+    if (is.null(fit)) {
+      return(data.table(Index = idx, AIC = NA_real_, LogLik = NA_real_, Df = NA_integer_, N = n_obs, Note = "fit_failed"))
+    }
+
+    data.table(Index = idx, AIC = fit$aic, LogLik = fit$loglik, Df = fit$df, N = n_obs, Note = NA_character_)
+  })
+
+  out <- rbindlist(results, use.names = TRUE, fill = TRUE)
+  setorder(out, AIC)
+  out
+}
 
 # Calculate Linearity Metrics using linear regression
 linearity_scores <- long_res[, {
@@ -391,6 +441,12 @@ setorder(linearity_scores, -R2)
 
 cat("\n=== LINEARITY EVALUATION (Sorted by R2 descending) ===\n")
 print(linearity_scores)
+
+# AIC comparison focused on key indices
+aic_table <- compute_aic_table(long_res, response_col = "fraction_veg", targets = target_aic_indices)
+cat("\n=== AIC COMPARISON (Lower is better) ===\n")
+print(aic_table)
+write.csv(aic_table, "target_index_aic.csv", row.names = FALSE)
 
 # Filter linearizable indices
 threshold_r2 <- 0.95
@@ -436,8 +492,6 @@ ggsave("index_linearity_check.png", p, width = 12, height = 10)
 # Save metrics
 write.csv(linearity_scores, "index_linearity_scores.csv", row.names = FALSE)
 
-cat("\nAnalysis complete. Check 'index_linearity_check.png' and 'index_linearity_scores.csv'.\n")
-
 # ==============================================================================
 # 6. Vegetation-Vegetation Mixing Analysis
 # ==============================================================================
@@ -471,11 +525,11 @@ for (pair in veg_pairs) {
   veg_mixtures <- calculate_indices(veg_mixtures)
   
   # Linearize indices
-  veg_mixtures <- linearize_indices(veg_mixtures)
+  # veg_mixtures <- linearize_indices(veg_mixtures)
   
   # Evaluate linearity for each index
   indices <- c("DVI", "OSAVI", "MCARI", "NIRv", "PSRI", "NBR",
-               "TCW", "NDVI", "MSAVI2", "NDMI", "TCB", "GVI", "PPI")
+               "TCW", "NDVI", "MSAVI2", "MSAVI", "NDMI", "TCB", "GVI", "PPI", "SATVI", "EVI")
   
   pair_results <- data.table(
     Index = indices,
@@ -484,22 +538,46 @@ for (pair in veg_pairs) {
   )
   
   for (idx in indices) {
-    # Fit linear model
-    lm_fit <- lm(fractions ~ veg_mixtures[[idx]])
-    r2 <- summary(lm_fit)$r.squared
-    residuals <- residuals(lm_fit)
-    rmse <- sqrt(mean(residuals^2))
-    max_dev <- max(abs(residuals))
-    range_val <- diff(range(veg_mixtures[[idx]]))
-    norm_max_dev <- ifelse(range_val > 1e-6, max_dev / range_val, 0)
+    # Check if index exists and has valid data
+    if (!idx %in% names(veg_mixtures) || is.null(veg_mixtures[[idx]]) || all(is.na(veg_mixtures[[idx]]))) {
+      cat(sprintf("  Skipping %s (not available or all NA)\n", idx))
+      pair_results[Index == idx, `:=`(
+        R2 = NA_real_,
+        RMSE = NA_real_,
+        Max_Deviation = NA_real_,
+        Normalized_Max_Dev = NA_real_,
+        Range = NA_real_
+      )]
+      next
+    }
     
-    pair_results[Index == idx, `:=`(
-      R2 = r2,
-      RMSE = rmse,
-      Max_Deviation = max_dev,
-      Normalized_Max_Dev = norm_max_dev,
-      Range = range_val
-    )]
+    # Fit linear model
+    tryCatch({
+      lm_fit <- lm(fractions ~ veg_mixtures[[idx]])
+      r2 <- summary(lm_fit)$r.squared
+      residuals <- residuals(lm_fit)
+      rmse <- sqrt(mean(residuals^2))
+      max_dev <- max(abs(residuals))
+      range_val <- diff(range(veg_mixtures[[idx]], na.rm = TRUE))
+      norm_max_dev <- ifelse(range_val > 1e-6, max_dev / range_val, 0)
+      
+      pair_results[Index == idx, `:=`(
+        R2 = r2,
+        RMSE = rmse,
+        Max_Deviation = max_dev,
+        Normalized_Max_Dev = norm_max_dev,
+        Range = range_val
+      )]
+    }, error = function(e) {
+      cat(sprintf("  Error fitting %s: %s\n", idx, e$message))
+      pair_results[Index == idx, `:=`(
+        R2 = NA_real_,
+        RMSE = NA_real_,
+        Max_Deviation = NA_real_,
+        Normalized_Max_Dev = NA_real_,
+        Range = NA_real_
+      )]
+    })
   }
   
   veg_veg_results[[paste(veg1_name, veg2_name, sep = "_vs_")]] <- pair_results
@@ -559,11 +637,13 @@ for (b in names(veg1_spec)) {
 example_mixtures <- calculate_indices(example_mixtures)
 
 # Linearize indices
-example_mixtures <- linearize_indices(example_mixtures)
+# example_mixtures <- linearize_indices(example_mixtures)
 
 # Reshape for plotting
+# Only use indices that are available in example_mixtures
+available_indices <- intersect(indices, names(example_mixtures))
 veg_veg_long <- melt(example_mixtures, id.vars = "fraction_veg1", 
-                     measure.vars = indices, 
+                     measure.vars = available_indices, 
                      variable.name = "Index", value.name = "Value")
 
 # Add linear reference
@@ -588,5 +668,4 @@ p_veg <- ggplot(veg_veg_long, aes(x = fraction_veg1)) +
 
 ggsave("veg_veg_linearity_check.png", p_veg, width = 12, height = 10)
 
-cat("\nVegetation-vegetation analysis complete.\n")
-cat("Check 'veg_veg_linearity_scores.csv', 'veg_veg_linearity_summary.csv', 'linearity_comparison.csv', and 'veg_veg_linearity_check.png'.\n")
+# Vegetation-vegetation analysis complete.

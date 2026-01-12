@@ -113,11 +113,11 @@ MAX_COMBOS_FOR_FULL_SEARCH <- 6000
 
 MIN_ENDMEMBER_SAMPLES <- 5L
 
-ALLOWED_VEG <- c("populus", "tamarix", "phragmites", "agriculture")
+ALLOWED_VEG <- c("populus", "tamarix", "phragmites")
 
 OPTIMAL_INDICES <- c("WDVI", "WDVI_BY_SWIR1", "GVI", "NIRv", "PSRI", "MSAVI2", "NDMI", "PPI", "EVI", "NDTI", "SATVI", "CIG", "BSI", "NBR", "TCW", "TCB", "NDSI")
 # Indices to explicitly exclude from the MESMA fitter (do not use as features)
-FITTER_EXCLUDE_INDICES <- c("PPI", "MSAVI2", "NIRv")
+FITTER_EXCLUDE_INDICES <- c("MSAVI", "NIRv", "OSAVI", "NDVI", "NDMI", "MSAVI2", "EVI", "SATVI")
 
 # Outlier removal configuration: when TRUE, remove large per-location(/year) outliers
 ENABLE_OUTLIER_REMOVAL <- TRUE
@@ -145,6 +145,21 @@ BOOTSTRAP_BLOCK_SIZE <- 5L       # Block size for Moving Block Bootstrap of resi
 ENABLE_UNCERTAINTY <- TRUE
 DEBUG_UNCERTAINTY <- TRUE        # global debug flag for uncertainty diagnostics
 
+# Small-n CI inflation (per location-year and small-N global aggregation)
+# Goal: extremely low observation counts should yield very wide intervals (almost no certainty).
+UNCERTAINTY_N_REF <- 12L               # reference observation count where inflation factor ~1
+UNCERTAINTY_N_POWER <- 2.0             # higher -> more extreme widening for small n
+UNCERTAINTY_BASE_SD <- 0.15            # fallback SD when sd is NA/0; before inflation
+UNCERTAINTY_SD_MAX <- 0.50             # cap SD so CI doesn't become numerically unstable
+
+# Optional: estimate UNCERTAINTY_N_REF / UNCERTAINTY_N_POWER from data (Option A: subsampling experiment)
+ESTIMATE_UNCERTAINTY_PARAMS_OPTION_A <- TRUE
+UNCERTAINTY_PARAM_EST_HIGH_N <- 20L            # only use loc-years with at least this many observations as pseudo-truth
+UNCERTAINTY_PARAM_EST_MAX_GROUPS <- 25L        # cap number of loc-years used (runtime control)
+UNCERTAINTY_PARAM_EST_TARGET_NS <- 1:15        # subsample sizes to evaluate
+UNCERTAINTY_PARAM_EST_REPS <- 20L              # replicates per subsample size
+UNCERTAINTY_PARAM_EST_SEED <- 123
+
 # Data quality thresholds
 MIN_OBS_PER_LOC_YEAR <- 3L
 MIN_UNIQUE_DOY_DEFAULT <- 5L
@@ -159,6 +174,7 @@ VARIANCE_THRESHOLD <- 0.90
 
 # Modeling/algorithmic caps and defaults
 TOPK_VARIANTS <- 10L             # Max variants per veg type to consider in MESMA (higher is slower but more accurate)
+ENABLE_LDA_L2_NORMALIZATION <- TRUE # Whether to L2-normalize training samples before LDA (set to FALSE to preserve brightness info)
 GAM_K_MAX <- 40
 GAM_GAMMA <- 1.0
 USE_INDICES_MIN <- 1L
@@ -1022,9 +1038,7 @@ if ("NDSI" %in% names(df) && "NDDI" %in% names(df)) {
 
 # STEP 2: Calculate PPI on raw data, now that Veg column is available
 if (!"pheno_year" %in% names(df) && "date" %in% names(df)) df$pheno_year <- assign_pheno_year(as.Date(df$date))
-cat("Filtering training data to 2024 (phenological years: March-February) before PPI baseline calculation...\n")
-  df <- df |> dplyr::filter(pheno_year >= 2024 & pheno_year <= 2024)
-if (nrow(df) == 0) cat("[NOTICE] Year filter removed all rows; PPI baseline calculation will proceed on empty data and likely be skipped.\n")
+cat("[NOTICE] Retaining all years for PPI baseline calculation and trend analysis. Training subset will be filtered later.\n")
 if (exists("auto_add_ppi_columns")) {
   if (!"PPI" %in% names(df) || all(!is.finite(df$PPI))) {
     ppi_pre_res <- tryCatch({ auto_add_ppi_columns(df) }, error = function(e) { cat(sprintf("[PPI] auto_add_ppi_columns error: %s\n", e$message)); NULL })
@@ -1067,6 +1081,32 @@ if ("PPI_raw" %in% names(df) && any(is.finite(df$PPI_raw))) {
 selected_vegs <- c("phragmites", "populus", "tamarix", "barren")
 df <- df[tolower(df$Veg) %in% selected_vegs, ]
 cat(sprintf("Filtered training data to selected vegetation types: %s\n", paste(selected_vegs, collapse = ", ")))
+
+# Exclude tamarix samples with no_soil == 1, but keep tamarix with no_soil == NaN
+if ("no_soil" %in% names(df)) {
+  # Count tamarix with no_soil == 1 (to exclude)
+  tamarix_no_soil_1 <- sum(tolower(df$Veg) == "tamarix" & df$no_soil == 1 & !is.na(df$no_soil), na.rm = TRUE)
+  # Count tamarix with no_soil == NaN (to keep)
+  tamarix_no_soil_na <- sum(tolower(df$Veg) == "tamarix" & is.na(df$no_soil), na.rm = TRUE)
+  # Count total tamarix
+  total_tamarix <- sum(tolower(df$Veg) == "tamarix", na.rm = TRUE)
+  
+  cat(sprintf("Tamarix samples: total=%d, no_soil==1=%d, no_soil==NaN=%d\n", 
+              total_tamarix, tamarix_no_soil_1, tamarix_no_soil_na))
+  
+  # Exclude only tamarix with no_soil == 1, keep tamarix with no_soil == NaN or other values
+  if (tamarix_no_soil_1 > 0) {
+    df <- df[!(tolower(df$Veg) == "tamarix" & df$no_soil == 1 & !is.na(df$no_soil)), ]
+    cat(sprintf("Excluded %d tamarix samples with no_soil == 1\n", tamarix_no_soil_1))
+  }
+}
+
+# AGENT: Capture full dataset for trends BEFORE downsampling or year filtering
+df_full <- df
+cat(sprintf("[NOTICE] Captured df_full with %d rows for trend analysis (all years).\n", nrow(df_full)))
+
+# AGENT: Downsampling deferred until after df_train creation to ensure year-specific balancing
+
 cat(sprintf("Remaining samples: %d\n", nrow(df)))
 
 TRAINING_NORM_PARAMS <- list(
@@ -1114,6 +1154,20 @@ if (exists("TRAIN_YEARS") && !is.null(TRAIN_YEARS) && length(TRAIN_YEARS) > 0) {
   df_train <- df[df$pheno_year %in% TRAIN_YEARS, , drop = FALSE]
 } else {
   df_train <- df
+}
+
+# AGENT: Apply balancing/downsampling to df_train ONLY (ensure balanced training library)
+set.seed(42)
+class_counts <- table(df_train$Veg)
+if (length(class_counts) > 0) {
+  min_count <- min(class_counts)
+  if (min_count > 0) {
+    df_train <- df_train %>%
+      dplyr::group_by(Veg) %>%
+      dplyr::slice_sample(n = min_count) %>%
+      dplyr::ungroup()
+    cat(sprintf("[BALANCE] Downsampled df_train (training year) to %d samples per class (total=%d)\n", min_count, nrow(df_train)))
+  }
 }
 cat(sprintf(
   "Training dataset (Initial): %d rows from %d locations\n",
@@ -1180,7 +1234,7 @@ cat(sprintf(
   nrow(df_test), length(unique(df_test$location_id))
 ))
 
-df_full <- df
+# df_full is already captured before downsampling/filtering
 df <- df_train
 
 if (exists("df_full") && "Veg" %in% names(df_full) && length(ALLOWED_VEG) > 0) {
@@ -1361,19 +1415,23 @@ train_feature_pipeline <- function(df, class_col, feature_cols) {
     y_labels <- c(y_labels, lbl)
   }
   
-  if(length(X_raw) < 10) return(NULL)
+  if (length(X_raw) < 10) return(NULL)
   X_mat <- do.call(rbind, X_raw)
 
   # L2-normalize input samples to make LDA focus on shape (relative values) rather than brightness
-  cat("  L2-normalizing training samples for shape-based LDA...\n")
-  X_mat <- t(apply(X_mat, 1, function(r) {
-    # Treat NA as 0 for norm calculation
-    r_clean <- r
-    r_clean[is.na(r_clean)] <- 0
-    nrm <- sqrt(sum(r_clean^2))
-    if (!is.finite(nrm) || nrm < 1e-9) return(r)
-    r / nrm
-  }))
+  if (isTRUE(ENABLE_LDA_L2_NORMALIZATION)) {
+    cat("  L2-normalizing training samples for shape-based LDA...\n")
+    X_mat <- t(apply(X_mat, 1, function(r) {
+      # Treat NA as 0 for norm calculation
+      r_clean <- r
+      r_clean[is.na(r_clean)] <- 0
+      nrm <- sqrt(sum(r_clean^2))
+      if (!is.finite(nrm) || nrm < 1e-9) return(r)
+      r / nrm
+    }))
+  } else {
+    cat("  L2-normalization for LDA skipped (using raw values)...\n")
+  }
   
   
   n_bins <- N_TEMPORAL_BINS
@@ -1433,7 +1491,15 @@ train_feature_pipeline <- function(df, class_col, feature_cols) {
   lda_res <- safe_lda_call(pca_res$x[, 1:n_pcs, drop=FALSE], as.factor(y_labels), min_n_pcs = min_n_pcs_train)
 
   if (is.null(lda_res)) {
-    return(NULL)
+    # LDA failed (too few samples per class, collinearity, etc.) - fall back to uniform weights
+    cat("[FALLBACK] LDA failed; using uniform weights (all features weighted equally).\n")
+    final_weights <- rep(1, ncol(X_z))
+    return(list(
+      means = global_means,
+      sds = global_sds,
+      weights = final_weights,
+      indices = feature_cols
+    ))
   }
   
   W_pc <- lda_res$scaling
@@ -1575,17 +1641,6 @@ apply_pca_lda_transform <- function(y, pca_lda_result) {
   y_weighted
 }
 
-weighted_cosine_similarity <- function(a, b, weights = NULL) {
-  if (is.null(weights) || length(weights) != length(a)) {
-    return(sum(a * b) / (sqrt(sum(a^2)) * sqrt(sum(b^2))))
-  }
-  
-  a_w <- a * sqrt(weights)
-  b_w <- b * sqrt(weights)
-  
-  sum(a_w * b_w) / (sqrt(sum(a_w^2)) * sqrt(sum(b_w^2)))
-}
-
 medoid_row_index <- function(M) {
   if (is.null(M) || !is.matrix(M) || nrow(M) == 0) return(NA_integer_)
   if (nrow(M) == 1) return(1L)
@@ -1609,12 +1664,6 @@ medoid_row_index <- function(M) {
     if (length(idx) == 0 || !is.finite(idx)) idx <- 1L
   }
   as.integer(idx)
-}
-
-cos_sim <- function(a, b) {
-  da <- sqrt(safe_dot(a, a)); db <- sqrt(safe_dot(b, b))
-  if (da == 0 || db == 0) return(0)
-  safe_dot(a, b) / (da * db)
 }
 
 .run_map <- function(X, FUN, show_pb = TRUE) {
@@ -1698,9 +1747,8 @@ if (length(lon_candidates) > 0 && length(lat_candidates) > 0) {
 
 df$Veg <- tolower(df$Veg)
 
-# Merge vegetation categories: map 'herbs', 'halocnemum', 'salicornia' to 'phragmites', 'agri' to 'agriculture'
+# Merge vegetation categories: map 'agri' to 'agriculture'
 df$Veg <- dplyr::case_when(
-  df$Veg %in% c("herbs", "halocnemum", "salicornia") ~ "phragmites",
   df$Veg == "agri" ~ "agriculture",
   TRUE ~ df$Veg
 )
@@ -1714,9 +1762,8 @@ if ("Veg.geo" %in% names(df_train)) {
 
 df_train$Veg <- tolower(df_train$Veg)
 
-# Merge vegetation categories: map 'herbs', 'halocnemum', 'salicornia' to 'phragmites', 'agri' to 'agriculture'
+# Merge vegetation categories: map 'agri' to 'agriculture'
 df_train$Veg <- dplyr::case_when(
-  df_train$Veg %in% c("herbs", "halocnemum", "salicornia") ~ "phragmites",
   df_train$Veg == "agri" ~ "agriculture",
   TRUE ~ df_train$Veg
 )
@@ -1727,10 +1774,9 @@ if (!"location_id" %in% names(df)) stop("Input CSV must contain a 'location_id' 
 
 if ("Veg" %in% names(df)) df$Veg <- tolower(as.character(df$Veg))
 
-# Merge vegetation categories: map 'herbs', 'halocnemum', 'salicornia' to 'phragmites', 'agri' to 'agriculture'
+# Merge vegetation categories: map 'agri' to 'agriculture'
 if ("Veg" %in% names(df)) {
   df$Veg <- dplyr::case_when(
-    df$Veg %in% c("herbs", "halocnemum", "salicornia") ~ "phragmites",
     df$Veg == "agri" ~ "agriculture",
     TRUE ~ df$Veg
   )
@@ -2688,6 +2734,11 @@ location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123)
              
              # Add minimum uncertainty to ensure CI is not too narrow for small samples
              se_total <- sqrt(se_total^2 + 0.05^2)
+
+             # Aggressively widen uncertainty for very small N (years with few locations)
+             # Translate the CI policy into an SD inflation on the mean.
+             ci_tmp <- small_n_inflated_ci(est = mu, sd_in = se_total, n_obs = n_obs)
+             se_total <- ci_tmp$coef_sd
              
              # Generate bootstrap distribution parametrically
              # We clamp the mean distribution to physical [0,1] limits if needed, 
@@ -2773,6 +2824,206 @@ location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123)
   }
   
   dplyr::bind_rows(results_list)
+}
+
+# Compute a deliberately conservative CI that widens aggressively as n_obs decreases.
+# This is used as a fallback when bootstrapping is skipped due to too few observations.
+small_n_inflated_ci <- function(est, sd_in = NA_real_, n_obs = NA_integer_,
+                                z = 1.96,
+                                n_ref = UNCERTAINTY_N_REF,
+                                power = UNCERTAINTY_N_POWER,
+                                sd_base = UNCERTAINTY_BASE_SD,
+                                sd_max = UNCERTAINTY_SD_MAX) {
+  n_eff <- suppressWarnings(as.numeric(n_obs))
+  if (!is.finite(n_eff)) n_eff <- NA_real_
+  if (is.na(n_eff) || n_eff < 1) n_eff <- 1
+
+  est <- as.numeric(est)
+  if (!is.finite(est)) est <- NA_real_
+
+  sd0 <- as.numeric(sd_in)
+  if (!is.finite(sd0) || sd0 <= 0) sd0 <- sd_base
+
+  infl <- (as.numeric(n_ref) / n_eff) ^ as.numeric(power)
+  if (!is.finite(infl) || infl < 1) infl <- 1
+
+  sd_eff <- sd0 * infl
+  if (!is.finite(sd_eff) || sd_eff <= 0) sd_eff <- sd_base
+  sd_eff <- min(sd_eff, sd_max)
+
+  if (!is.finite(est)) {
+    # If estimate is missing, return fully wide interval.
+    return(list(
+      coef_025 = 0,
+      coef_975 = 1,
+      coef_sd = sd_eff,
+      interval = 1
+    ))
+  }
+
+  lo <- est - z * sd_eff
+  hi <- est + z * sd_eff
+  lo <- max(0, lo)
+  hi <- min(1, hi)
+
+  list(
+    coef_025 = lo,
+    coef_975 = hi,
+    coef_sd = sd_eff,
+    interval = hi - lo
+  )
+}
+
+# --- Option A calibration helpers ---
+extract_coef_vec_from_fit <- function(fit_res, veg_levels = NULL) {
+  if (is.null(fit_res) || is.null(fit_res$coef_df)) return(NULL)
+  df <- fit_res$coef_df
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  # Defensive: handle multiple variants per veg by summing
+  agg <- tapply(df$coef, df$Veg, function(x) sum(as.numeric(x), na.rm = TRUE))
+  if (is.null(agg)) return(NULL)
+  if (!is.null(veg_levels)) {
+    out <- setNames(rep(0, length(veg_levels)), veg_levels)
+    common <- intersect(names(agg), veg_levels)
+    out[common] <- as.numeric(agg[common])
+    return(out)
+  }
+  as.numeric(agg)
+}
+
+estimate_uncertainty_params_optionA <- function(df_tasks,
+                                                high_n = UNCERTAINTY_PARAM_EST_HIGH_N,
+                                                max_groups = UNCERTAINTY_PARAM_EST_MAX_GROUPS,
+                                                target_ns = UNCERTAINTY_PARAM_EST_TARGET_NS,
+                                                reps = UNCERTAINTY_PARAM_EST_REPS,
+                                                seed = UNCERTAINTY_PARAM_EST_SEED,
+                                                veg_levels = ALLOWED_VEG,
+                                                quiet = TRUE) {
+  if (is.null(df_tasks) || nrow(df_tasks) == 0) stop("df_tasks is empty; cannot calibrate")
+  if (!"location_id" %in% names(df_tasks)) stop("df_tasks must have location_id")
+  if (!"pheno_year" %in% names(df_tasks)) {
+    if ("date" %in% names(df_tasks)) {
+      df_tasks$pheno_year <- assign_pheno_year(df_tasks$date)
+    } else {
+      stop("df_tasks must have pheno_year or date")
+    }
+  }
+
+  set.seed(seed)
+
+  # Build group table
+  grp <- df_tasks |>
+    dplyr::group_by(location_id, pheno_year) |>
+    dplyr::summarise(n_obs = dplyr::n(), .groups = "drop") |>
+    dplyr::filter(is.finite(n_obs) & n_obs >= high_n)
+
+  if (nrow(grp) == 0) stop(sprintf("No location-years with n_obs >= %d", high_n))
+
+  # Sample groups (runtime control)
+  if (nrow(grp) > max_groups) grp <- grp[sample(seq_len(nrow(grp)), max_groups), , drop = FALSE]
+
+  # Pre-allocate collectors per target n
+  errors_by_n <- setNames(vector("list", length(target_ns)), as.character(target_ns))
+  for (n in target_ns) errors_by_n[[as.character(n)]] <- numeric(0)
+
+  # Suppress chatter during repeated fits
+  sink_file <- NULL
+  con_out <- con_msg <- NULL
+  if (isTRUE(quiet)) {
+    sink_file <- tempfile()
+    con_out <- file(sink_file, open = "wt")
+    con_msg <- file(paste0(sink_file, ".msg"), open = "wt")
+  }
+
+  on.exit({
+    if (isTRUE(quiet)) {
+      try(sink(type = "message"), silent = TRUE)
+      try(sink(type = "output"), silent = TRUE)
+      if (!is.null(con_out)) try(close(con_out), silent = TRUE)
+      if (!is.null(con_msg)) try(close(con_msg), silent = TRUE)
+      if (!is.null(sink_file)) {
+        try(unlink(sink_file), silent = TRUE)
+        try(unlink(paste0(sink_file, ".msg")), silent = TRUE)
+      }
+    }
+  }, add = TRUE)
+
+  if (isTRUE(quiet)) {
+    sink(con_out, type = "output")
+    sink(con_msg, type = "message")
+  }
+
+  for (gi in seq_len(nrow(grp))) {
+    loc <- grp$location_id[gi]
+    yr <- grp$pheno_year[gi]
+    sub <- df_tasks[df_tasks$location_id == loc & df_tasks$pheno_year == yr, , drop = FALSE]
+    n_full <- nrow(sub)
+    if (!is.finite(n_full) || n_full < high_n) next
+
+    # Full fit as pseudo-truth
+    full_fit <- tryCatch(fit_one_task(sub), error = function(e) NULL)
+    full_vec <- extract_coef_vec_from_fit(full_fit, veg_levels = veg_levels)
+    if (is.null(full_vec)) next
+
+    for (n in target_ns) {
+      if (n > n_full) next
+      for (r in seq_len(reps)) {
+        idx <- sample(seq_len(n_full), n, replace = FALSE)
+        sub_n <- sub[idx, , drop = FALSE]
+        fit_n <- tryCatch(fit_one_task(sub_n), error = function(e) NULL)
+        vec_n <- extract_coef_vec_from_fit(fit_n, veg_levels = veg_levels)
+        if (is.null(vec_n)) next
+        # error pooled across veg components (L2 norm / sqrt(k)) for scale comparability
+        diff <- as.numeric(vec_n - full_vec)
+        err <- sqrt(mean(diff^2, na.rm = TRUE))
+        if (is.finite(err)) errors_by_n[[as.character(n)]] <- c(errors_by_n[[as.character(n)]], err)
+      }
+    }
+  }
+
+  # Summarize sd_emp(n)
+  summ <- data.frame(
+    n = as.integer(names(errors_by_n)),
+    n_samples = sapply(errors_by_n, function(x) length(x)),
+    sd_emp = sapply(errors_by_n, function(x) if (length(x) >= 3) stats::sd(x, na.rm = TRUE) else NA_real_),
+    stringsAsFactors = FALSE
+  )
+  summ <- summ[order(summ$n), , drop = FALSE]
+  summ <- summ[is.finite(summ$sd_emp) & summ$sd_emp > 0, , drop = FALSE]
+  if (nrow(summ) < 3) stop("Not enough valid subsampling results to estimate slope")
+
+  # Fit log(sd_emp) ~ log(n) => slope = -p
+  fit <- stats::lm(log(sd_emp) ~ log(n), data = summ)
+  p_hat <- -as.numeric(stats::coef(fit)[["log(n)"]])
+  if (!is.finite(p_hat) || p_hat < 0) p_hat <- NA_real_
+
+  # Pick N_REF as the first n where improvements become small (stability heuristic)
+  # We look for the earliest n such that the relative improvement over the next 3 steps is < 10%.
+  n_ref_hat <- NA_integer_
+  if (nrow(summ) >= 5) {
+    for (i in seq_len(nrow(summ) - 3)) {
+      s0 <- summ$sd_emp[i]
+      s_next <- summ$sd_emp[(i + 1):(i + 3)]
+      # improvement ratio: (s0 - s_next) / s0
+      rel_impr <- (s0 - s_next) / s0
+      if (all(is.finite(rel_impr)) && all(rel_impr < 0.10)) {
+        n_ref_hat <- as.integer(summ$n[i])
+        break
+      }
+    }
+  }
+  if (!is.finite(n_ref_hat)) n_ref_hat <- as.integer(stats::median(summ$n, na.rm = TRUE))
+
+  list(
+    summary = summ,
+    fit = fit,
+    N_POWER_hat = p_hat,
+    N_REF_hat = n_ref_hat,
+    used_high_n = high_n,
+    used_groups = nrow(grp),
+    target_ns = target_ns,
+    reps = reps
+  )
 }
 
 
@@ -3081,10 +3332,9 @@ load_and_prepare_inference_data <- function() {
     w <- res$x
     if (sum(w) > 0) w <- w / sum(w)
 
-    # Enforce minimum fraction of 10% for vegetation types
-    min_frac <- 0.1
-    w[w < min_frac] <- 0
-    if (sum(w) > 0) w <- w / sum(w)
+    # NOTE: Removed the 10% minimum fraction floor here. Filtering should happen AFTER
+    # removing barren from the coefficient vector, so that vegetation types compete
+    # fairly against each other (not against barren which will be replaced by PPI).
 
     pred <- as.numeric(E_fit %*% w)
     rmse <- sqrt(mean((y_fit - pred)^2))
@@ -3610,22 +3860,23 @@ if ("pheno_year" %in% names(test_dly)) {
       n <- length(current_vars)
       if (n < 2) break
 
-      # Compute similarity matrix
-      # Normalize vectors first for fast cosine
-      M <- do.call(rbind, lapply(current_vars, function(x) {
-         v <- x$vec
-         nm <- sqrt(sum(v^2))
-         if (nm < 1e-9) v else v / nm
-      }))
+      # Compute distance matrix using Euclidean distance
+      M <- do.call(rbind, lapply(current_vars, function(x) x$vec))
       
-      Sim <- M %*% t(M)
-      diag(Sim) <- 0 # Ignore self-similarity
+      # Compute pairwise Euclidean distances
+      n_vars <- nrow(M)
+      Dist <- matrix(0, n_vars, n_vars)
+      for (i in 1:(n_vars-1)) {
+        for (j in (i+1):n_vars) {
+          Dist[i,j] <- Dist[j,i] <- sqrt(sum((M[i,] - M[j,])^2))
+        }
+      }
       
-      max_sim <- max(Sim)
-      if (max_sim < threshold) break
+      min_dist <- min(Dist[Dist > 0])  # Minimum non-zero distance
+      if (min_dist > (1 - threshold)) break  # threshold is similarity, so 1 - threshold is max allowed distance
       
-      # Find pair
-      idx_mat <- which(Sim == max_sim, arr.ind = TRUE)
+      # Find pair with minimum distance
+      idx_mat <- which(Dist == min_dist, arr.ind = TRUE)
       # Take first pair
       r <- idx_mat[1, 1]
       c <- idx_mat[1, 2]
@@ -3641,8 +3892,8 @@ if ("pheno_year" %in% names(test_dly)) {
          to_drop <- v2
       }
       
-      cat(sprintf("  [DROP] %s (n=%d) due to similarity %.4f with %s (n=%d)\n", 
-                  to_drop$id, to_drop$n_samples, max_sim, 
+      cat(sprintf("  [DROP] %s (n=%d) due to distance %.4f with %s (n=%d)\n", 
+                  to_drop$id, to_drop$n_samples, min_dist, 
                   if (to_drop$id == v1$id) v2$id else v1$id, 
                   if (to_drop$id == v1$id) v2$n_samples else v1$n_samples))
       
@@ -3693,11 +3944,23 @@ if ("pheno_year" %in% names(test_dly)) {
     
     cat("\n[LIBRARY BUILD] Starting Global Combinatorial Optimization for Cluster Counts (including Barren)...\n")
     
+    # Validate params structure
+    if (is.null(params) || is.null(params$means) || is.null(params$sds)) {
+      stop("[ERROR] build_single_stage_library_weighted: params$means or params$sds is NULL!")
+    }
+    if (length(params$means) != length(indices)) {
+      cat(sprintf("[ERROR] params$means has length %d but indices has length %d\n", length(params$means), length(indices)))
+      cat(sprintf("  indices: %s\n", paste(indices, collapse = ", ")))
+      cat(sprintf("  params$means names: %s\n", paste(names(params$means), collapse = ", ")))
+      stop("[ERROR] Length mismatch between params$means and indices")
+    }
+    
     # -------------------------------------------------------------------------
-    # PASS 1: Load, Normalize, and Store Data
+    # PASS 1: Load, Normalize, and Store Data (with Metadata)
     # -------------------------------------------------------------------------
     expected_cols <- length(indices) * N_TEMPORAL_BINS
     storage <- list()       # Store unweighted Z-score matrices
+    storage_meta <- list()  # Store metadata (location_id) for spatial bootstrapping
     
     # Unified class list
     target_classes <- unique(c("barren", allowed_veg))
@@ -3709,12 +3972,20 @@ if ("pheno_year" %in% names(test_dly)) {
       if(nrow(veg_data) == 0) next
       
       veg_list <- list()
+      loc_list <- character(0)
+      
       traces <- unique(veg_data[, c("location_id", "pheno_year")])
+      
+      # Batch processing for speed? No, keep simple loop for now
       for(i in seq_len(nrow(traces))) {
-        sub <- veg_data[veg_data$location_id == traces$location_id[i] &
-                          veg_data$pheno_year == traces$pheno_year[i], ]
+        lid <- traces$location_id[i]
+        pyr <- traces$pheno_year[i]
+        sub <- veg_data[veg_data$location_id == lid & veg_data$pheno_year == pyr, ]
         mat <- build_pentad_matrix(sub, indices)
-        if(!is.null(mat)) veg_list[[length(veg_list) + 1]] <- as.numeric(mat)
+        if(!is.null(mat)) {
+          veg_list[[length(veg_list) + 1]] <- as.numeric(mat)
+          loc_list <- c(loc_list, as.character(lid))
+        }
       }
       
       if(length(veg_list) > 0) {
@@ -3728,6 +3999,7 @@ if ("pheno_year" %in% names(test_dly)) {
           }
           veg_mat[is.na(veg_mat)] <- 0
           storage[[v]] <- veg_mat
+          storage_meta[[v]] <- data.frame(location_id = loc_list, stringsAsFactors = FALSE)
           valid_classes <- c(valid_classes, v)
         }
       }
@@ -3745,123 +4017,117 @@ if ("pheno_year" %in% names(test_dly)) {
     min_cluster_size <- 5
 
     # -------------------------------------------------------------------------
-    # Internal Optimization Routine (Clustering + Grid Search)
+    # Internal Optimization Routine: Stratified Spatial Bootstrap OOB
     # -------------------------------------------------------------------------
-    optimize_library <- function(metric = "euclidean") {
-      cat(sprintf("\n  --- Running Optimization with Metric: %s ---\n", metric))
+    optimize_library <- function(n_boot = 5) {
+      cat(sprintf("\n  --- Running Optimization with Stratified Spatial Bootstrap (%d folds) ---\n", n_boot))
       
-      # --- PASS 2: Pre-compute Clusters ---
-      cluster_cache <- list()
-      k_ranges <- list()
-      
-      # Pre-compute Barren Weighted Center for Filtering (using standard weighted median)
-      barren_ref_w <- NULL
-      if ("barren" %in% valid_classes) {
-         b_mat <- storage[["barren"]]
-         b_mat_w <- sweep(b_mat, 2, w_vec, "*")
-         barren_ref_w <- apply(b_mat_w, 2, median, na.rm=TRUE)
+      # 1. Generate Bootstrap Folds
+      # Structure: folds[[b]][[v]] -> list(train_idx, oob_idx)
+      folds <- list()
+      for(b in 1:n_boot) {
+        folds[[b]] <- list()
+        for(v in valid_classes) {
+          locs <- storage_meta[[v]]$location_id
+          unique_locs <- unique(locs)
+          
+          if(length(unique_locs) < 2) {
+             # Too few locations to bootstrap: use all for train, none for OOB (or duplicate)
+             # Fallback: simple row resampling if locations are scarce
+             n_rows <- nrow(storage[[v]])
+             train_rows <- sample(n_rows, n_rows, replace = TRUE)
+             oob_rows <- setdiff(1:n_rows, unique(train_rows))
+             if(length(oob_rows) == 0) oob_rows <- sample(n_rows, max(1, floor(n_rows * 0.2))) # Force some OOB
+          } else {
+             # Spatial Bootstrap
+             train_locs <- sample(unique_locs, length(unique_locs), replace = TRUE)
+             oob_locs <- setdiff(unique_locs, unique(train_locs))
+             
+             # Map back to row indices
+             # Note: A location might appear multiple times in train_locs (weighted)
+             # But for clustering input, we typically just want the set of training rows.
+             # Standard Bagging uses the resampled set (with duplicates).
+             
+             # Create a mapping from loc -> row_indices
+             loc_to_rows <- split(seq_along(locs), locs)
+             
+             train_rows <- unlist(lapply(train_locs, function(l) loc_to_rows[[l]]))
+             oob_rows <- unlist(lapply(oob_locs, function(l) loc_to_rows[[l]]))
+          }
+          folds[[b]][[v]] <- list(train = train_rows, oob = oob_rows)
+        }
       }
 
+      # 2. Pre-compute Clusters for EACH Fold and Class (K=1..11)
+      # cluster_cache[[b]][[v]][[k]] -> centers
+      boot_cluster_cache <- list()
+      k_ranges <- list() # Common range for grid search (derived from full data stats or per-fold?)
+      # We'll derive global valid ranges to keep grid consistent, but check per-fold feasibility
+      
+      cat("    Pre-computing clusters for bootstrap folds...\n")
+      
       for(v in valid_classes) {
-        veg_mat <- storage[[v]]
-        n_samples <- nrow(veg_mat)
-        
-        # Base Weighted Matrix
-        veg_mat_w <- sweep(veg_mat, 2, w_vec, "*")
-        
-        # Prepare Input for Clustering
-        if (metric == "cosine") {
-             # L2-normalize rows for Spherical K-Means proxy
-             veg_mat_input <- t(apply(veg_mat_w, 1, function(r) {
-                 nm <- sqrt(sum(r^2))
-                 if (nm < 1e-9) r else r / nm
-             }))
-        } else {
-             veg_mat_input <- veg_mat_w
-        }
-
-        # Valid k range
+        # Determine valid K range based on TOTAL samples (upper bound)
+        n_total <- nrow(storage[[v]])
         if (v == "barren") {
            k_candidates <- 1
         } else {
-           max_k <- floor(n_samples / min_cluster_size)
+           max_k <- floor(n_total / min_cluster_size)
            k_candidates <- 1:11
            k_candidates <- k_candidates[k_candidates <= max_k]
-           if (length(k_candidates) == 0) {
-             if (max_k >= 1) k_candidates <- 1:max_k else k_candidates <- 1
-           }
            if (length(k_candidates) == 0) k_candidates <- 1
         }
-
-        cluster_cache[[v]] <- list()
-        
-        for(k in k_candidates) {
-          set.seed(123)
-          if (k == 1) {
-             # k=1: Single Median (Same for both metrics for stability)
-             center_w <- apply(veg_mat_w, 2, median, na.rm=TRUE)
-             centers_unw <- center_w / w_vec
-             
-             # Filter against barren
-             keep <- TRUE
-             if (v != "barren" && !is.null(barren_ref_w)) {
-                 num <- sum(center_w * barren_ref_w)
-                 den <- sqrt(sum(center_w^2)) * sqrt(sum(barren_ref_w^2))
-                 sim <- if (den > 1e-9) num/den else 0
-                 if (sim > 0.95) keep <- FALSE
-             }
-             
-             if (keep) {
-                 cluster_cache[[v]][[as.character(k)]] <- list(centers = matrix(centers_unw, nrow=1), k = 1, sizes = n_samples)
-             }
-          } else {
-             km <- tryCatch(kmeans(veg_mat_input, centers = k, nstart = 10, iter.max = 50), error = function(e) NULL)
-             if(!is.null(km)) {
-               if(min(table(km$cluster)) >= min_cluster_size) {
-                 sizes <- km$size
-                 
-                 # Recover centroids in Weighted Space
-                 if (metric == "cosine") {
-                     # For Cosine: Centroid is the mean of original weighted vectors in the cluster
-                     # (Preserves magnitude info while using directional clustering)
-                     centers_w <- matrix(NA, nrow=k, ncol=ncol(veg_mat_w))
-                     for(ci in 1:k) {
-                         centers_w[ci, ] <- colMeans(veg_mat_w[km$cluster == ci, , drop=FALSE])
-                     }
-                 } else {
-                     # For Euclidean: K-means centroids are already in weighted space
-                     centers_w <- km$centers
-                 }
-
-                 # Store Unweighted Centers
-                 centers_unw <- sweep(centers_w, 2, w_vec, "/")
-
-                 # Filter Soil-Like Variants
-                 if (v != "barren" && !is.null(barren_ref_w)) {
-                     keep_mask <- apply(centers_unw, 1, function(row) {
-                         row_w <- row * w_vec
-                         num <- sum(row_w * barren_ref_w)
-                         den <- sqrt(sum(row_w^2)) * sqrt(sum(barren_ref_w^2))
-                         sim <- if (den > 1e-9) num/den else 0
-                         return(sim <= 0.95)
-                     })
-                     if (any(!keep_mask)) {
-                         centers_unw <- centers_unw[keep_mask, , drop=FALSE]
-                         sizes <- sizes[keep_mask]
-                     }
-                 }
-                 
-                 if (nrow(centers_unw) > 0) {
-                     cluster_cache[[v]][[as.character(k)]] <- list(centers = centers_unw, k = k, sizes = sizes)
-                 }
-               }
-             }
-          }
-        }
-        k_ranges[[v]] <- as.integer(names(cluster_cache[[v]]))
+        k_ranges[[v]] <- k_candidates
       }
 
-      # --- PASS 3: Grid Search ---
+      for(b in 1:n_boot) {
+        boot_cluster_cache[[b]] <- list()
+        
+        for(v in valid_classes) {
+           boot_cluster_cache[[b]][[v]] <- list()
+           
+           train_idx <- folds[[b]][[v]]$train
+           if(length(train_idx) < min_cluster_size) {
+             # Fallback if bootstrap fold is empty/tiny: use all data
+             train_idx <- 1:nrow(storage[[v]])
+           }
+           
+           veg_mat_train <- storage[[v]][train_idx, , drop = FALSE]
+           veg_mat_w <- sweep(veg_mat_train, 2, w_vec, "*")
+           
+           # Input for K-Means
+           veg_mat_input <- veg_mat_w
+
+           for(k in k_ranges[[v]]) {
+             # Safe K-Means on this fold
+             # Adjust k if fold is smaller than expected (rare with bootstrap size, but possible)
+             if(nrow(veg_mat_input) < k) {
+               curr_k <- max(1, nrow(veg_mat_input))
+             } else {
+               curr_k <- k
+             }
+             
+             # Run K-Means
+             if(curr_k == 1) {
+                center_w <- apply(veg_mat_w, 2, median, na.rm=TRUE)
+                centers_unw <- center_w / w_vec
+                # Skip barren filter in OOB pre-compute for speed/robustness? 
+                # Better to apply it to match final logic.
+                boot_cluster_cache[[b]][[v]][[as.character(k)]] <- matrix(centers_unw, nrow=1)
+             } else {
+                km <- tryCatch(kmeans(veg_mat_input, centers = curr_k, nstart = 5, iter.max = 20), error = function(e) NULL)
+                if(!is.null(km)) {
+                  # Recover centroids
+                  centers_w <- km$centers
+                  centers_unw <- sweep(centers_w, 2, w_vec, "/")
+                  boot_cluster_cache[[b]][[v]][[as.character(k)]] <- centers_unw
+                }
+             }
+           }
+        }
+      }
+
+      # 3. Grid Search: Evaluate Combinations on OOB Sets
       grid <- expand.grid(k_ranges)
       n_combos <- nrow(grid)
       if (n_combos > 500) {
@@ -3869,130 +4135,275 @@ if ("pheno_year" %in% names(test_dly)) {
         grid <- grid[sample(seq_len(n_combos), 500), , drop=FALSE]
       }
       
-      # Prepare Test Set
-      test_samples <- list(); test_labels <- c()
-      for(v in valid_classes) {
-        if(nrow(storage[[v]]) > 0) {
-          test_samples[[length(test_samples)+1]] <- storage[[v]]
-          test_labels <- c(test_labels, rep(v, nrow(storage[[v]])))
-        }
-      }
-      Y_test <- do.call(rbind, test_samples)
+      cat(sprintf("    Evaluating %d cluster combinations on %d OOB folds...\n", nrow(grid), n_boot))
       
-      best_score <- -1
+      best_mean_score <- -1
       best_combo <- NULL
+      
+      # Prepare OOB Test Matrices for speed
+      # oob_data[[b]] -> matrix of all OOB samples for that fold
+      # oob_labels[[b]] -> vector of labels
+      oob_sets <- list()
+      for(b in 1:n_boot) {
+         samples <- list(); lbls <- c()
+         for(v in valid_classes) {
+            idx <- folds[[b]][[v]]$oob
+            if(length(idx) > 0) {
+               samples[[length(samples)+1]] <- storage[[v]][idx, , drop=FALSE]
+               lbls <- c(lbls, rep(v, length(idx)))
+            }
+         }
+         if(length(samples) > 0) {
+            oob_sets[[b]] <- list(Y = do.call(rbind, samples), labels = lbls)
+         } else {
+            oob_sets[[b]] <- NULL 
+         }
+      }
       
       run_solver <- function(y, M, w) {
         sq_w <- sqrt(pmax(w, 0)); M_w <- sweep(M, 1, sq_w, "*"); y_w <- y * sq_w
         tryCatch(nnls::nnls(M_w, y_w)$x, error=function(e) rep(0, ncol(M)))
       }
       
+      # Loop over Grid
+      # Parallelize this loop if possible? No, inner NNLS is fast enough.
+      
       for(i in seq_len(nrow(grid))) {
         combo <- grid[i, , drop=FALSE]
-        cols <- list(); col_names <- c()
-        for(v in valid_classes) {
-          k_val <- as.character(combo[[v]])
-          if (is.null(cluster_cache[[v]][[k_val]])) next
-          centers <- cluster_cache[[v]][[k_val]]$centers 
-          cols[[length(cols)+1]] <- t(centers)
-          col_names <- c(col_names, rep(v, nrow(centers)))
+        fold_scores <- numeric(n_boot)
+        valid_folds <- 0
+        
+        for(b in 1:n_boot) {
+           if(is.null(oob_sets[[b]])) next
+           
+           # Construct Library from Boot Cache using this Combo
+           cols <- list(); col_names <- c()
+           valid_lib <- TRUE
+           
+           for(v in valid_classes) {
+              k_val <- as.character(combo[[v]])
+              # Check if this fold has this k (might have failed or been skipped)
+              centers <- boot_cluster_cache[[b]][[v]][[k_val]]
+              if(is.null(centers)) { valid_lib <- FALSE; break }
+              
+              cols[[length(cols)+1]] <- t(centers)
+              col_names <- c(col_names, rep(v, nrow(centers)))
+           }
+           
+           if(!valid_lib) next
+           
+           M <- do.call(cbind, cols)
+           Y_test <- oob_sets[[b]]$Y
+           labels_test <- oob_sets[[b]]$labels
+           
+           # Evaluate
+           correct_by_class <- list(); total_by_class <- list()
+           for(vc in valid_classes) { correct_by_class[[vc]] <- 0; total_by_class[[vc]] <- 0 }
+           
+           # Batch or loop? Loop for now
+           for(j in seq_len(nrow(Y_test))) {
+              true_label <- labels_test[j]
+              total_by_class[[true_label]] <- total_by_class[[true_label]] + 1
+              
+              coefs <- run_solver(Y_test[j, ], M, params$weights)
+              sums <- tapply(coefs, col_names, sum)
+              
+              if (!true_label %in% names(sums)) next
+              score_true <- sums[[true_label]]
+              
+              competitors <- if (true_label == "barren") setdiff(names(sums), "barren") else setdiff(names(sums), c(true_label, "barren"))
+              score_max_other <- if(length(competitors)>0) max(sums[competitors]) else -1
+              
+              if (score_true > score_max_other) correct_by_class[[true_label]] <- correct_by_class[[true_label]] + 1
+           }
+           
+           # Macro Accuracy (Vegetation Only)
+           accs <- c()
+           veg_classes_only <- setdiff(valid_classes, "barren")
+           for(vc in veg_classes_only) if(total_by_class[[vc]] > 0) accs <- c(accs, correct_by_class[[vc]]/total_by_class[[vc]])
+           
+           if(length(accs) > 0) {
+              fold_scores[b] <- mean(accs)
+              valid_folds <- valid_folds + 1
+           }
         }
-        if (length(cols) == 0) next
         
-        M <- do.call(cbind, cols)
+        mean_score <- if(valid_folds > 0) sum(fold_scores) / valid_folds else -1
         
-        correct_by_class <- list()
-        total_by_class <- list()
-        for(vc in valid_classes) { correct_by_class[[vc]] <- 0; total_by_class[[vc]] <- 0 }
-        
-        for(j in seq_len(nrow(Y_test))) {
-          true_label <- test_labels[j]
-          total_by_class[[true_label]] <- total_by_class[[true_label]] + 1
-          
-          coefs <- run_solver(Y_test[j, ], M, params$weights)
-          sums <- tapply(coefs, col_names, sum)
-          
-          if (!true_label %in% names(sums)) next
-          score_true <- sums[[true_label]]
-          
-          competitors <- if (true_label == "barren") setdiff(names(sums), "barren") else setdiff(names(sums), c(true_label, "barren"))
-          score_max_other <- if(length(competitors)>0) max(sums[competitors]) else -1
-          
-          if (score_true > score_max_other) correct_by_class[[true_label]] <- correct_by_class[[true_label]] + 1
-        }
-        
-        accs <- c()
-        # Evaluate optimization metric based only on vegetation discrimination (excluding barren class performance)
-        veg_classes_only <- setdiff(valid_classes, "barren")
-        for(vc in veg_classes_only) if(total_by_class[[vc]] > 0) accs <- c(accs, correct_by_class[[vc]]/total_by_class[[vc]])
-        macro_acc <- if(length(accs)>0) mean(accs) else 0
-        
-        if (macro_acc > best_score) {
-          best_score <- macro_acc
+        if (mean_score > best_mean_score) {
+          best_mean_score <- mean_score
           best_combo <- combo
         }
       }
       
-      return(list(score = best_score, combo = best_combo, cache = cluster_cache))
-    }
-    
-    # -------------------------------------------------------------------------
-    # COMPARE AND SELECT BEST
-    # -------------------------------------------------------------------------
-    res_euc <- optimize_library("euclidean")
-    res_cos <- optimize_library("cosine")
-    
-    cat("\n=== CLUSTERING METHOD COMPARISON ===\n")
-    cat(sprintf("Euclidean Macro-Accuracy: %.2f%%\n", res_euc$score * 100))
-    cat(sprintf("Cosine Macro-Accuracy:    %.2f%%\n", res_cos$score * 100))
-    
-    if (res_cos$score >= res_euc$score) {
-      cat(">> Selecting COSINE clustering (Better or Equal)\n")
-      winner <- res_cos
-    } else {
-      cat(">> Selecting EUCLIDEAN clustering (Better)\n")
-      winner <- res_euc
-    }
-    
-    # -------------------------------------------------------------------------
-    # PASS 4: Build Final Library
-    # -------------------------------------------------------------------------
-    lib <- list()
-    cat(sprintf("Building final library using best combination (Score: %.1f%%)...\n", winner$score * 100))
-    print(winner$combo)
-    
-    for(v in valid_classes) {
-      k_best <- as.character(winner$combo[[v]])
-      if (is.null(winner$cache[[v]][[k_best]])) {
-         # Fallback if combo is invalid (should not happen)
-         k_best <- names(winner$cache[[v]])[1]
-      }
-      centers_unw <- winner$cache[[v]][[k_best]]$centers 
-      sizes <- winner$cache[[v]][[k_best]]$sizes
+      cat(sprintf("    Best OOB Score: %.4f using combo: %s\n", best_mean_score, paste(names(best_combo), best_combo, sep="=", collapse=", ")))
       
-      variants_out <- list()
-      for(r in seq_len(nrow(centers_unw))) {
-        raw_row <- centers_unw[r, ]
-        vec_w <- raw_row * w_vec
-        
-        variants_out[[length(variants_out)+1]] <- list(
-          vec = vec_w,
-          id = paste0(v, "_v", r),
-          raw_row = raw_row,
-          n_samples = sizes[r] 
-        )
+      # --- AGENT ADDITION: Average Confusion Matrix Calculation ---
+      cat("\n    Computing Average Confusion Matrix across OOB folds for best combination...\n")
+      
+      # Initialize Confusion Matrix
+      # Rows: True, Cols: Predicted
+      cm_labels <- valid_classes
+      conf_mat <- matrix(0, nrow = length(cm_labels), ncol = length(cm_labels))
+      rownames(conf_mat) <- cm_labels
+      colnames(conf_mat) <- cm_labels
+      
+      total_samples <- 0
+      
+      for(b in 1:n_boot) {
+         if(is.null(oob_sets[[b]])) next
+         
+         # Construct Library for this fold
+         cols <- list(); col_names <- c()
+         valid_lib <- TRUE
+         
+         for(v in valid_classes) {
+            k_val <- as.character(best_combo[[v]])
+            centers <- boot_cluster_cache[[b]][[v]][[k_val]]
+            if(is.null(centers)) { valid_lib <- FALSE; break }
+            cols[[length(cols)+1]] <- t(centers)
+            col_names <- c(col_names, rep(v, nrow(centers)))
+         }
+         
+         if(!valid_lib) next
+         
+         M <- do.call(cbind, cols)
+         Y_test <- oob_sets[[b]]$Y
+         labels_test <- oob_sets[[b]]$labels
+         
+         for(j in seq_len(nrow(Y_test))) {
+            true_label <- labels_test[j]
+            coefs <- run_solver(Y_test[j, ], M, params$weights)
+            sums <- tapply(coefs, col_names, sum)
+            
+            # Predict class with max coefficient
+            if(length(sums) > 0) {
+                pred_label <- names(sums)[which.max(sums)]
+                
+                # Update Matrix
+                if(true_label %in% cm_labels && pred_label %in% cm_labels) {
+                    conf_mat[true_label, pred_label] <- conf_mat[true_label, pred_label] + 1
+                    total_samples <- total_samples + 1
+                }
+            }
+         }
       }
-      lib[[v]] <- variants_out
+      
+      cat("\n    [OOB Confusion Matrix - Sum over all folds]\n")
+      print(conf_mat)
+      
+      # Row-normalized (Producer's Accuracy / Recall)
+      conf_mat_pct <- sweep(conf_mat, 1, rowSums(conf_mat), "/")
+      conf_mat_pct[is.nan(conf_mat_pct)] <- 0
+      
+      cat("\n    [OOB Confusion Matrix - Row Normalized (Recall)]\n")
+      print(round(conf_mat_pct, 2))
+      
+      # Compute Overall Accuracy on OOB
+      oa <- sum(diag(conf_mat)) / sum(conf_mat)
+      cat(sprintf("\n    Overall OOB Accuracy: %.2f%%\n", oa * 100))
+      
+      # --- END AGENT ADDITION ---
+
+      return(best_combo)
     }
     
-    # Final check for collinearity across ALL variants (intra- and inter-class)
-    # This ensures that even if different classes produced similar centroids, we remove redundancy.
-    if (exists("prune_collinear_variants", mode = "function")) {
-      lib <- prune_collinear_variants(lib, threshold = 0.99)
+    # -------------------------------------------------------------------------
+    # MAIN EXECUTION
+    # -------------------------------------------------------------------------
+    
+    # 1. Run Optimization to get Best K-Combo
+    best_combo <- optimize_library(n_boot = 5)
+    
+    # 2. Re-Train Final Clusters on FULL Dataset using Best K
+    cat("\n[LIBRARY BUILD] Re-training final clusters on full dataset using optimal counts...\n")
+    
+    final_lib_cache <- list()
+    
+    # Pre-compute Barren Weighted Center for Final Filtering
+    barren_ref_w <- NULL
+    if ("barren" %in% valid_classes) {
+       b_mat <- storage[["barren"]]
+       b_mat_w <- sweep(b_mat, 2, w_vec, "*")
+       barren_ref_w <- apply(b_mat_w, 2, median, na.rm=TRUE)
     }
 
-    lib
+    for(v in valid_classes) {
+       k_opt <- as.numeric(best_combo[[v]])
+       veg_mat <- storage[[v]]
+       veg_mat_w <- sweep(veg_mat, 2, w_vec, "*")
+       
+       # Check availability
+       if(nrow(veg_mat) < k_opt) {
+          k_opt <- max(1, nrow(veg_mat))
+          cat(sprintf("  [WARNING] Reducing k for '%s' to %d (insufficient samples)\n", v, k_opt))
+       }
+       
+       # Final Clustering
+       final_centers_unw <- NULL
+       
+       if (k_opt == 1) {
+          center_w <- apply(veg_mat_w, 2, median, na.rm=TRUE)
+          final_centers_unw <- matrix(center_w / w_vec, nrow=1)
+       } else {
+          # Use Euclidean K-Means (consistent with best practice for final shapes)
+          km <- tryCatch(kmeans(veg_mat_w, centers = k_opt, nstart = 20, iter.max = 50), error = function(e) NULL)
+          if(!is.null(km)) {
+             final_centers_unw <- sweep(km$centers, 2, w_vec, "/")
+          }
+       }
+       
+       # Filter Soil-Like Variants (Consistently applied)
+       if (!is.null(final_centers_unw) && v != "barren" && !is.null(barren_ref_w)) {
+           keep_mask <- apply(final_centers_unw, 1, function(row) {
+               row_w <- row * w_vec
+               num <- sum(row_w * barren_ref_w)
+               den <- sqrt(sum(row_w^2)) * sqrt(sum(barren_ref_w^2))
+               sim <- if (den > 1e-9) num/den else 0
+               return(sim <= 0.95)
+           })
+           # Always keep at least one
+           if (any(keep_mask)) {
+               final_centers_unw <- final_centers_unw[keep_mask, , drop=FALSE]
+           } else {
+               cat(sprintf("  [WARNING] All variants for '%s' were too similar to barren. Keeping the most distinct one.\n", v))
+               sims <- apply(final_centers_unw, 1, function(row) {
+                   row_w <- row * w_vec
+                   num <- sum(row_w * barren_ref_w)
+                   den <- sqrt(sum(row_w^2)) * sqrt(sum(barren_ref_w^2))
+                   if (den > 1e-9) num/den else 0
+               })
+               best_idx <- which.min(sims)
+               final_centers_unw <- final_centers_unw[best_idx, , drop=FALSE]
+           }
+       }
+       
+       if (!is.null(final_centers_unw)) {
+          final_lib_cache[[v]] <- final_centers_unw
+       }
+    }
+    
+    # 3. Construct Final Library Structure (Legacy Format)
+    res_lib <- list()
+    for(v in names(final_lib_cache)) {
+       mat <- final_lib_cache[[v]]
+       res_lib[[v]] <- list()
+       for(i in 1:nrow(mat)) {
+          # Construct dummy variant object
+          # Re-normalization to T_medoid structure if needed?
+          # The rest of the pipeline expects 'vec' (unweighted, z-scored) or 'T' (medoid).
+          # Here we provide 'vec'.
+          res_lib[[v]][[length(res_lib[[v]]) + 1]] <- list(
+             vec = mat[i, ],
+             id = paste0(v, "_opt_", i),
+             n_samples = floor(nrow(storage[[v]]) / nrow(mat)) # Approximate n_samples
+          )
+       }
+    }
+    
+    return(res_lib)
   }
+
 
   precompute_optimized_library_weighted <- function(mesma_lib, grid_type = "full", feature_weights = NULL) {
     opt_lib <- list()
@@ -4306,6 +4717,79 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
     }
     # ============================
 
+    # --- New Logic: Estimate barren fraction purely through PPI ---
+    # Moved from end of function to allow early exit for pure barren pixels
+    # 1. Get current PPI for the task (prefer raw PPI if available)
+    current_ppi <- NA_real_
+    ppi_col <- if ("PPI_raw" %in% names(task_data)) "PPI_raw" else "PPI"
+
+    if (ppi_col %in% names(task_data)) {
+      # Filter task_data for summer months (June-September)
+      summer_task_data <- if ("month" %in% names(task_data)) task_data[task_data$month %in% 6:9, ] else task_data
+      if (nrow(summer_task_data) > 0) {
+        current_ppi <- median(summer_task_data[[ppi_col]], na.rm = TRUE)
+      } else {
+        # Fallback if no summer data, use median of all available data for the year
+        current_ppi <- median(task_data[[ppi_col]], na.rm = TRUE)
+         if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] loc=%s yr=%d: No summer PPI data found; falling back to median of all annual PPI values.\n", loc, yr))
+      }
+    }
+
+    total_veg_cover <- 0 # Default to 0 if PPI is not available or invalid
+    barren_fraction <- 1.0
+
+    if (is.finite(current_ppi)) {
+      # Linear interpolation of PPI to total vegetation cover
+      slope <- 1 / (PPI_FULL_VEG_COVER - PPI_ZERO_VEG_COVER)
+      total_veg_cover <- (current_ppi - PPI_ZERO_VEG_COVER) * slope
+      
+      # Clamp to [0, 1]
+      total_veg_cover <- pmin(pmax(total_veg_cover, 0), 1)
+      barren_fraction <- 1 - total_veg_cover
+    }
+    
+    # SHORTCUT: If barren fraction > 0.95, return pure barren immediately
+    if (barren_fraction > 0.95) {
+      if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] loc=%s yr=%d: High barren fraction (%.3f > 0.95) - returning pure barren without unmixing\n", loc, yr, barren_fraction))
+      
+      coef_df_barren <- data.frame(
+        location_id = loc,
+        pheno_year = yr,
+        lat = lat_val,
+        lon = lon_val,
+        Veg = "barren",
+        variant_id = "barren_ppi",
+        coef = 1.0, # Force to 1.0 as requested
+        rmse = 0,
+        coef_025 = NA,
+        coef_975 = NA,
+        coef_sd = 0,
+        interval = NA,
+        n_obs = nrow(task_data),
+        inseparable_variant_flag = FALSE,
+        inseparable_variant_details = NA_character_,
+        stringsAsFactors = FALSE
+      )
+      
+      diag_df_barren <- data.frame(location_id = loc, pheno_year = yr, stringsAsFactors = FALSE)
+      diag_df_barren$barren_fraction <- 1.0
+      diag_df_barren$barren_fraction_ppi_based <- barren_fraction
+      
+      # Return minimal valid structure
+      return(list(
+        coef_df = coef_df_barren,
+        diagnostics = diag_df_barren,
+        uncertainty = NULL, 
+        residuals = if (exists("y_raw")) y_raw else numeric(0),
+        y_hat = if (exists("y_raw")) rep(0, length(y_raw)) else numeric(0),
+        y_obs = if (exists("y_raw")) y_raw else numeric(0),
+        E_best = matrix(0, nrow=0, ncol=0),
+        top_variants = list(),
+        weights_masked = NULL,
+        valid_mask = valid_mask
+      ))
+    }
+
     # ===== SINGLE-STAGE UNMIXING =====
       # Normalize the observation using single-stage parameters
       y_norm <- y_raw
@@ -4388,14 +4872,8 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
         for (ev in empty_vegs) top_variants[[ev]] <- NULL
       }
 
-      # Remove barren category entirely before unmixing
-      if ("barren" %in% names(top_variants)) {
-        if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] loc=%s yr=%d: Removing 'barren' from top_variants before unmixing.\n", loc, yr))
-        top_variants[["barren"]] <- NULL
-      }
-
       if (length(top_variants) == 0) {
-        if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] loc=%s yr=%d: no top_variants available after removing barren, skipping\n", loc, yr))
+        if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] loc=%s yr=%d: no top_variants available after filtering empties, skipping\n", loc, yr))
         return(NULL)
       }
       
@@ -4453,6 +4931,33 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
         stringsAsFactors = FALSE
       )
 
+      # Keep barren in the solve, but strip it from coefficients before reporting; barren fraction comes from PPI
+      barren_solver_mask <- tolower(coef_df$Veg) == "barren"
+      if (any(barren_solver_mask)) {
+        if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] loc=%s yr=%d: Removing %d barren variants after solving; PPI supplies barren fraction.\n", loc, yr, sum(barren_solver_mask)))
+        coef_df <- coef_df[!barren_solver_mask, , drop = FALSE]
+      }
+
+      # Apply 5% minimum fraction filter to VEGETATION types only (after barren removal)
+      # This ensures vegetation types compete fairly against each other
+      if (nrow(coef_df) > 0) {
+        veg_sum <- sum(coef_df$coef, na.rm = TRUE)
+        if (veg_sum > 1e-9) {
+          rel_fracs <- coef_df$coef / veg_sum
+          min_frac <- 0.05
+          below_thresh <- rel_fracs < min_frac
+          if (any(below_thresh)) {
+            if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] loc=%s yr=%d: Zeroing %d vegetation types below 5%% threshold.\n", loc, yr, sum(below_thresh)))
+            coef_df$coef[below_thresh] <- 0
+            # Renormalize remaining to sum to original veg_sum
+            new_sum <- sum(coef_df$coef, na.rm = TRUE)
+            if (new_sum > 1e-9) {
+              coef_df$coef <- coef_df$coef * (veg_sum / new_sum)
+            }
+          }
+        }
+      }
+
       # --- Mark inseparable variants (drop instead of assign Veg = 'unknown') if detected in similarity tables ---
       sim_tbl <- NULL
       if (exists("INSEPARABLE_VARIANT_INFO") && !is.null(INSEPARABLE_VARIANT_INFO$similarity_table)) {
@@ -4494,7 +4999,7 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
             coef_df$inseparable_variant_details[mask] <- details
 
             # New behavior: drop variants only if similarity > 0.95 with barren.
-            sim_col <- intersect(c("cos_sim","Similarity","similarity","sim"), names(sim_tbl))[1]
+            sim_col <- intersect(c("Similarity","similarity","sim"), names(sim_tbl))[1]
             if (!is.na(sim_col)) {
               for (i in seq_len(nrow(sim_tbl))) {
                 sim_val <- as.numeric(sim_tbl[[sim_col]][i])
@@ -4538,38 +5043,15 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
       }
 
       # Aggregate by vegetation type (sum coefficients for same veg type)
-      coef_agg <- aggregate(coef ~ Veg, data = coef_df, FUN = sum)
-
-      # --- New Logic: Estimate barren fraction purely through PPI ---
-      # 1. Get current PPI for the task (prefer raw PPI if available)
-      current_ppi <- NA_real_
-      ppi_col <- if ("PPI_raw" %in% names(task_data)) "PPI_raw" else "PPI"
-
-      if (ppi_col %in% names(task_data)) {
-        # Filter task_data for summer months (June-September)
-        summer_task_data <- task_data[task_data$month %in% 6:9, ]
-        if (nrow(summer_task_data) > 0) {
-          current_ppi <- median(summer_task_data[[ppi_col]], na.rm = TRUE)
-        } else {
-          # Fallback if no summer data, use median of all available data for the year
-          current_ppi <- median(task_data[[ppi_col]], na.rm = TRUE)
-          if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] loc=%s yr=%d: No summer PPI data found; falling back to median of all annual PPI values.\n", loc, yr))
-        }
+      if (nrow(coef_df) > 0) {
+        coef_agg <- aggregate(coef ~ Veg, data = coef_df, FUN = sum)
+      } else {
+        coef_agg <- data.frame(Veg = character(0), coef = numeric(0), stringsAsFactors = FALSE)
       }
 
-      total_veg_cover <- 0 # Default to 0 if PPI is not available or invalid
-      barren_fraction <- 1.0
+      # --- PPI-based barren fraction (calculated at start of function) ---
+      # Variables current_ppi, total_veg_cover, and barren_fraction are already set at the top of fit_one_task.
 
-      if (is.finite(current_ppi)) {
-        # Linear interpolation of PPI to total vegetation cover
-        # 0 PPI_ZERO_VEG_COVER = 0% veg, PPI_FULL_VEG_COVER = 100% veg
-        slope <- 1 / (PPI_FULL_VEG_COVER - PPI_ZERO_VEG_COVER)
-        total_veg_cover <- (current_ppi - PPI_ZERO_VEG_COVER) * slope
-        
-        # Clamp to [0, 1]
-        total_veg_cover <- pmin(pmax(total_veg_cover, 0), 1)
-        barren_fraction <- 1 - total_veg_cover
-      }
       
       # Re-normalize existing vegetation coefficients to sum to total_veg_cover
       # Exclude 'barren' if it somehow snuck in (it shouldn't due to earlier filtering)
@@ -4788,7 +5270,31 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
             year_data <- location_data[location_data$pheno_year == yr, , drop = FALSE]
             n_obs <- nrow(year_data)
             if (n_obs < max(6, MIN_OBS_PER_LOC_YEAR)) {
-              if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG] Skipping bootstrap for loc=%s yr=%s (n_obs=%d)\n", loc, yr, n_obs))
+              if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG] Too few observations for bootstrap loc=%s yr=%s (n_obs=%d); applying small-n CI inflation fallback\n", loc, yr, n_obs))
+
+              # Populate conservative uncertainty directly on the coefficient table
+              curr_df <- year_results[[as.character(yr)]]$coef_df
+              if (!is.null(curr_df) && nrow(curr_df) > 0) {
+                for (r in seq_len(nrow(curr_df))) {
+                  # Keep any existing sd signal (e.g., top-model spread) but inflate aggressively for small n
+                  ci <- small_n_inflated_ci(
+                    est = curr_df$coef[r],
+                    sd_in = if ("coef_sd" %in% names(curr_df)) curr_df$coef_sd[r] else NA_real_,
+                    n_obs = n_obs
+                  )
+                  curr_df$coef_025[r] <- ci$coef_025
+                  curr_df$coef_975[r] <- ci$coef_975
+                  curr_df$coef_sd[r] <- ci$coef_sd
+                  curr_df$interval[r] <- ci$interval
+                }
+                year_results[[as.character(yr)]]$coef_df <- curr_df
+
+                if (isTRUE(TESTING_MODE)) {
+                  widths <- curr_df$coef_975 - curr_df$coef_025
+                  cat(sprintf("[DEBUG] small-n fallback CI widths loc=%s yr=%s: median=%.3f (n_obs=%d)\n",
+                              loc, yr, median(widths, na.rm = TRUE), n_obs))
+                }
+              }
               next
             }
 
@@ -5482,6 +5988,34 @@ flush.console()
       write.csv(all_coefs, file.path(OUT_DIR, "training_results.csv"), row.names = FALSE)
   }
 
+  # --- Optional: Estimate uncertainty inflation parameters from data (Option A) ---
+  if (isTRUE(ESTIMATE_UNCERTAINTY_PARAMS_OPTION_A)) {
+    cat("[UNCERTAINTY PARAM EST] Running Option A subsampling calibration...\n")
+    est <- tryCatch({
+      estimate_uncertainty_params_optionA(
+        df_tasks = df_tasks,
+        high_n = UNCERTAINTY_PARAM_EST_HIGH_N,
+        max_groups = UNCERTAINTY_PARAM_EST_MAX_GROUPS,
+        target_ns = UNCERTAINTY_PARAM_EST_TARGET_NS,
+        reps = UNCERTAINTY_PARAM_EST_REPS,
+        seed = UNCERTAINTY_PARAM_EST_SEED,
+        veg_levels = ALLOWED_VEG,
+        quiet = TRUE
+      )
+    }, error = function(e) {
+      cat(sprintf("[UNCERTAINTY PARAM EST] Failed: %s\n", e$message))
+      NULL
+    })
+    if (!is.null(est)) {
+      cat(sprintf("[UNCERTAINTY PARAM EST] Estimated N_POWER ~ %.3f\n", est$N_POWER_hat))
+      cat(sprintf("[UNCERTAINTY PARAM EST] Estimated N_REF ~ %d\n", est$N_REF_hat))
+      # Persist results for inspection
+      out_csv <- file.path(OUT_DIR, "uncertainty_param_estimate_optionA.csv")
+      try(write.csv(est$summary, out_csv, row.names = FALSE), silent = TRUE)
+      cat(sprintf("[UNCERTAINTY PARAM EST] Wrote summary to %s\n", out_csv))
+    }
+  }
+
   # Calculate total number of year results processed
   n_year_results <- if (!is.null(all_coefs) && nrow(all_coefs) > 0) {
     length(unique(paste(all_coefs$location_id, all_coefs$pheno_year, sep = "_")))
@@ -5794,6 +6328,20 @@ flush.console()
     }
 
     prefix <- if (nzchar(label)) paste0(" (", label, ")") else ""
+
+    # Optional PPI-based truth for vegetation cover (derived from PPI barren fraction)
+    ppi_truth <- NULL
+    if (exists("all_diagnostics") && !is.null(all_diagnostics) &&
+        all(c("location_id", "pheno_year") %in% names(all_diagnostics)) &&
+        "barren_fraction_ppi_based" %in% names(all_diagnostics)) {
+      ppi_truth <- all_diagnostics |>
+        dplyr::select(location_id, pheno_year, barren_fraction_ppi_based) |>
+        dplyr::mutate(
+          barren_fraction_ppi_based = pmin(pmax(barren_fraction_ppi_based, 0), 1),
+          true_veg_cover_ppi = 1 - barren_fraction_ppi_based
+        ) |>
+        dplyr::distinct()
+    }
     
     # --- 1. Identify Valid Locations and Get True Labels ---
     labels_df <- NULL
@@ -5829,11 +6377,21 @@ flush.console()
     # We join first to filter efficiently
     val_coefs_labeled <- val_coefs %>% 
        dplyr::inner_join(labels_df, by = "location_id")
-       
-    if (nrow(val_coefs_labeled) == 0) {
-       cat("[NOTICE] No overlap between coefficients and labeled locations.\n")
+
+     # Drop barren from classification accuracy; rely on PPI-based cover truth instead
+     if ("true_veg" %in% names(val_coefs_labeled)) {
+       barren_mask <- tolower(val_coefs_labeled$true_veg) == "barren"
+       if (any(barren_mask, na.rm = TRUE)) {
+        cat(sprintf("[NOTICE] Dropping %d validation rows with true_veg=='barren' from classification accuracy; using PPI cover truth instead when available.\n",
+                sum(barren_mask, na.rm = TRUE)))
+        val_coefs_labeled <- val_coefs_labeled[!barren_mask, , drop = FALSE]
+       }
+     }
+    
+     if (nrow(val_coefs_labeled) == 0) {
+       cat("[NOTICE] No labeled validation rows remain after removing barren truth.\n")
        return(invisible(NULL))
-    }
+     }
     
     cat(sprintf("\n=== VALIDATION ACCURACY ON HELD-OUT SET%s ===\n", prefix))
     cat(sprintf("Validation set: %d locations, %d location-year pairs\n", 
@@ -5872,39 +6430,61 @@ flush.console()
           return(invisible(NULL))
        }
        
+       # AGENT: Aggregate variants to vegetation class level (e.g. "phragmites_opt_1" -> "phragmites")
        val_coefs_wide <- val_coefs_labeled %>%
-         dplyr::select(location_id, pheno_year, true_veg, Veg, dplyr::all_of(measure_col)) %>%
-         tidyr::pivot_wider(names_from = Veg, values_from = dplyr::all_of(measure_col), values_fill = 0, names_prefix = "frac_")
+         dplyr::mutate(
+             # Remove common suffixes to get base class: _opt_N, _single, _ppi
+             Veg_class = sub("(_opt_[0-9]+|_single|_ppi)$", "", Veg)
+         ) %>%
+         dplyr::select(location_id, pheno_year, true_veg, Veg_class, dplyr::all_of(measure_col)) %>%
+         tidyr::pivot_wider(names_from = Veg_class, 
+                            values_from = dplyr::all_of(measure_col), 
+                            values_fill = 0, 
+                            values_fn = sum, 
+                            names_prefix = "frac_")
     }
 
-    veg_cols <- grep("^frac_", names(val_coefs_wide), value = TRUE)
+    # Identify all fraction columns (now aggregated by class)
+    all_veg_cols <- grep("^frac_", names(val_coefs_wide), value = TRUE)
+    
+    # For PPI analysis, we might exclude barren if strictly analyzing "vegetation" cover
+    veg_cols_no_barren <- all_veg_cols[all_veg_cols != "frac_barren"]
+
+    # --- PPI-based total vegetation cover validation (truth from PPI-derived cover) ---
+    if (!is.null(ppi_truth) && !is.null(val_coefs_wide) && length(veg_cols_no_barren) > 0) {
+      ppi_join <- val_coefs_wide %>%
+        dplyr::left_join(ppi_truth, by = c("location_id", "pheno_year"))
+
+      if ("true_veg_cover_ppi" %in% names(ppi_join)) {
+        ppi_join$pred_total_veg_cover <- rowSums(ppi_join[, veg_cols_no_barren, drop = FALSE], na.rm = TRUE)
+        ppi_join$true_veg_cover_ppi <- pmin(pmax(ppi_join$true_veg_cover_ppi, 0), 1)
+
+        cover_rows <- ppi_join[is.finite(ppi_join$true_veg_cover_ppi), , drop = FALSE]
+        if (nrow(cover_rows) > 0) {
+          mae_cover <- mean(abs(cover_rows$pred_total_veg_cover - cover_rows$true_veg_cover_ppi), na.rm = TRUE)
+          bias_cover <- mean(cover_rows$pred_total_veg_cover - cover_rows$true_veg_cover_ppi, na.rm = TRUE)
+          cat("\n--- PPI-BASED VEGETATION COVER VALIDATION ---\n")
+          cat(sprintf("Samples with PPI truth: %d\n", nrow(cover_rows)))
+          cat(sprintf("Mean absolute error (pred veg cover vs PPI): %.3f\n", mae_cover))
+          cat(sprintf("Mean bias (pred - truth): %.3f\n", bias_cover))
+        } else {
+          cat("[NOTICE] PPI truth found but no matching location-year rows after filtering.\n")
+        }
+      }
+    }
     
     # --- 3. Compute Mean Predicted Fraction ---
-    if (length(veg_cols) > 0) {
+    # Use raw fractions directly (MESMA coefficients already sum to 1)
+    if (length(all_veg_cols) > 0) {
       for (v in unique(val_coefs_wide$true_veg)) {
+        if (tolower(v) == "barren") next
         sub <- val_coefs_wide[val_coefs_wide$true_veg == v, ]
         if (nrow(sub) > 0) {
           frac_col <- paste0("frac_", v) # e.g. frac_populus
           
           if (frac_col %in% names(sub)) {
-            if (v == "barren") {
-              mean_frac <- mean(sub[[frac_col]], na.rm = TRUE)
-            } else {
-              # Relative vegetation fraction
-              barren_col <- "frac_barren"
-              veg_frac_cols <- veg_cols[veg_cols != barren_col]
-              
-              rescaled_fracs <- sapply(1:nrow(sub), function(i) {
-                vals <- unlist(sub[i, veg_frac_cols])
-                total_veg <- sum(vals, na.rm = TRUE)
-                if (total_veg > 1e-9) {
-                  as.numeric(sub[i, frac_col]) / total_veg
-                } else {
-                  NA_real_
-                }
-              })
-              mean_frac <- mean(rescaled_fracs, na.rm = TRUE)
-            }
+            # Use raw fraction directly (no rescaling needed - MESMA coeffs sum to 1)
+            mean_frac <- mean(sub[[frac_col]], na.rm = TRUE)
             cat(sprintf("  %s: mean predicted fraction = %.3f\n", v, mean_frac))
           } else {
              # If the column doesn't exist, it means the model NEVER predicted this class
@@ -5915,40 +6495,51 @@ flush.console()
     }
 
     # --- 4. Confusion Matrix (Average Predicted Fractions) ---
-    if (length(veg_cols) > 0) {
-      cat("\n--- CONFUSION MATRIX (Average Predicted Fractions) ---\n")
-      cat("Rows: True Class | Columns: Mean Predicted Fraction\n\n")
+    if (length(all_veg_cols) > 0) {
+      # Exclude barren from columns
+      matrix_veg_cols <- all_veg_cols[all_veg_cols != "frac_barren"]
       
-      # Group by true_veg and calculate means for all frac_ columns
-      avg_fractions <- val_coefs_wide %>%
-        dplyr::group_by(true_veg) %>%
-        dplyr::summarize(dplyr::across(dplyr::all_of(veg_cols), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
-      
-      # Clean up column names (remove frac_)
-      colnames(avg_fractions) <- sub("^frac_", "", colnames(avg_fractions))
-      
-      # Convert to matrix for nice printing
-      mat_data <- as.matrix(avg_fractions[, -1]) # exclude true_veg column
-      rownames(mat_data) <- avg_fractions$true_veg
-      
-      # Sort rows and columns alphabetically
-      sorted_classes <- sort(union(rownames(mat_data), colnames(mat_data)))
-      
-      # Ensure all classes exist in both dimensions (add missing cols with 0)
-      missing_cols <- setdiff(sorted_classes, colnames(mat_data))
-      if(length(missing_cols) > 0) {
-        for(mc in missing_cols) {
-          mat_data <- cbind(mat_data, 0)
-          colnames(mat_data)[ncol(mat_data)] <- mc
-        }
+      if (length(matrix_veg_cols) > 0) {
+          cat("\n--- CONFUSION MATRIX (Average Predicted Fractions, excluding Barren) ---\n")
+          cat("Rows: True Class | Columns: Mean Predicted Fraction\n\n")
+          
+          # Group by true_veg (excluding barren rows) and calculate means for non-barren frac columns
+          avg_fractions <- val_coefs_wide %>%
+            dplyr::filter(tolower(true_veg) != "barren") %>%
+            dplyr::group_by(true_veg) %>%
+            dplyr::summarize(dplyr::across(dplyr::all_of(matrix_veg_cols), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+          
+          # Clean up column names (remove frac_)
+          colnames(avg_fractions) <- sub("^frac_", "", colnames(avg_fractions))
+          
+          # Convert to matrix for nice printing
+          mat_data <- as.matrix(avg_fractions[, -1]) # exclude true_veg column
+          rownames(mat_data) <- avg_fractions$true_veg
+          
+          # Sort rows and columns alphabetically
+          sorted_classes <- sort(union(rownames(mat_data), colnames(mat_data)))
+          
+          # Ensure all classes exist in both dimensions (add missing cols with 0)
+          missing_cols <- setdiff(sorted_classes, colnames(mat_data))
+          if(length(missing_cols) > 0) {
+            for(mc in missing_cols) {
+              mat_data <- cbind(mat_data, 0)
+              colnames(mat_data)[ncol(mat_data)] <- mc
+            }
+          }
+          
+          # Reorder
+          mat_data <- mat_data[match(sorted_classes, rownames(mat_data)), match(sorted_classes, colnames(mat_data))]
+          rownames(mat_data) <- sorted_classes # Restore rownames after subsetting/ordering might have dropped them if NAs
+          
+          # Print with 3 decimal places
+          print(round(mat_data, 3))
+          
+          # Print mean diagonal (average correctly predicted fraction across classes)
+          diag_vals <- diag(mat_data)
+          mean_diag <- mean(diag_vals, na.rm = TRUE)
+          cat(sprintf("\nMean correctly predicted fraction (diagonal average): %.3f\n", mean_diag))
       }
-      
-      # Reorder
-      mat_data <- mat_data[match(sorted_classes, rownames(mat_data)), match(sorted_classes, colnames(mat_data))]
-      rownames(mat_data) <- sorted_classes # Restore rownames after subsetting/ordering might have dropped them if NAs
-      
-      # Print with 3 decimal places
-      print(round(mat_data, 3))
     }
 
     # --- 5. Artificial Mix Logic ---
@@ -6272,15 +6863,12 @@ flush.console()
       variant_similarity_table <- INSEPARABLE_VARIANT_INFO$similarity_table
     }
     if (!is.null(variant_similarity_table) && nrow(variant_similarity_table) > 0) {
-      variant_similarity_table <- variant_similarity_table[order(variant_similarity_table$veg, -variant_similarity_table$cos_sim, variant_similarity_table$euclidean_dist), , drop = FALSE]
+      variant_similarity_table <- variant_similarity_table[order(variant_similarity_table$veg, variant_similarity_table$euclidean_dist), , drop = FALSE]
       if (requireNamespace("dplyr", quietly = TRUE)) {
         variant_similarity_summary <- variant_similarity_table |> 
           dplyr::group_by(.data$veg) |> 
           dplyr::summarise(
             pair_count = dplyr::n(),
-            max_cos_sim = if (all(is.na(.data$cos_sim))) NA_real_ else max(.data$cos_sim, na.rm = TRUE),
-            min_cos_sim = if (all(is.na(.data$cos_sim))) NA_real_ else min(.data$cos_sim, na.rm = TRUE),
-            median_cos_sim = if (all(is.na(.data$cos_sim))) NA_real_ else stats::median(.data$cos_sim, na.rm = TRUE),
             min_euclidean_dist = if (all(is.na(.data$euclidean_dist))) NA_real_ else min(.data$euclidean_dist, na.rm = TRUE),
             median_euclidean_dist = if (all(is.na(.data$euclidean_dist))) NA_real_ else stats::median(.data$euclidean_dist, na.rm = TRUE),
             .groups = "drop"
@@ -6292,9 +6880,6 @@ flush.console()
           data.frame(
             veg = veg_name,
             pair_count = nrow(tbl),
-            max_cos_sim = if (all(is.na(tbl$cos_sim))) NA_real_ else max(tbl$cos_sim, na.rm = TRUE),
-            min_cos_sim = if (all(is.na(tbl$cos_sim))) NA_real_ else min(tbl$cos_sim, na.rm = TRUE),
-            median_cos_sim = if (all(is.na(tbl$cos_sim))) NA_real_ else stats::median(tbl$cos_sim, na.rm = TRUE),
             min_euclidean_dist = if (all(is.na(tbl$euclidean_dist))) NA_real_ else min(tbl$euclidean_dist, na.rm = TRUE),
             median_euclidean_dist = if (all(is.na(tbl$euclidean_dist))) NA_real_ else stats::median(tbl$euclidean_dist, na.rm = TRUE),
             stringsAsFactors = FALSE
@@ -6473,7 +7058,7 @@ flush.console()
 
     if (!is.null(variant_similarity_table) && nrow(variant_similarity_table) > 0) {
       openxlsx::addWorksheet(wb, "Variant_Similarity")
-      openxlsx::writeData(wb, "Variant_Similarity", "Pairwise similarity across variants (cosine similarity and Euclidean distance)", startRow = 1, startCol = 1)
+      openxlsx::writeData(wb, "Variant_Similarity", "Pairwise similarity across variants (Euclidean distance)", startRow = 1, startCol = 1)
       start_row <- 2
       if (!is.null(variant_similarity_summary) && nrow(variant_similarity_summary) > 0) {
         openxlsx::writeData(wb, "Variant_Similarity", variant_similarity_summary, startRow = start_row, startCol = 1)
@@ -6617,23 +7202,31 @@ flush.console()
     best_fit_summary <- do.call(rbind, lapply(unique_locations, function(loc) {
       yrs <- unique(all_coefs$pheno_year[all_coefs$location_id == loc])
       tv <- true_veg_map$true_veg[true_veg_map$location_id == loc]
-      if (length(tv) == 0) tv <- NA_character_
+      tv_val <- if (length(tv) > 0) tv[1] else NA_character_
+      tv_lower <- tolower(tv_val)
 
-        do.call(rbind, lapply(yrs, function(yr) {
-        row <- all_coefs[all_coefs$location_id == loc & all_coefs$pheno_year == yr & tolower(all_coefs$Veg) == tolower(tv), , drop = FALSE]
+      do.call(rbind, lapply(yrs, function(yr) {
+        row <- all_coefs[all_coefs$location_id == loc & all_coefs$pheno_year == yr & tolower(all_coefs$Veg) == tv_lower, , drop = FALSE]
         pred <- if (nrow(row) == 1) row$coef else NA_real_
         pred_abs <- pred
         rmse_val <- if (nrow(row) == 1 && "rmse" %in% names(row)) row$rmse else NA_real_
-          sum_veg_coef <- sum(all_coefs$coef[all_coefs$location_id == loc & all_coefs$pheno_year == yr & tolower(all_coefs$Veg) != "barren"], na.rm = TRUE)
-          pred_rel <- if (!is.na(pred) && is.finite(sum_veg_coef) && sum_veg_coef > 0) pred / sum_veg_coef else NA_real_
-          pred_rel <- pmin(pred_rel, 1)  # Clamp to 1 to prevent >100%
-          abs_pct <- if (!is.na(pred_abs) && !is.na(tv)) abs(1 - pred_abs) * 100 else NA_real_
-          abs_pct_rel <- if (!is.na(pred_rel) && !is.na(tv)) abs(1 - pred_rel) * 100 else NA_real_
+        sum_veg_coef <- sum(all_coefs$coef[all_coefs$location_id == loc & all_coefs$pheno_year == yr & tolower(all_coefs$Veg) != "barren"], na.rm = TRUE)
+        pred_rel <- if (!is.na(pred) && is.finite(sum_veg_coef) && sum_veg_coef > 0) pred / sum_veg_coef else NA_real_
+        pred_rel <- pmin(pred_rel, 1)  # Clamp to 1 to prevent >100%
+        abs_pct <- if (!is.na(pred_abs) && !is.na(tv_val)) abs(1 - pred_abs) * 100 else NA_real_
+        abs_pct_rel <- if (!is.na(pred_rel) && !is.na(tv_val)) abs(1 - pred_rel) * 100 else NA_real_
+
+        is_barren_truth <- isTRUE(tv_lower == "barren")
+        pred_total_veg_cover <- sum_veg_coef
+
+        if (is_barren_truth) {
+          pred <- NA_real_; pred_abs <- NA_real_; pred_rel <- NA_real_; abs_pct <- NA_real_; abs_pct_rel <- NA_real_
+        }
 
         data.frame(
           location_id = loc,
           year = yr,
-          true_veg = tv,
+          true_veg = tv_val,
           pred_coef = pred_rel,
           pred_coef_abs = pred_abs,
           pred_coef_rel = pred_rel,
@@ -6641,15 +7234,46 @@ flush.console()
           abs_pct_diff = abs_pct_rel,
           abs_pct_diff_abs = abs_pct,
           abs_pct_diff_rel = abs_pct_rel,
+          is_barren_truth = is_barren_truth,
+          pred_total_veg_cover = pred_total_veg_cover,
+          true_veg_cover_ppi = NA_real_,
+          veg_cover_error_ppi = NA_real_,
           stringsAsFactors = FALSE
         )
       }))
     }))
 
+    # Attach PPI-derived vegetation cover truth when available
+    ppi_truth_summary <- NULL
+    if (exists("all_diagnostics") && !is.null(all_diagnostics) &&
+        all(c("location_id", "pheno_year") %in% names(all_diagnostics)) &&
+        "barren_fraction_ppi_based" %in% names(all_diagnostics)) {
+      ppi_truth_summary <- all_diagnostics %>%
+        dplyr::select(location_id, pheno_year, barren_fraction_ppi_based) %>%
+        dplyr::mutate(
+          barren_fraction_ppi_based_join = pmin(pmax(barren_fraction_ppi_based, 0), 1),
+          true_veg_cover_ppi_join = 1 - barren_fraction_ppi_based_join
+        ) %>%
+        dplyr::rename(year = pheno_year) %>%
+        dplyr::distinct()
+    }
+
+    if (!is.null(ppi_truth_summary)) {
+      best_fit_summary <- best_fit_summary %>%
+        dplyr::left_join(ppi_truth_summary, by = c("location_id", "year")) %>%
+        dplyr::mutate(
+          true_veg_cover_ppi = dplyr::coalesce(true_veg_cover_ppi, true_veg_cover_ppi_join),
+          veg_cover_error_ppi = ifelse(is.finite(pred_total_veg_cover) & is.finite(true_veg_cover_ppi),
+                                       pred_total_veg_cover - true_veg_cover_ppi,
+                                       veg_cover_error_ppi)
+        ) %>%
+        dplyr::select(-dplyr::any_of(c("true_veg_cover_ppi_join", "barren_fraction_ppi_based_join", "barren_fraction_ppi_based")))
+    }
+
     eval_years <- sort(unique(c(TRAIN_YEARS, TRAIN_YEARS - 1L, TRAIN_YEARS + 1L)))
     eval_years <- eval_years[is.finite(eval_years)]
     best_fit_summary$eval_window <- best_fit_summary$year %in% eval_years
-    best_fit_eval <- best_fit_summary[best_fit_summary$eval_window, , drop = FALSE]
+    best_fit_eval <- best_fit_summary[best_fit_summary$eval_window & !best_fit_summary$is_barren_truth, , drop = FALSE]
     if (nrow(best_fit_eval) == 0) {
       warning("No location-years fall within the TRAIN_YEARS +/- 1 evaluation window; overall fit cannot be computed")
     }
@@ -6675,19 +7299,6 @@ flush.console()
           if (length(true_veg_val) == 0) true_veg_val <- NA_character_
           true_veg_val <- true_veg_val[1]  # Take first value
 
-          quality_metrics <- loc_coefs |> 
-            dplyr::group_by(.data$pheno_year) |> 
-            dplyr::summarize(
-              deviation = sum(abs(.data$coef - (tolower(.data$Veg) == tolower(true_veg_val)))),
-              avg_rmse = mean(.data$rmse, na.rm = TRUE),
-              .groups = "drop"
-            ) |> 
-            dplyr::summarize(
-              avg_pct_deviation = mean(.data$deviation, na.rm = TRUE) * 100,
-              avg_rmse = mean(.data$avg_rmse, na.rm = TRUE),
-              .groups = "drop"
-            )
-
           loc_q_data <- if (!is.null(q_dvi_data) && "location_id" %in% names(q_dvi_data)) {
             q_dvi_data[q_dvi_data$location_id == loc_id, ]
           } else {
@@ -6706,8 +7317,31 @@ flush.console()
             NA
           }
 
-          quality_metrics$peak_q10_dvi <- peak_q10_dvi
-          quality_metrics$peak_q90_dvi <- peak_q90_dvi
+          if (!is.na(true_veg_val) && tolower(true_veg_val) == "barren") {
+            quality_metrics <- data.frame(
+              avg_pct_deviation = NA_real_,
+              avg_rmse = mean(loc_coefs$rmse, na.rm = TRUE),
+              peak_q10_dvi = peak_q10_dvi,
+              peak_q90_dvi = peak_q90_dvi,
+              stringsAsFactors = FALSE
+            )
+          } else {
+            quality_metrics <- loc_coefs |> 
+              dplyr::group_by(.data$pheno_year) |> 
+              dplyr::summarize(
+                deviation = sum(abs(.data$coef - (tolower(.data$Veg) == tolower(true_veg_val)))),
+                avg_rmse = mean(.data$rmse, na.rm = TRUE),
+                .groups = "drop"
+              ) |> 
+              dplyr::summarize(
+                avg_pct_deviation = mean(.data$deviation, na.rm = TRUE) * 100,
+                avg_rmse = mean(.data$avg_rmse, na.rm = TRUE),
+                .groups = "drop"
+              )
+
+            quality_metrics$peak_q10_dvi <- peak_q10_dvi
+            quality_metrics$peak_q90_dvi <- peak_q90_dvi
+          }
 
           openxlsx::writeData(wb, sheet_name, "QUALITY METRICS", startRow = 1, startCol = 1)
           openxlsx::writeData(wb, sheet_name, quality_metrics, startRow = 2, startCol = 1)
@@ -6718,7 +7352,7 @@ flush.console()
 
           loc_best <- if ("location_id" %in% names(best_fit_summary)) best_fit_summary[best_fit_summary$location_id == loc_id, , drop = FALSE] else data.frame()
           if (!is.null(loc_best) && nrow(loc_best) > 0) {
-            desired_cols <- c("year", "true_veg", "pred_coef", "pred_coef_abs", "rmse", "abs_pct_diff", "abs_pct_diff_abs", "eval_window")
+            desired_cols <- c("year", "true_veg", "pred_coef", "pred_coef_abs", "rmse", "abs_pct_diff", "abs_pct_diff_abs", "eval_window", "is_barren_truth", "pred_total_veg_cover", "true_veg_cover_ppi", "veg_cover_error_ppi")
             write_tbl <- loc_best[, c("location_id", intersect(desired_cols, names(loc_best))), drop = FALSE]
             openxlsx::writeData(wb, sheet_name, "BEST FIT SUMMARY (per-year) — pred_coef is proportion relative to vegetated area (barren excluded)",
               startRow = current_row, startCol = 1
@@ -7237,7 +7871,8 @@ flush.console()
     cat("\nGenerating Observations vs Accuracy plot...\n")
   
   
-    loc_accuracy <- best_fit_summary |>
+      loc_accuracy <- best_fit_summary |>
+        dplyr::filter(!is_barren_truth) |>
       dplyr::group_by(location_id) |>
       dplyr::summarize(
         mean_pred_coef_rel = mean(pred_coef_rel, na.rm = TRUE),
@@ -7585,21 +8220,9 @@ flush.console()
   p4 <- plot_vegetation_heatmap(global_pattern)
   ggsave(file.path(OUT_DIR, "training_vegetation_heatmap.png"), p4, width = 10, height = 6)
 
-  # Use a smaller bootstrap B for interactive/debug runs to avoid long hangs;
-  # keep it moderate for production use (can be tuned by setting TREND_BOOT_B)
-  TREND_BOOT_B <- if (exists("TREND_BOOT_B")) TREND_BOOT_B else 200
-  trend_ci <- bootstrap_trend_ci(all_coefs, B = TREND_BOOT_B)
-  # Ensure all ALLOWED_VEG are present in trend_ci (fill missing with NA rows)
-  if (exists("ALLOWED_VEG")) {
-    missing_vegs <- setdiff(ALLOWED_VEG, trend_ci$Veg)
-    if (length(missing_vegs) > 0) {
-      cat(sprintf("[NOTICE] No trend data for: %s. Adding placeholder NA rows for reporting.\n", paste(missing_vegs, collapse = ", ")))
-      for (mv in missing_vegs) {
-        trend_ci <- rbind(trend_ci, data.frame(Veg = mv, slope_mean = NA_real_, slope_median = NA_real_, slope_ci_lower = NA_real_, slope_ci_upper = NA_real_, prob_positive = NA_real_, prob_negative = NA_real_, stringsAsFactors = FALSE))
-      }
-    }
-  }
-  print(trend_ci)
+  # AGENT: Trend analysis DISABLED for training data (inference only)
+  cat("[NOTICE] Skipped trend analysis for training data.\n")
+  trend_ci <- NULL 
 
   analyze_vegetation_trends <- function(all_coefs, B = 200) {
     # Simplified trend estimation using per-location linear slopes on annual coefficients.
@@ -7628,9 +8251,9 @@ flush.console()
     do.call(rbind, trend_rows)
   }
 
-  trends <- tryCatch(analyze_vegetation_trends(all_coefs, B = 200), error = function(e) { warning(sprintf("analyze_vegetation_trends failed: %s", e$message)); NULL })
+  # AGENT: Trend analysis DISABLED for training data
+  trends <- NULL
   if (is.null(trends)) {
-    cat("[NOTICE] No trends computed (insufficient data). Writing empty placeholder to Excel sheet.\n")
     trends <- data.frame(Veg = character(0), slope = numeric(0), n_locations = integer(0), stringsAsFactors = FALSE)
   }
 
@@ -7669,8 +8292,10 @@ flush.console()
   openxlsx::addWorksheet(wb, "Vegetation_Trends")
   openxlsx::writeData(wb, "Vegetation_Trends", trends)
 
-  openxlsx::addWorksheet(wb, "Trend_Bootstrap_CI")
-  openxlsx::writeData(wb, "Trend_Bootstrap_CI", trend_ci)
+  if (!is.null(trend_ci)) {
+    openxlsx::addWorksheet(wb, "Trend_Bootstrap_CI")
+    openxlsx::writeData(wb, "Trend_Bootstrap_CI", trend_ci)
+  }
 
   timing_info$end_time <- Sys.time()
   total_time <- as.numeric(difftime(timing_info$end_time, timing_info$start_time, units = "secs"))
