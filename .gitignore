@@ -1,0 +1,51 @@
+# Ignore generated data folders
+modis/
+landsat/
+phenology_results/
+downloads/
+
+# Python virtual environments
+venv/
+.venv/
+venv.*
+
+# Local editor/IDE settings
+.idea/
+
+# Project folders
+path/
+scripts/
+training_visualizations/
+
+# R-specific
+.vscode/    # ignore VS Code workspace settings (keep this line to ignore the folder)
+.gemini/
+.claude/
+.path/
+.Rhistory
+.RData
+.Rproj.user/
+*.png
+*.csv
+.rds
+*.rda
+*.RDA
+*.log
+*.LOG
+*.pdf
+*.PDF
+.Ruserdata
+.Rbuildignore
+.Rproj
+.Rhistory
+.bak
+.proj
+*.png
+# Temporary MESMA results
+/temp_results/
+
+# Additional file types to ignore
+*.txt
+*.bat
+*.json
+.Rprofile
