@@ -56,6 +56,13 @@ options(warn = 1)  # print warnings as they occur for debugging
 options(future.progress = FALSE)  # disable progress bars from future package
 options(progressr.enable = FALSE) # disable progress bars from progressr package
 
+# Helper function to print memory usage
+print_memory_usage <- function(label = "") {
+  gc_info <- gc()
+  mem_used <- sum(gc_info[, "used"] * c(8, 8)) / 1024 / 1024  # Convert to MB (approximate)
+  cat(sprintf("[%s] Memory usage: %.2f MB\n", label, mem_used))
+}
+
 # Ensure core initialization helpers are available (defines setup_parallel_backend(), constants, etc.)
 if (!exists("setup_parallel_backend", mode = "function")) {
   if (file.exists("init_mesma.R")) {
@@ -67,15 +74,20 @@ if (!exists("setup_parallel_backend", mode = "function")) {
 }
 
 
-SKIP_PPI <- TRUE
+# I/O & dataset selection
+SKIP_PPI <- TRUE                 # If TRUE, skip PPI normalization and PPI-dependent steps (set FALSE to enable PPI-based adjustments)
 
 INPUT_CSV <- "C:\\Users\\yolan\\Downloads\\LS_S2_Harmonized_Timeseries.csv"
+                                 # Path to the input CSV used for training. Replace with your own file path.
 INFERENCE_CSV <- "C:\\Users\\yolan\\OneDrive\\Documenten\\UGENT\\Master\\masterproef\\GIS\\landsat_lower_inference.csv"
+                                 # Path for spatial inference input (set to NA to disable inference steps).
 
-# AGENT: Restrict training to the most recent years for variant building.
+# Training year selection
+# If you only want to build variants using the most recent data, set TRAIN_YEARS to a single year (e.g., 2024) or a vector of years.
 TRAIN_YEARS <- 2024  # Years to use for training (inclusive)
 
-# Check for override from environment or pre-set variable
+# Parallel / debug toggles
+# PARALLEL_ENABLE can be pre-defined (e.g., from command line or environment). The default below disables it for stability.
 if (!exists("PARALLEL_ENABLE")) {
   PARALLEL_ENABLE <- FALSE
 }
@@ -86,120 +98,192 @@ if (isTRUE(PARALLEL_ENABLE)) {
   cat("[CONFIG] Parallel processing DISABLED (running sequentially - slower but more stable)\n")
 }
 
-PARALLEL_WORKERS <- 3
+PARALLEL_WORKERS <- 3            # # workers to spawn when PARALLEL_ENABLE=TRUE; increase to use more cores (watch memory).
 COMBO_PARALLEL_WORKERS <- max(1L, floor(PARALLEL_WORKERS/2))
 
-# Batch-level parallelization settings
-BATCH_PARALLEL_ENABLE <- TRUE  # Enable parallel batch processing
-BATCH_PARALLEL_WORKERS <- 3  # Number of batches to process in parallel
+# Batch-level parallelization controls
+BATCH_PARALLEL_ENABLE <- TRUE    # Parallelize location batches (good for >1 CPU)
+BATCH_PARALLEL_WORKERS <- 3      # How many batches to run in parallel; adjust to CPU count and memory.
 
-# RMSE threshold factor for uncertainty estimation (keep models within this factor of best RMSE)
+# Uncertainty / model acceptance tuning
 RMSE_UNCERTAINTY_THRESHOLD_FACTOR <- 1.40
+                                 # Accept candidate models with RMSE <= best_rmse * RMSE_UNCERTAINTY_THRESHOLD_FACTOR.
+                                 # Larger values are more permissive; smaller values are stricter.
 
-# Memory monitoring utility function
-print_memory_usage <- function(label = "") {
-  # if (label != "") label <- paste0(" [", label, "]")
-  # mem_info <- gc(verbose = FALSE, full = FALSE)
-  # used_mb <- sum(mem_info[, "used"])
-  # max_mb <- sum(mem_info[, "(Mb)"])
-  # cat(sprintf("Memory usage%s: %.1f MB used, %.1f MB max\n", label, used_mb, max_mb))
-  # invisible(mem_info)
-}
-
-ENABLE_DIAGNOSTICS <- TRUE
-MAX_VARIANTS_PER_VEG <- 10
-MIN_VARIANTS_PER_VEG <- 1
+# Diagnostic & variant generation
+ENABLE_DIAGNOSTICS <- TRUE       # Enable additional debug plots/logging.
+MAX_VARIANTS_PER_VEG <- 10       # Max variants generated per vegetation type; increase to allow greater intra-class variability.
+MIN_VARIANTS_PER_VEG <- 1        # Minimum number of variants to keep per veg type.
 MAX_COMBOS_FOR_FULL_SEARCH <- 6000
+                                 # If total combos <= this number, MESMA will run a full exhaustive search; otherwise sampling is used.
 
-MIN_ENDMEMBER_SAMPLES <- 5L
+MIN_ENDMEMBER_SAMPLES <- 5L      # Minimum raw samples required to form an endmember variant. Raise to be stricter.
 
 ALLOWED_VEG <- c("populus", "tamarix", "phragmites")
+                                 # Restrict vegetation classes to these labels during training; edit to match your dataset.
 
+# Index defaults
 OPTIMAL_INDICES <- c("WDVI", "WDVI_BY_SWIR1", "GVI", "NIRv", "PSRI", "MSAVI2", "NDMI", "PPI", "EVI", "NDTI", "SATVI", "CIG", "BSI", "NBR", "TCW", "TCB", "NDSI")
-# Indices to explicitly exclude from the MESMA fitter (do not use as features)
+                                 # Suggested default indices to include in fitting; add or remove indices depending on sensor and quality.
+# Indices to explicitly exclude from the MESMA fitter (some indices are unstable or redundant for MESMA)
 FITTER_EXCLUDE_INDICES <- c("MSAVI", "NIRv", "OSAVI", "NDVI", "NDMI", "MSAVI2", "EVI", "SATVI")
 
-# Outlier removal configuration: when TRUE, remove large per-location(/year) outliers
-ENABLE_OUTLIER_REMOVAL <- TRUE
-# Threshold in multiples of MAD; default 6 (conservative). Rows with |x - median| > THRESHOLD * MAD are removed.
-OUTLIER_MAD_THRESHOLD <- 3.5
+# Outlier removal
+ENABLE_OUTLIER_REMOVAL <- TRUE   # Remove strong outliers prior to prototype building (recommended TRUE for noisy sensors).
+OUTLIER_MAD_THRESHOLD <- 3.5     # How aggressively to trim outliers (higher -> fewer removals). ~3-4 is typical.
 
-SKIP_INFERENCE <- FALSE
+# Prototype plot options
+GENERATE_PROTO_PLOTS <- FALSE     # Turn on to save one plot per prototype (useful for inspection; can generate many files)
+PROTO_PLOTS_OUTDIR <- "prototype_plots"
+PROTO_PLOT_DPI <- 150            # Output resolution for prototype plots
 
-TESTING_MODE <- FALSE
-TESTING_MAX_PER_VEG <- 5000L  # Upper cap per vegetation class when TESTING_MODE is enabled
+# Run / testing flags
+SKIP_INFERENCE <- FALSE          # If TRUE, skip the inference/prediction stage (useful to only perform training steps)
+TESTING_MODE <- FALSE            # Short-circuits and caps to speed up testing; set TRUE for quick iterations
+TESTING_MAX_PER_VEG <- 5000L     # Max samples per veg when in TESTING_MODE
+
 if (!exists('DEBUG')) DEBUG <- FALSE
+
+# === SPLINE ENDMEMBER MODE ===
+# When USE_SPLINE_ENDMEMBERS = TRUE, each vegetation class is represented by a single 
+# smooth spline fitted to all training samples for that class across DOY.
+# This eliminates endmember variants and uses continuous phenology curves for unmixing.
+# Motivation: MESMA results often show best performance with 1 endmember per class;
+# splines provide a natural continuous representation of class phenology.
+USE_SPLINE_ENDMEMBERS <- FALSE   # Set TRUE to use spline-based unmixing instead of discrete endmembers
+SPLINE_SPAR <- 0.7               # Smoothing parameter for splines (0-1). Lower = more wiggly, higher = smoother.
+                                 # 0.7 is typical for phenology; reduce for noisier data, increase for smoother curves.
+SPLINE_LAMBDA <- 10.0            # Constraint weight for sum-to-one in FCLS solver (higher = stricter constraint)
 
 # -----------------------------------------------------------------------------
 # USER-TUNABLE PARAMETERS (centralized)
 # Move any frequently-adjusted constants here for easy configuration
+# NOTE: each parameter below has a short tuning note explaining its purpose and how
+#       to change it safely. Prefer conservative changes and test on a small dataset.
 # -----------------------------------------------------------------------------
-COMBO_SAFE_EXPAND_LIMIT <- 1e6    # fully expand combo grid up to this many combos
-COMBO_ABORT_LIMIT <- 5e7          # abort if combos exceed this hard limit
 
-BOOTSTRAP_B <- 100L              # Number of bootstrap iterations for location-based resampling
-MAX_INFERENCE_LOCATIONS <- 300L  # Maximum number of locations to use for inference (cap to reduce runtime)
-BOOTSTRAP_BLOCK_SIZE <- 5L       # Block size for Moving Block Bootstrap of residuals
+# Combinatorics safeguards
+COMBO_SAFE_EXPAND_LIMIT <- 1e6    # Max number of total combinations to expand fully before switching to random sampling.
+                                  # Increase if you want exhaustive search and have time + memory; lower to reduce runtime.
+COMBO_ABORT_LIMIT <- 5e7          # Hard abort threshold: if combos exceed this, the grid search will stop to avoid OOM.
+                                  # Only raise with extreme caution on large-memory hosts.
+
+# Bootstrap / inference sizing
+BOOTSTRAP_B <- 100L              # Number of bootstrap iterations (location-level). Higher -> more stable CIs but slower. 100-500 typical.
+MAX_INFERENCE_LOCATIONS <- 300L  # Cap for inference locations to avoid huge runtime/memory when inference dataset is large. Lower this to speed up runs.
+BOOTSTRAP_BLOCK_SIZE <- 5L       # Block length for moving-block bootstrap of residuals; set to approximate temporal autocorrelation length (days/pentads).
 
 # Uncertainty handling
-ENABLE_UNCERTAINTY <- TRUE
-DEBUG_UNCERTAINTY <- TRUE        # global debug flag for uncertainty diagnostics
+ENABLE_UNCERTAINTY <- TRUE       # Turn off to skip expensive uncertainty estimation (bootstrap, MC propagation) for faster runs.
+DEBUG_UNCERTAINTY <- TRUE        # Verbose diagnostics for uncertainty steps; set FALSE for quiet production runs.
 
-# Small-n CI inflation (per location-year and small-N global aggregation)
-# Goal: extremely low observation counts should yield very wide intervals (almost no certainty).
-UNCERTAINTY_N_REF <- 12L               # reference observation count where inflation factor ~1
-UNCERTAINTY_N_POWER <- 2.0             # higher -> more extreme widening for small n
-UNCERTAINTY_BASE_SD <- 0.15            # fallback SD when sd is NA/0; before inflation
-UNCERTAINTY_SD_MAX <- 0.50             # cap SD so CI doesn't become numerically unstable
+# Robust residual scoring / MC propagation
+ROBUST_RESIDUALS_HUBER <- TRUE   # Use Huber loss to rank candidate models (less sensitive to outliers). Set FALSE to use RMSE instead.
+HUBER_DELTA <- 1.345             # Huber delta (in z-score units). Reduce (~1.0) to be more robust, increase (~1.5) to be closer to RMSE.
 
-# Optional: estimate UNCERTAINTY_N_REF / UNCERTAINTY_N_POWER from data (Option A: subsampling experiment)
+ENABLE_MONTE_CARLO <- TRUE       # Propagate observation noise into coefficient uncertainty via repeated unmixing draws. Disable to save time.
+MC_N_DRAWS <- 50L                # Number of MC draws per location-year (>=10 recommended). Lower to speed up, increase to stabilize CI estimates.
+MC_NOISE_SCALE <- 1.0            # Multiplier applied to per-task residual RMSE to set MC noise SD. Increase to model larger noise.
+# Optional explicit MC noise SD can be set via MC_NOISE_SD (if present, it overrides MC_NOISE_SCALE * rmse).
+
+ENABLE_ENDMEMBER_BUNDLES <- TRUE # If TRUE, represent endmember variability as a mean+cov and sample endmembers during MC. Improves uncertainty realism at cost of CPU.
+
+# SAM-based endmember selection tuning
+MAX_K_SAM <- 8L                 # Maximum number of endmembers to consider per vegetation class in SAM selection. Increase to allow more variants if data supports it.
+MIN_CLUSTER_SIZE_SAM <- 1L       # Minimum samples per endmember cluster. Decrease to allow more endmembers from smaller datasets.
+
+# Small-N CI inflation (prevent tiny-sample overconfidence)
+UNCERTAINTY_N_REF <- 12L         # Reference observation count; above this, no inflation. Increase if your typical loc-year has more obs.
+UNCERTAINTY_N_POWER <- 2.0       # Strength of small-n inflation; higher -> stronger widening for low-n cases.
+UNCERTAINTY_BASE_SD <- 0.15      # Fallback SD for locations with no empirical SD (before inflation). Raise if you want conservative wide CIs.
+UNCERTAINTY_SD_MAX <- 0.50       # Cap to avoid absurdly large SD values from inflation.
+
+# Option A: estimate UNCERTAINTY params by subsampling experiment (auto-calibrate)
 ESTIMATE_UNCERTAINTY_PARAMS_OPTION_A <- TRUE
-UNCERTAINTY_PARAM_EST_HIGH_N <- 20L            # only use loc-years with at least this many observations as pseudo-truth
-UNCERTAINTY_PARAM_EST_MAX_GROUPS <- 25L        # cap number of loc-years used (runtime control)
-UNCERTAINTY_PARAM_EST_TARGET_NS <- 1:15        # subsample sizes to evaluate
-UNCERTAINTY_PARAM_EST_REPS <- 20L              # replicates per subsample size
-UNCERTAINTY_PARAM_EST_SEED <- 123
+UNCERTAINTY_PARAM_EST_HIGH_N <- 20L            # Only use location-years with >= this many obs as 'truth' in the subsampling experiment.
+UNCERTAINTY_PARAM_EST_MAX_GROUPS <- 25L        # Cap the number of loc-years used to limit runtime of the estimation.
+UNCERTAINTY_PARAM_EST_TARGET_NS <- 1:15        # Subsample sizes to evaluate during estimation (typical small-n range).
+UNCERTAINTY_PARAM_EST_REPS <- 20L              # Repeats per subsample size (increase for smoother estimates; slower).
+UNCERTAINTY_PARAM_EST_SEED <- 123              # RNG seed for reproducible estimation runs.
 
-# Data quality thresholds
-MIN_OBS_PER_LOC_YEAR <- 3L
-MIN_UNIQUE_DOY_DEFAULT <- 5L
-MIN_UNIQUE_DOY_INFERENCE <- 1L
-MIN_INDEX_SD <- 0.05
-MIN_IDX_PRESENCE <- 0.5
+# Data quality thresholds (filtering / skipping)
+MIN_OBS_PER_LOC_YEAR <- 3L      # Minimum rows required per location-year for processing. Increase to be stricter on noisy cases.
+MIN_UNIQUE_DOY_DEFAULT <- 5L    # Minimum unique DOYs per loc-year during training to consider time-series adequate.
+MIN_UNIQUE_DOY_INFERENCE <- 1L  # Less strict for inference to allow sparse inputs.
+MIN_INDEX_SD <- 0.05            # Minimum index SD (per-feature) to be considered informative; set higher to remove low-contrast indices.
+MIN_IDX_PRESENCE <- 0.5        # Minimum fraction of pentads with data for an index to be considered present (0-1).
 
-# Variant handling
-VARIANT_SWITCH <- TRUE           # Allow variant switching across pentads
-VARIANT_SWITCH_RE_CENTER <- TRUE
-VARIANCE_THRESHOLD <- 0.90
+# Variant handling and switching
+VARIANT_SWITCH <- TRUE           # Allow variant switching across pentads (flexible, may increase noise). Set FALSE to enforce temporal consistency.
+VARIANT_SWITCH_RE_CENTER <- TRUE # If TRUE, recenters variants when switching (reduces sudden jumps).
+VARIANCE_THRESHOLD <- 0.90      # Threshold used in variant switching decisions (lower -> more permissive switching).
 
 # Modeling/algorithmic caps and defaults
-TOPK_VARIANTS <- 10L             # Max variants per veg type to consider in MESMA (higher is slower but more accurate)
-ENABLE_LDA_L2_NORMALIZATION <- TRUE # Whether to L2-normalize training samples before LDA (set to FALSE to preserve brightness info)
-GAM_K_MAX <- 40
-GAM_GAMMA <- 1.0
-USE_INDICES_MIN <- 1L
+ENABLE_LDA_L2_NORMALIZATION <- FALSE # L2-normalize training samples before LDA to focus on temporal shape rather than amplitude.
+                                     # Set TRUE to emphasize shape; FALSE to preserve brightness differences used by classifiers.
+GAM_K_MAX <- 40                  # Max basis dimension for GAM fits. Larger -> more flexible curves but risk overfitting.
+GAM_GAMMA <- 1.0                 # Regularization / smoothing strength for GAM (higher -> smoother).
+USE_INDICES_MIN <- 1L            # Minimum # indices to include in single-stage fitting; increase to be strict about multi-index coverage.
 
 # Sample/cluster controls
 ENABLE_SOIL_PREPROCESS <- TRUE
 SOIL_PURE_THRESHOLD <- 0.95
 SOIL_MIN_SAMPLES <- 3L
+# Support multiple barren/soil prototypes extracted from training bare-soil observations
+RAW_BARREN_N_PROTOTYPES <- 1L  # number of soil prototypes to extract (1 = single prototype).
+                                # Tuning: set >1 if you expect distinct soil types/brightness regimes in the region
+                                # (e.g., sandy vs. clay surfaces). Increasing this improves representativeness but
+                                # will increase library size and runtime; typical values: 1-3.
 
-MAX_PROJECTIONS_PER_VEG <- 25000L  # subsample before clustering to avoid OOM
-SILHOUETTE_SAMPLE_SIZE <- 20000L   # subsample for silhouette distance matrix
-MEDOID_SAMPLE_SIZE <- 10000L       # subsample for medoid distance computation
+MAX_PROJECTIONS_PER_VEG <- 25000L  # Subsample cap per vegetation class before clustering to avoid OOM; reduce if memory is constrained
 
 # Numerical tolerances
-EPS_SIGMA <- 1e-8
-LOWER_BND <- 0
+EPS_SIGMA <- 1e-8                # Small epsilon used in numeric ops to avoid division by zero
+LOWER_BND <- 0                   # Lower bound used for non-negativity constraints
 
 # Batch processing
-BATCH_SIZE <- 6  # Default batch size for location-level processing (tunable)
+BATCH_SIZE <- 6  # Default batch size for location-level processing. Lower for memory-constrained runs; higher for throughput.
 
 # Output file (can be overridden later if OUT_DIR isn't set yet)
-OUTPUT_XLSX <- NA
+OUTPUT_XLSX <- NA                # Path for output Excel workbook; set to NA to skip writing XLSX
+
 # === PPI-BASED FRACTION ESTIMATION CONFIG ===
-PPI_ZERO_VEG_COVER <- 0.0  # PPI value assumed to correspond to 0% vegetation cover
-PPI_FULL_VEG_COVER <- 0.7  # PPI value assumed to correspond to 100% vegetation cover (top 95% median PPI)
+PPI_ZERO_VEG_COVER <- 0.0  # PPI value assumed to correspond to 0% vegetation cover; adjust with calibration data
+PPI_FULL_VEG_COVER <- 0.7  # PPI value assumed to correspond to 100% vegetation cover; increase/decrease depending on sensor/site
+
+MIN_SKIP_DOYS_PER_LOCATION <- 2L  # Minimum number of DOYs to allow skipping behavior per location
+
+FAST_VAR <- TRUE                 # Use faster approximate variance calculations (set FALSE for exact but slower computations)
+
+# Temporal (pentad) settings
+TEMPORAL_AGGREGATION_DAYS <- 20L  # Temporal aggregation window in days (~pentad length). Smaller -> finer but sparser.
+N_TEMPORAL_BINS <- ceiling(365 / TEMPORAL_AGGREGATION_DAYS)
+TEMPORAL_BUDGET <- N_TEMPORAL_BINS  # Number of temporal bins (pentads) used in modeling
+
+# Variant / clustering settings
+N_VARIANTS_PER_VEG <- 10L         # Maximum variants per vegetation class to generate; raise to model more intra-class diversity
+MIN_CLUSTER_SIZE <- 10L           # Minimum cluster size to accept a variant prototype
+PCA_VARIANCE_THRESHOLD <- 0.95    # PCA energy to retain when reducing endmember dimensionality prior to clustering
+
+# LDA tuning
+LDA_WEIGHT_FLOOR <- 0.01          # Minimum LDA weight floor to avoid degenerate small coefficients
+# Threshold below which LDA weights are zeroed out (set to NULL to disable)
+LDA_WEIGHT_ZERO_THRESHOLD <- 0
+# Whether to prune features with zero LDA weight from optimized libraries
+PRUNE_ZERO_WEIGHT_FEATURES <- TRUE
+# If fraction of zeroed features exceeds this, skip pruning to avoid degenerate libraries
+PRUNE_ZERO_WEIGHT_MAX_FRAC <- 0.8
+# Minimum number of features to keep after pruning to avoid degenerate models
+PRUNE_ZERO_MIN_FEATURES <- 3
+# Minimum pentad weight as fraction of global mean weight (default 20%)
+PENTAD_WEIGHT_MIN_FRAC <- 0.20
+SKIP_MOVING_VARIANCE <- TRUE
+ENABLE_MULTISCALE <- FALSE
+MULTISCALE_WINDOWS <- c(7L, 14L, 30L)
+ENABLE_QP_SOLVER <- TRUE
+COMBO_PARALLEL_ENABLE <- TRUE
+EARLY_STOP_RMSE_THRESHOLD <- 0.0
+ENABLE_DIAGNOSTICS <- TRUE
 
 # === END GLOBAL CONFIG ===
 
@@ -242,7 +326,6 @@ assign_pheno_year <- function(d) {
 pheno_doy <- function(d) {
   d <- tryCatch(as.Date(d), error = function(e) NA)
   month <- lubridate::month(d)
-  day <- lubridate::day(d)
 
   # For March-December: count days from March 1
   # For January-February: count days from previous March 1 (add ~306 days)
@@ -437,57 +520,6 @@ if (is.na(OUTPUT_XLSX) || !is.character(OUTPUT_XLSX) || !nzchar(OUTPUT_XLSX)) {
   OUTPUT_XLSX <- file.path(OUT_DIR, "mesma_results.xlsx")
   cat(sprintf("[CONFIG] OUTPUT_XLSX default set to: %s\n", OUTPUT_XLSX))
 }
-
-MIN_SKIP_DOYS_PER_LOCATION <- 2L
-
-FAST_VAR <- TRUE
-
-TEMPORAL_AGGREGATION_DAYS <- 10L  # 10-day intervals (pentads)
-N_TEMPORAL_BINS <- ceiling(365 / TEMPORAL_AGGREGATION_DAYS)  # = 37 pentads
-TEMPORAL_BUDGET <- N_TEMPORAL_BINS  # Use pentad resolution (no compression beyond pentad aggregation)
-
-N_VARIANTS_PER_VEG <- 10L
-MIN_CLUSTER_SIZE <- 10L
-PCA_VARIANCE_THRESHOLD <- 0.95
-LDA_WEIGHT_FLOOR <- 0.01
-# Threshold below which LDA weights are zeroed out (set to NULL to disable)
-LDA_WEIGHT_ZERO_THRESHOLD <- 0
-# Whether to prune features with zero LDA weight from optimized libraries
-PRUNE_ZERO_WEIGHT_FEATURES <- TRUE
-# If fraction of zeroed features exceeds this, skip pruning to avoid degenerate libraries
-PRUNE_ZERO_WEIGHT_MAX_FRAC <- 0.8
-# Minimum number of features to keep after pruning to avoid degenerate models
-PRUNE_ZERO_MIN_FEATURES <- 3
-# Minimum pentad weight as fraction of global mean weight (default 20%)
-PENTAD_WEIGHT_MIN_FRAC <- 0.20
-SKIP_MOVING_VARIANCE <- TRUE
-ENABLE_MULTISCALE <- FALSE
-MULTISCALE_WINDOWS <- c(7L, 14L, 30L)
-ENABLE_QP_SOLVER <- TRUE
-COMBO_PARALLEL_ENABLE <- TRUE
-EARLY_STOP_RMSE_THRESHOLD <- 0.0
-ENABLE_DIAGNOSTICS <- TRUE
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# Tunable parameters moved to the centralized section near the top of the file.
-# See the "USER-TUNABLE PARAMETERS (centralized)" block for configuration.
 
 if (!file.exists(INPUT_CSV)) {
   stop(paste0("Required input CSV not found: ", INPUT_CSV))
@@ -1082,25 +1114,6 @@ selected_vegs <- c("phragmites", "populus", "tamarix", "barren")
 df <- df[tolower(df$Veg) %in% selected_vegs, ]
 cat(sprintf("Filtered training data to selected vegetation types: %s\n", paste(selected_vegs, collapse = ", ")))
 
-# Exclude tamarix samples with no_soil == 1, but keep tamarix with no_soil == NaN
-if ("no_soil" %in% names(df)) {
-  # Count tamarix with no_soil == 1 (to exclude)
-  tamarix_no_soil_1 <- sum(tolower(df$Veg) == "tamarix" & df$no_soil == 1 & !is.na(df$no_soil), na.rm = TRUE)
-  # Count tamarix with no_soil == NaN (to keep)
-  tamarix_no_soil_na <- sum(tolower(df$Veg) == "tamarix" & is.na(df$no_soil), na.rm = TRUE)
-  # Count total tamarix
-  total_tamarix <- sum(tolower(df$Veg) == "tamarix", na.rm = TRUE)
-  
-  cat(sprintf("Tamarix samples: total=%d, no_soil==1=%d, no_soil==NaN=%d\n", 
-              total_tamarix, tamarix_no_soil_1, tamarix_no_soil_na))
-  
-  # Exclude only tamarix with no_soil == 1, keep tamarix with no_soil == NaN or other values
-  if (tamarix_no_soil_1 > 0) {
-    df <- df[!(tolower(df$Veg) == "tamarix" & df$no_soil == 1 & !is.na(df$no_soil)), ]
-    cat(sprintf("Excluded %d tamarix samples with no_soil == 1\n", tamarix_no_soil_1))
-  }
-}
-
 # AGENT: Capture full dataset for trends BEFORE downsampling or year filtering
 df_full <- df
 cat(sprintf("[NOTICE] Captured df_full with %d rows for trend analysis (all years).\n", nrow(df_full)))
@@ -1388,7 +1401,6 @@ safe_lda_call <- function(X_pca, y, min_n_pcs = 2) {
 train_feature_pipeline <- function(df, class_col, feature_cols) {
   cat(sprintf("\n=== Training Feature Pipeline for Class: %s ===\n", class_col))
   
-  norm_params <- list()
   X_raw <- list()
   y_labels <- c()
   
@@ -1575,6 +1587,13 @@ build_pentad_matrix <- function(dly_year, avail_idx) {
     subset_p <- dly_year[dly_year$pentad == p, ]
     if (nrow(subset_p) == 0) next
 
+    # Pentad center in phenological DOY space (March 1 = 1), using the nominal bin boundaries.
+    # Use a linear intra-pentad trend for the representative pentad value:
+    # yi,b = beta0 + beta1*(ti - t_center) + eps, and take beta0 as the pentad center value.
+    t_start <- (p - 1) * TEMPORAL_AGGREGATION_DAYS + 1
+    t_end <- min(p * TEMPORAL_AGGREGATION_DAYS, N_TEMPORAL_BINS * TEMPORAL_AGGREGATION_DAYS)
+    t_center <- (t_start + t_end) / 2
+
     for (j in seq_along(avail_idx)) {
       idx <- avail_idx[j]
       if (!idx %in% names(subset_p)) next
@@ -1583,23 +1602,32 @@ build_pentad_matrix <- function(dly_year, avail_idx) {
       v <- v[is.finite(v)]
       if (length(v) == 0) next
 
-      q_high <- quantile(v, 0.999, na.rm = TRUE)
-      q_low <- quantile(v, 0.001, na.rm = TRUE)
-      v_clipped <- pmax(q_low, pmin(v, q_high))
-
+      # Always use Case B (linear intra-pentad trend) and remove quantile clipping.
+      # When time variation is insufficient (e.g., all doys identical), this reduces to an intercept-only fit.
       doys <- subset_p$doy
+      doys <- doys[is.finite(doys)]
+      if (length(doys) != length(v)) {
+        n_use <- min(length(doys), length(v))
+        doys <- doys[seq_len(n_use)]
+        v <- v[seq_len(n_use)]
+      }
 
-      if (length(v_clipped) >= 3) {
-        model <- tryCatch(lm(v_clipped ~ doys), error = function(e) NULL)
-        if (!is.null(model)) {
-          mean_doy <- mean(doys)
-          pred <- predict(model, newdata = data.frame(doys = mean_doy))
-          pentad_mat[p, j] <- pred
-        } else {
-          pentad_mat[p, j] <- median(v_clipped)
-        }
+      if (length(v) == 1 || length(unique(doys)) < 2) {
+        # Degenerate case: no slope information; representative is the intercept-only estimate.
+        pentad_mat[p, j] <- mean(v, na.rm = TRUE)
       } else {
-        pentad_mat[p, j] <- median(v_clipped)
+        x <- doys - t_center
+        model <- tryCatch(stats::lm(v ~ x), error = function(e) NULL)
+        if (!is.null(model)) {
+          b0 <- tryCatch(stats::coef(model)[[1]], error = function(e) NA_real_)
+          if (is.finite(b0)) {
+            pentad_mat[p, j] <- as.numeric(b0)
+          } else {
+            pentad_mat[p, j] <- mean(v, na.rm = TRUE)
+          }
+        } else {
+          pentad_mat[p, j] <- mean(v, na.rm = TRUE)
+        }
       }
     }
   }
@@ -1641,30 +1669,6 @@ apply_pca_lda_transform <- function(y, pca_lda_result) {
   y_weighted
 }
 
-medoid_row_index <- function(M) {
-  if (is.null(M) || !is.matrix(M) || nrow(M) == 0) return(NA_integer_)
-  if (nrow(M) == 1) return(1L)
-  X <- M
-  X[!is.finite(X)] <- 0
-  
-  n <- nrow(X)
-  
-  if (n > MEDOID_SAMPLE_SIZE) {
-    samp_idx <- sample.int(n, size = min(as.integer(MEDOID_SAMPLE_SIZE), n))
-    X_samp <- X[samp_idx, , drop = FALSE]
-    D_samp <- tryCatch(as.matrix(stats::dist(X_samp)), error = function(e) stop(sprintf("medoid_row_index: distance computation failed: %s", e$message)))
-    rs_samp <- rowSums(D_samp, na.rm = TRUE)
-    local_idx <- which.min(rs_samp)
-    if (length(local_idx) == 0 || !is.finite(local_idx)) local_idx <- 1L
-    idx <- samp_idx[local_idx]
-  } else {
-    D <- tryCatch(as.matrix(stats::dist(X)), error = function(e) stop(sprintf("medoid_row_index: distance computation failed: %s", e$message)))
-    rs <- rowSums(D, na.rm = TRUE)
-    idx <- which.min(rs)
-    if (length(idx) == 0 || !is.finite(idx)) idx <- 1L
-  }
-  as.integer(idx)
-}
 
 .run_map <- function(X, FUN, show_pb = TRUE) {
   f_FUN <- FUN
@@ -2057,147 +2061,7 @@ if (nrow(loc_years) == 0) {
 cat("Constructing lib from TRAINING dataset...\n")
 cat("[DEBUG] Defining functions...\n")
 lib <- list()
-build_soil_prototype <- function(df_local, avail_idx, threshold = SOIL_PURE_THRESHOLD, min_samples = SOIL_MIN_SAMPLES) {
-  if (!"Veg" %in% names(df_local)) return(NULL)
-  candidates <- df_local[tolower(as.character(df_local$Veg)) == "barren", , drop = FALSE]
 
-  if (nrow(candidates) < min_samples) {
-    return(NULL)
-  }
-
-  if (nrow(candidates) == 0) return(NULL)
-
-  soil_lib <- list()
-  if (!"doy" %in% names(candidates)) candidates$doy <- pheno_doy(as.Date(candidates$date))  # Use phenological DOY
-
-  for (idx in avail_idx) {
-    if (!idx %in% names(candidates)) next
-    vals_by_doy <- tryCatch(
-      {
-        tapply(seq_along(candidates[[idx]]), candidates$doy, function(indices) {
-          vals <- candidates[[idx]][indices]
-          vals <- vals[is.finite(vals)]
-          if (length(vals) == 0) return(NA_real_)
-          if (length(vals) == 1) return(as.numeric(vals[1]))
-          m <- mean(vals)
-          as.numeric(vals[which.min(abs(vals - m))])
-        })
-      },
-      error = function(e) NULL
-    )
-
-    mu <- rep(NA_real_, 365)
-    if (!is.null(vals_by_doy) && length(vals_by_doy) > 0) {
-      doy_values <- as.integer(names(vals_by_doy))
-      valid_doy <- doy_values >= 1 & doy_values <= 365
-      mu[doy_values[valid_doy]] <- vals_by_doy[valid_doy]
-    }
-
-    if (all(!is.finite(mu))) next
-    mv <- tryCatch(calc_moving_var(data.frame(date = 1:365, idx = mu), "idx", window = 14), error = function(e) rep(NA_real_, 365))
-    soil_lib[[idx]] <- list(mu = mu, mv = mv)
-  }
-
-  attr(soil_lib, "rows_used") <- nrow(candidates)
-  soil_lib
-}
-
-augment_minority_class <- function(df_class, target_n, seed = NULL, alpha_range = c(0.3, 0.7), jitter_frac = 1e-6) {
-  df_class <- as.data.frame(df_class, stringsAsFactors = FALSE)
-
-  if (nrow(df_class) >= target_n) {
-    return(df_class)
-  }
-
-  if (nrow(df_class) <= 1) {
-    reps <- target_n - nrow(df_class)
-    base <- df_class[rep(1, reps), , drop = FALSE]
-    num_cols <- names(df_class)[sapply(df_class, is.numeric)]
-
-    if (length(num_cols) > 0) {
-      rng <- sapply(df_class[, num_cols, drop = FALSE], function(x) {
-        x_valid <- x[is.finite(x)]
-        if (length(x_valid) < 2) return(1.0)
-        r <- diff(range(x_valid))
-        if (!is.finite(r) || r <= 0) 1.0 else r
-      })
-
-      noise <- matrix(rnorm(reps * length(num_cols), sd = sqrt(mean(rng)) * jitter_frac), nrow = reps)
-      base[, num_cols] <- base[, num_cols] + noise
-    }
-
-    out <- rbind(df_class, base)
-    rownames(out) <- NULL
-    return(out)
-  }
-
-  if (!is.null(seed)) set.seed(seed)
-  n_add <- target_n - nrow(df_class)
-
-  num_cols <- names(df_class)[sapply(df_class, is.numeric)]
-  other_cols <- setdiff(names(df_class), num_cols)
-
-  col_ranges <- if(length(num_cols) > 0) {
-    sapply(df_class[, num_cols, drop = FALSE], function(x) {
-      x_valid <- x[is.finite(x)]
-      if (length(x_valid) < 2) return(1.0)
-      r <- diff(range(x_valid))
-      if (!is.finite(r) || r <= 0) 1.0 else r
-    })
-  } else numeric(0)
-
-  synth_rows <- lapply(seq_len(n_add), function(i) {
-    ids <- sample.int(nrow(df_class), 2, replace = FALSE)
-    a <- df_class[ids[1], , drop = FALSE]
-    b <- df_class[ids[2], , drop = FALSE]
-    alpha <- runif(1, min(alpha_range), max(alpha_range))
-
-    new_row <- a # Start with structure of 'a'
-
-    if (length(num_cols) > 0) {
-      va <- as.numeric(a[1, num_cols])
-      vb <- as.numeric(b[1, num_cols])
-
-      va[!is.finite(va)] <- 0
-      vb[!is.finite(vb)] <- 0
-
-      interp <- (1 - alpha) * va + alpha * vb
-
-      jitter <- rnorm(length(interp), sd = col_ranges * jitter_frac)
-      interp <- interp + jitter
-
-      new_row[1, num_cols] <- interp
-    }
-
-    for (col in other_cols) {
-      if (col %in% c("date", "doy", "doy_for_lib")) next
-      if (col %in% c("Veg", "s1_label")) {
-        new_row[[col]] <- a[[col]]
-        next
-      }
-      val <- if (runif(1) < 0.5) a[[col]] else b[[col]]
-      new_row[[col]] <- val
-    }
-
-    if ("doy_for_lib" %in% names(df_class)) {
-      da <- as.integer(a$doy_for_lib)
-      db <- as.integer(b$doy_for_lib)
-      if (!is.na(da) && !is.na(db)) {
-        diff_ab <- ((db - da + 365) %% 365)
-        pick_doy <- ((da + round(alpha * diff_ab) - 1) %% 365) + 1
-        new_row$doy_for_lib <- as.integer(pick_doy)
-      }
-    }
-
-    new_row
-  })
-
-  synth_df <- do.call(rbind, synth_rows)
-  out <- rbind(df_class, synth_df)
-  rownames(out) <- NULL
-
-  return(out)
-}
 
 
 
@@ -2482,8 +2346,6 @@ location_bootstrap_ppi <- function(all_coefs, df_tasks, B = BOOTSTRAP_B, seed = 
   # Each unique loc-year needs a row index into ppi_boot_mat
   unique_loc_years <- merged_veg |> 
     dplyr::distinct(location_id, pheno_year, ppi_row_idx)
-
-  results_list <- list()
   
   cat(sprintf("[PPI BOOTSTRAP] Running %d bootstrap iterations with per-location PPI uncertainty...\n", B))
 
@@ -2953,6 +2815,22 @@ estimate_uncertainty_params_optionA <- function(df_tasks,
     sink(con_msg, type = "message")
   }
 
+  # Helper function to handle both spline and standard modes for uncertainty calibration
+  fit_task_for_calib <- function(task_data) {
+    if (is.null(task_data) || nrow(task_data) == 0) return(NULL)
+    loc <- as.character(task_data$location_id[1])
+    yr <- as.integer(task_data$pheno_year[1])
+    
+    if (isTRUE(USE_SPLINE_ENDMEMBERS) && exists("SPLINE_LIBRARY") && exists("SPLINE_PARAMS")) {
+      res <- tryCatch({
+        fit_one_task_spline(task_data, SPLINE_LIBRARY, SPLINE_PARAMS$indices, SPLINE_PARAMS, loc, yr)
+      }, error = function(e) NULL)
+    } else {
+      res <- fit_one_task(task_data)
+    }
+    return(res)
+  }
+
   for (gi in seq_len(nrow(grp))) {
     loc <- grp$location_id[gi]
     yr <- grp$pheno_year[gi]
@@ -2961,7 +2839,7 @@ estimate_uncertainty_params_optionA <- function(df_tasks,
     if (!is.finite(n_full) || n_full < high_n) next
 
     # Full fit as pseudo-truth
-    full_fit <- tryCatch(fit_one_task(sub), error = function(e) NULL)
+    full_fit <- tryCatch(fit_task_for_calib(sub), error = function(e) NULL)
     full_vec <- extract_coef_vec_from_fit(full_fit, veg_levels = veg_levels)
     if (is.null(full_vec)) next
 
@@ -2970,7 +2848,7 @@ estimate_uncertainty_params_optionA <- function(df_tasks,
       for (r in seq_len(reps)) {
         idx <- sample(seq_len(n_full), n, replace = FALSE)
         sub_n <- sub[idx, , drop = FALSE]
-        fit_n <- tryCatch(fit_one_task(sub_n), error = function(e) NULL)
+        fit_n <- tryCatch(fit_task_for_calib(sub_n), error = function(e) NULL)
         vec_n <- extract_coef_vec_from_fit(fit_n, veg_levels = veg_levels)
         if (is.null(vec_n)) next
         # error pooled across veg components (L2 norm / sqrt(k)) for scale comparability
@@ -3289,59 +3167,149 @@ load_and_prepare_inference_data <- function() {
 
 
 
-  # Old solver `solve_weights_ols()` removed — use `solve_weights_nnls_simple(E, y)` which uses standard NNLS behaviour
-
-
-  # Simple NNLS wrapper with minimal preprocessing
-  solve_weights_nnls_simple <- function(E, y, feature_weights = NULL) {
+  # =============================================================================
+  # FCLS: Fully Constrained Least Squares Solver
+  # Enforces BOTH non-negativity AND sum-to-one constraints simultaneously
+  # Uses iterative active-set method (Heinz & Chang, 2001)
+  # =============================================================================
+  
+  solve_weights_fcls <- function(E, y, feature_weights = NULL, max_iter = 500, tol = 1e-8) {
     if (is.null(E) || ncol(E) < 1) return(NULL)
+    
     # Ensure numeric
     E_fit <- as.matrix(E)
     y_fit <- as.numeric(y)
-
-    # Handle length mismatch (truncate if necessary)
-    len <- nrow(E_fit)
-    if (length(y_fit) != len) {
-      warning(sprintf("solve_weights_nnls_simple: Length of y (%d) does not match rows in E (%d); truncating or padding with zeros", length(y_fit), len))
-      if (length(y_fit) > len) y_fit <- y_fit[1:len] else y_fit <- c(y_fit, rep(0, len - length(y_fit)))
+    n_endmembers <- ncol(E_fit)
+    n_bands <- nrow(E_fit)
+    
+    # Handle length mismatch
+    if (length(y_fit) != n_bands) {
+      warning(sprintf("solve_weights_fcls: Length of y (%d) does not match rows in E (%d); truncating or padding", length(y_fit), n_bands))
+      if (length(y_fit) > n_bands) y_fit <- y_fit[1:n_bands] else y_fit <- c(y_fit, rep(0, n_bands - length(y_fit)))
     }
-
-    # Impute non-finite values to 0
+    
+    # Impute non-finite values
     y_fit[!is.finite(y_fit)] <- 0
     E_fit[!is.finite(E_fit)] <- 0
-
-    # Optional per-feature weighting (WLS) — apply as sqrt weights to rows
-    if (!is.null(feature_weights) && length(feature_weights) == nrow(E_fit)) {
+    
+    # Apply feature weights if provided
+    if (!is.null(feature_weights) && length(feature_weights) == n_bands) {
       sqrt_w <- sqrt(pmax(feature_weights, 0))
-      E_weighted <- E_fit * sqrt_w
-      y_weighted <- y_fit * sqrt_w
+      E_w <- E_fit * sqrt_w
+      y_w <- y_fit * sqrt_w
     } else {
-      E_weighted <- E_fit
-      y_weighted <- y_fit
+      E_w <- E_fit
+      y_w <- y_fit
     }
-
+    
+    # Augment system for sum-to-one constraint: [E; ones] * w = [y; 1]
+    # Weight for sum-to-one constraint (scaled to match data magnitude)
+    lambda_sto <- sqrt(mean(y_w^2)) * 10  # Strong enforcement
+    if (!is.finite(lambda_sto) || lambda_sto < 1) lambda_sto <- 10
+    
+    E_aug <- rbind(E_w, rep(lambda_sto, n_endmembers))
+    y_aug <- c(y_w, lambda_sto)
+    
+    # Solve augmented NNLS problem
     res <- tryCatch({
-      nnls::nnls(E_weighted, y_weighted)
+      nnls::nnls(E_aug, y_aug)
     }, error = function(e) {
-      warning(sprintf("nnls failed in solve_weights_nnls_simple: %s", e$message))
+      warning(sprintf("NNLS failed in FCLS: %s", e$message))
       return(NULL)
     })
-
-    if (is.null(res)) return(list(w = rep(1 / ncol(E_fit), ncol(E_fit)), rmse = Inf, residuals = rep(NA_real_, length(y_fit))))
-
-    w <- res$x
-    if (sum(w) > 0) w <- w / sum(w)
-
-    # NOTE: Removed the 10% minimum fraction floor here. Filtering should happen AFTER
-    # removing barren from the coefficient vector, so that vegetation types compete
-    # fairly against each other (not against barren which will be replaced by PPI).
-
+    
+    if (is.null(res)) {
+      # Fallback: uniform weights
+      w <- rep(1 / n_endmembers, n_endmembers)
+    } else {
+      w <- res$x
+    }
+    
+    # Normalize to sum-to-one (should already be close due to constraint)
+    w_sum <- sum(w)
+    if (w_sum > 1e-10) {
+      w <- w / w_sum
+    } else {
+      w <- rep(1 / n_endmembers, n_endmembers)
+    }
+    
+    # Iterative refinement using active-set method for tighter constraints
+    # (Optional second pass for difficult cases)
+    active_set <- w > tol
+    
+    for (iter in 1:max_iter) {
+      # Solve equality-constrained LS on active set only
+      active_idx <- which(active_set)
+      n_active <- length(active_idx)
+      
+      if (n_active == 0) {
+        w <- rep(1 / n_endmembers, n_endmembers)
+        break
+      }
+      
+      if (n_active == 1) {
+        # Only one endmember active: must be 1.0
+        w <- rep(0, n_endmembers)
+        w[active_idx] <- 1.0
+        break
+      }
+      
+      # Solve with equality sum-to-one on active set
+      E_active <- E_w[, active_idx, drop = FALSE]
+      
+      # Use Lagrangian: minimize ||E_active * w_active - y||^2 s.t. sum(w_active) = 1
+      # Form augmented normal equations
+      EtE <- crossprod(E_active)
+      Ety <- crossprod(E_active, y_w)
+      ones <- rep(1, n_active)
+      
+      # Augmented system: [EtE, ones; ones', 0] * [w; lambda] = [Ety; 1]
+      A_aug <- rbind(cbind(EtE, ones), c(ones, 0))
+      b_aug <- c(Ety, 1)
+      
+      sol <- tryCatch({
+        solve(A_aug, b_aug)
+      }, error = function(e) NULL)
+      
+      if (is.null(sol)) break
+      
+      w_active <- sol[1:n_active]
+      
+      # Check for negative values
+      if (all(w_active >= -tol)) {
+        # Valid solution
+        w <- rep(0, n_endmembers)
+        w[active_idx] <- pmax(w_active, 0)
+        # Re-normalize
+        if (sum(w) > 1e-10) w <- w / sum(w)
+        break
+      }
+      
+      # Remove most negative from active set
+      most_neg_local <- which.min(w_active)
+      most_neg_global <- active_idx[most_neg_local]
+      active_set[most_neg_global] <- FALSE
+    }
+    
+    # Final normalization to ensure exact sum-to-one
+    w <- pmax(w, 0)
+    w_sum <- sum(w)
+    if (w_sum > 1e-10) {
+      w <- w / w_sum
+    } else {
+      w <- rep(1 / n_endmembers, n_endmembers)
+    }
+    
+    # Compute residuals and RMSE on original (unweighted) system
     pred <- as.numeric(E_fit %*% w)
-    rmse <- sqrt(mean((y_fit - pred)^2))
     residuals <- y_fit - pred
-
+    rmse <- sqrt(mean(residuals^2))
+    
     list(w = w, rmse = rmse, residuals = residuals)
   }
+  
+  # Alias for backward compatibility
+  solve_weights_nnls_simple <- solve_weights_fcls
 
 
 
@@ -3461,7 +3429,7 @@ load_and_prepare_inference_data <- function() {
 
     cfg <- list(
       TEMPORAL_BUDGET = if (exists("TEMPORAL_BUDGET")) TEMPORAL_BUDGET else NULL,
-      TOPK_VARIANTS = if (exists("TOPK_VARIANTS")) TOPK_VARIANTS else NULL,
+
       ENABLE_MULTISCALE = if (exists("ENABLE_MULTISCALE")) ENABLE_MULTISCALE else NULL,
       MULTISCALE_WINDOWS = if (exists("MULTISCALE_WINDOWS")) MULTISCALE_WINDOWS else NULL,
       ENABLE_QP_SOLVER = if (exists("ENABLE_QP_SOLVER")) ENABLE_QP_SOLVER else NULL,
@@ -3681,7 +3649,15 @@ if ("pheno_year" %in% names(test_dly)) {
 
 
 
-  evaluate_all_combinations <- function(y, top_variants, lambda = 0, early_stop_rmse = EARLY_STOP_RMSE_THRESHOLD, feature_weights = NULL) {
+  evaluate_all_combinations <- function(
+    y,
+    top_variants,
+    lambda = 0,
+    early_stop_rmse = EARLY_STOP_RMSE_THRESHOLD,
+    feature_weights = NULL,
+    loss = c("rmse", "huber"),
+    huber_delta = NULL
+  ) {
     if (length(top_variants) == 0) return(NULL)
 
     veg_names <- names(top_variants)
@@ -3690,6 +3666,35 @@ if ("pheno_year" %in% names(test_dly)) {
 
     y_target <- y
     y_target[!is.finite(y_target)] <- 0
+
+    loss <- match.arg(loss)
+    if (is.null(huber_delta) || !is.finite(huber_delta) || huber_delta <= 0) {
+      # Residuals are in (masked) z-score space; a standard robust default works well.
+      huber_delta <- 1.345
+    }
+
+    huber_loss_mean <- function(r, w = NULL, delta = huber_delta) {
+      r <- as.numeric(r)
+      r[!is.finite(r)] <- 0
+      if (!is.null(w)) {
+        w <- as.numeric(w)
+        if (length(w) != length(r)) w <- NULL
+      }
+      a <- abs(r)
+      l <- ifelse(a <= delta, 0.5 * r^2, delta * (a - 0.5 * delta))
+      if (!is.null(w)) {
+        w <- pmax(w, 0)
+        if (sum(w) <= 0) return(mean(l))
+        return(sum(w * l) / sum(w))
+      }
+      mean(l)
+    }
+
+    score_from_solution <- function(res) {
+      if (is.null(res) || is.null(res$residuals)) return(Inf)
+      if (loss == "rmse") return(as.numeric(res$rmse))
+      huber_loss_mean(res$residuals, w = feature_weights)
+    }
 
     # Collector for all evaluated models (to capture uncertainty)
     candidate_results <- list()
@@ -3724,6 +3729,8 @@ if ("pheno_year" %in% names(test_dly)) {
       names(res$w) <- veg_names
       res$ids <- ids
       names(res$ids) <- veg_names
+      res$E <- E
+      res$score <- score_from_solution(res)
       return(res)
     }
     
@@ -3736,29 +3743,39 @@ if ("pheno_year" %in% names(test_dly)) {
     if (total_combos < 500) { # Heuristic: if total combos are less than 500, do full search
         full_idx_lists <- lapply(top_variants, function(lst) seq_along(lst))
         all_combos <- expand.grid(full_idx_lists, KEEP.OUT.ATTRS = FALSE)
-        best_rmse <- Inf
+      best_score <- Inf
         best_result <- NULL
         for (i in 1:nrow(all_combos)) {
             res <- solve_combo(as.integer(all_combos[i, ]))
             add_candidate(res) # Store for uncertainty
-            if (!is.null(res) && is.finite(res$rmse) && res$rmse < best_rmse) {
-                best_rmse <- res$rmse
+        if (!is.null(res) && is.finite(res$score) && res$score < best_score) {
+          best_score <- res$score
                 best_result <- res
             }
         }
         if (is.null(best_result)) return(NULL)
         
         # Sort and return top candidates
-        sorted_candidates <- candidate_results[order(sapply(candidate_results, function(x) x$rmse))]
+      sorted_candidates <- candidate_results[order(sapply(candidate_results, function(x) x$score))]
         top_models <- head(sorted_candidates, 20)
         
-        return(list(w = best_result$w, rmse = best_rmse, ids = best_result$ids, residuals = best_result$residuals, top_models = top_models))
+      return(list(
+        w = best_result$w,
+        rmse = best_result$rmse,
+        score = best_score,
+        loss = loss,
+        huber_delta = huber_delta,
+        ids = best_result$ids,
+        residuals = best_result$residuals,
+        E_best = best_result$E,
+        top_models = top_models
+      ))
     }
 
     # Stage 1: Coarse search
     coarse_combos <- expand.grid(coarse_idx_lists, KEEP.OUT.ATTRS = FALSE)
     
-    best_rmse <- Inf
+    best_score <- Inf
     best_result <- NULL
     best_combo_indices <- NULL
 
@@ -3766,8 +3783,8 @@ if ("pheno_year" %in% names(test_dly)) {
       current_indices <- as.integer(coarse_combos[i, ])
       res <- solve_combo(current_indices)
       add_candidate(res) # Store for uncertainty
-      if (!is.null(res) && is.finite(res$rmse) && res$rmse < best_rmse) {
-        best_rmse <- res$rmse
+      if (!is.null(res) && is.finite(res$score) && res$score < best_score) {
+        best_score <- res$score
         best_result <- res
         best_combo_indices <- current_indices
       }
@@ -3778,7 +3795,7 @@ if ("pheno_year" %in% names(test_dly)) {
        best_result <- solve_combo(best_combo_indices)
        add_candidate(best_result)
        if(is.null(best_result)) return(NULL)
-       best_rmse <- best_result$rmse
+       best_score <- best_result$score
     }
 
     # Fine-tuning step (Coordinate Descent)
@@ -3797,8 +3814,8 @@ if ("pheno_year" %in% names(test_dly)) {
             res <- solve_combo(test_indices)
             add_candidate(res) # Store for uncertainty
             
-            if (!is.null(res) && is.finite(res$rmse) && res$rmse < best_rmse) {
-                best_rmse <- res$rmse
+            if (!is.null(res) && is.finite(res$score) && res$score < best_score) {
+              best_score <- res$score
                 best_result <- res
                 current_best_indices[i] <- variant_idx
             }
@@ -3807,137 +3824,37 @@ if ("pheno_year" %in% names(test_dly)) {
     
     if (is.null(best_result)) return(NULL)
 
-    # Sort candidates by RMSE
-    sorted_candidates <- candidate_results[order(sapply(candidate_results, function(x) x$rmse))]
+    # Sort candidates by the selected score
+    sorted_candidates <- candidate_results[order(sapply(candidate_results, function(x) x$score))]
     
     # Filter to keep "low RMSE" models for uncertainty estimation
     # Strategy: threshold derived from the data distribution (Min + 2 * (Q25 - Min))
     # This adapts to the flatness of the objective function near the minimum, keeping models
     # that are statistically comparable to the best fit within the observed spread.
-    all_rmses <- sapply(sorted_candidates, function(x) x$rmse)
-    q25 <- quantile(all_rmses, 0.25, na.rm = TRUE)
-    spread_metric <- q25 - best_rmse
+    all_scores <- sapply(sorted_candidates, function(x) x$score)
+    q25 <- quantile(all_scores, 0.25, na.rm = TRUE)
+    spread_metric <- q25 - best_score
     
 
     
-    rmse_threshold <- best_rmse + (2.0 * spread_metric)
+    score_threshold <- best_score + (2.0 * spread_metric)
     
-    top_models <- Filter(function(x) x$rmse <= rmse_threshold, sorted_candidates)
+    top_models <- Filter(function(x) x$score <= score_threshold, sorted_candidates)
 
-    return(list(w = best_result$w, rmse = best_rmse, ids = best_result$ids, residuals = best_result$residuals, top_models = top_models))
+    return(list(
+      w = best_result$w,
+      rmse = best_result$rmse,
+      score = best_score,
+      loss = loss,
+      huber_delta = huber_delta,
+      ids = best_result$ids,
+      residuals = best_result$residuals,
+      E_best = best_result$E,
+      top_models = top_models
+    ))
   }
 
-  prune_collinear_variants <- function(lib, threshold = 0.99) {
-    # Flatten library
-    all_variants <- list()
-    for (v in names(lib)) {
-      for (i in seq_along(lib[[v]])) {
-        var <- lib[[v]][[i]]
-        # Ensure we have a vector to compare
-        vec <- if (!is.null(var$vec)) var$vec else if (!is.null(var$raw_row)) var$raw_row else NULL
-        if (!is.null(vec)) {
-          all_variants[[length(all_variants) + 1]] <- list(
-            veg = v,
-            idx = i,
-            id = if (!is.null(var$id)) var$id else paste0(v, "_v", i),
-            vec = vec,
-            n_samples = if (!is.null(var$n_samples)) var$n_samples else 1
-          )
-        }
-      }
-    }
-
-    if (length(all_variants) < 2) return(lib)
-
-    cat(sprintf("\n[PRUNING] Checking for collinearity among %d variants (threshold=%.4f)...\n", length(all_variants), threshold))
-
-    # Iterative pruning
-    removed_ids <- c()
-    
-    while (TRUE) {
-      # Filter out removed
-      current_vars <- all_variants[!sapply(all_variants, function(x) x$id %in% removed_ids)]
-      n <- length(current_vars)
-      if (n < 2) break
-
-      # Compute distance matrix using Euclidean distance
-      M <- do.call(rbind, lapply(current_vars, function(x) x$vec))
-      
-      # Compute pairwise Euclidean distances
-      n_vars <- nrow(M)
-      Dist <- matrix(0, n_vars, n_vars)
-      for (i in 1:(n_vars-1)) {
-        for (j in (i+1):n_vars) {
-          Dist[i,j] <- Dist[j,i] <- sqrt(sum((M[i,] - M[j,])^2))
-        }
-      }
-      
-      min_dist <- min(Dist[Dist > 0])  # Minimum non-zero distance
-      if (min_dist > (1 - threshold)) break  # threshold is similarity, so 1 - threshold is max allowed distance
-      
-      # Find pair with minimum distance
-      idx_mat <- which(Dist == min_dist, arr.ind = TRUE)
-      # Take first pair
-      r <- idx_mat[1, 1]
-      c <- idx_mat[1, 2]
-      
-      v1 <- current_vars[[r]]
-      v2 <- current_vars[[c]]
-      
-      # Decision logic: drop the one with fewer samples
-      to_drop <- if (v1$n_samples < v2$n_samples) v1 else v2
-      
-      # If samples equal, drop the one that appears later (arbitrary stable tie-break)
-      if (v1$n_samples == v2$n_samples) {
-         to_drop <- v2
-      }
-      
-      cat(sprintf("  [DROP] %s (n=%d) due to distance %.4f with %s (n=%d)\n", 
-                  to_drop$id, to_drop$n_samples, min_dist, 
-                  if (to_drop$id == v1$id) v2$id else v1$id, 
-                  if (to_drop$id == v1$id) v2$n_samples else v1$n_samples))
-      
-      removed_ids <- c(removed_ids, to_drop$id)
-    }
-
-    if (length(removed_ids) == 0) {
-      cat("[PRUNING] No variants removed.\n")
-      return(lib)
-    }
-
-    # Reconstruct library
-    new_lib <- list()
-    for (v in names(lib)) {
-      new_lib[[v]] <- list()
-      for (i in seq_along(lib[[v]])) {
-        var <- lib[[v]][[i]]
-        vid <- if (!is.null(var$id)) var$id else paste0(v, "_v", i)
-        if (!vid %in% removed_ids) {
-          new_lib[[v]][[length(new_lib[[v]]) + 1]] <- var
-        }
-      }
-      if (length(new_lib[[v]]) == 0) {
-          cat(sprintf("  [WARNING] All variants for '%s' were pruned! Restoring the one with most samples.\n", v))
-          # Find original variants for this class
-          vars_orig <- all_variants[sapply(all_variants, function(x) x$veg == v)]
-          if (length(vars_orig) > 0) {
-              # Pick best
-              best_v <- vars_orig[[which.max(sapply(vars_orig, function(x) x$n_samples))]]
-              # Find it in original lib
-              for(orig_var in lib[[v]]) {
-                  ovid <- if (!is.null(orig_var$id)) orig_var$id else ""
-                  if (ovid == best_v$id) {
-                      new_lib[[v]][[1]] <- orig_var
-                      break
-                  }
-              }
-          }
-      }
-    }
-    
-    return(new_lib)
-  }
-
+  
   build_single_stage_library_weighted <- function(df_train, indices, params, allowed_veg) {
     # Single-stage library: treats barren and all vegetation types as equal endmembers
     # Returns a library with all endmember types (barren + veg types) in one unified structure
@@ -4014,16 +3931,78 @@ if ("pheno_year" %in% names(test_dly)) {
     w_vec <- if(!is.null(params$weights)) sqrt(pmax(params$weights, 0)) else rep(1, expected_cols)
     w_vec[w_vec < 1e-9] <- 1e-9 # Prevent div by zero
     
-    min_cluster_size <- 5
+    min_cluster_size <- MIN_CLUSTER_SIZE_SAM
 
     # -------------------------------------------------------------------------
-    # Internal Optimization Routine: Stratified Spatial Bootstrap OOB
+    # SAM-Based Endmember Selection with Cross-Validation
+    # Uses Spectral Angle Mapping for brightness-invariant endmember identification
     # -------------------------------------------------------------------------
+    
+    # Spectral Angle Mapper: compute angle between two spectra (0 = identical shape)
+    spectral_angle <- function(a, b) {
+      a <- as.numeric(a)
+      b <- as.numeric(b)
+      a[!is.finite(a)] <- 0
+      b[!is.finite(b)] <- 0
+      dot_ab <- sum(a * b)
+      norm_a <- sqrt(sum(a^2))
+      norm_b <- sqrt(sum(b^2))
+      if (norm_a < 1e-10 || norm_b < 1e-10) return(pi/2)  # Orthogonal if zero vector
+      cos_theta <- dot_ab / (norm_a * norm_b)
+      cos_theta <- max(-1, min(1, cos_theta))  # Clamp for numerical stability
+      acos(cos_theta)
+    }
+    
+    # SAM-based endmember extraction: find k most spectrally distinct samples
+    sam_extract_endmembers <- function(data_mat, k, w_vec = NULL) {
+      n <- nrow(data_mat)
+      if (n == 0) return(NULL)
+      if (k >= n) return(data_mat)
+      if (k == 1) {
+        # Return medoid based on SAM distances
+        center <- colMeans(data_mat, na.rm = TRUE)
+        angles <- apply(data_mat, 1, function(row) spectral_angle(row, center))
+        return(matrix(data_mat[which.min(angles), ], nrow = 1))
+      }
+      
+      # Apply weighting if provided
+      if (!is.null(w_vec) && length(w_vec) == ncol(data_mat)) {
+        data_w <- sweep(data_mat, 2, w_vec, "*")
+      } else {
+        data_w <- data_mat
+      }
+      
+      # Greedy SAM-based selection (Sequential Maximum Angle)
+      # Start with the sample closest to the mean (most representative)
+      mean_spec <- colMeans(data_w, na.rm = TRUE)
+      angles_to_mean <- apply(data_w, 1, function(row) spectral_angle(row, mean_spec))
+      selected_idx <- which.min(angles_to_mean)
+      selected <- list(selected_idx)
+      
+      for (i in 2:k) {
+        # For each remaining sample, compute minimum SAM to already selected
+        remaining <- setdiff(1:n, unlist(selected))
+        if (length(remaining) == 0) break
+        
+        min_angles <- sapply(remaining, function(r) {
+          min(sapply(selected, function(s) spectral_angle(data_w[r, ], data_w[s, ])))
+        })
+        
+        # Select the sample with maximum minimum angle (most distinct)
+        best_idx <- remaining[which.max(min_angles)]
+        selected <- c(selected, best_idx)
+      }
+      
+      selected_idx <- unlist(selected)
+      
+      # Return unweighted endmembers but use SAM-selected indices
+      data_mat[selected_idx, , drop = FALSE]
+    }
+    
     optimize_library <- function(n_boot = 5) {
-      cat(sprintf("\n  --- Running Optimization with Stratified Spatial Bootstrap (%d folds) ---\n", n_boot))
+      cat(sprintf("\n  --- Running SAM-Based Endmember Selection with Cross-Validation (%d folds) ---\n", n_boot))
       
       # 1. Generate Bootstrap Folds
-      # Structure: folds[[b]][[v]] -> list(train_idx, oob_idx)
       folds <- list()
       for(b in 1:n_boot) {
         folds[[b]] <- list()
@@ -4032,25 +4011,14 @@ if ("pheno_year" %in% names(test_dly)) {
           unique_locs <- unique(locs)
           
           if(length(unique_locs) < 2) {
-             # Too few locations to bootstrap: use all for train, none for OOB (or duplicate)
-             # Fallback: simple row resampling if locations are scarce
              n_rows <- nrow(storage[[v]])
              train_rows <- sample(n_rows, n_rows, replace = TRUE)
              oob_rows <- setdiff(1:n_rows, unique(train_rows))
-             if(length(oob_rows) == 0) oob_rows <- sample(n_rows, max(1, floor(n_rows * 0.2))) # Force some OOB
+             if(length(oob_rows) == 0) oob_rows <- sample(n_rows, max(1, floor(n_rows * 0.2)))
           } else {
-             # Spatial Bootstrap
              train_locs <- sample(unique_locs, length(unique_locs), replace = TRUE)
              oob_locs <- setdiff(unique_locs, unique(train_locs))
-             
-             # Map back to row indices
-             # Note: A location might appear multiple times in train_locs (weighted)
-             # But for clustering input, we typically just want the set of training rows.
-             # Standard Bagging uses the resampled set (with duplicates).
-             
-             # Create a mapping from loc -> row_indices
              loc_to_rows <- split(seq_along(locs), locs)
-             
              train_rows <- unlist(lapply(train_locs, function(l) loc_to_rows[[l]]))
              oob_rows <- unlist(lapply(oob_locs, function(l) loc_to_rows[[l]]))
           }
@@ -4058,22 +4026,19 @@ if ("pheno_year" %in% names(test_dly)) {
         }
       }
 
-      # 2. Pre-compute Clusters for EACH Fold and Class (K=1..11)
-      # cluster_cache[[b]][[v]][[k]] -> centers
-      boot_cluster_cache <- list()
-      k_ranges <- list() # Common range for grid search (derived from full data stats or per-fold?)
-      # We'll derive global valid ranges to keep grid consistent, but check per-fold feasibility
+      # 2. Pre-compute SAM-based endmembers for EACH Fold and Class (K=1..11)
+      boot_endmember_cache <- list()
+      k_ranges <- list()
       
-      cat("    Pre-computing clusters for bootstrap folds...\n")
+      cat("    Pre-computing SAM-based endmembers for bootstrap folds...\n")
       
       for(v in valid_classes) {
-        # Determine valid K range based on TOTAL samples (upper bound)
         n_total <- nrow(storage[[v]])
         if (v == "barren") {
            k_candidates <- 1
         } else {
            max_k <- floor(n_total / min_cluster_size)
-           k_candidates <- 1:11
+           k_candidates <- 1:MAX_K_SAM
            k_candidates <- k_candidates[k_candidates <= max_k]
            if (length(k_candidates) == 0) k_candidates <- 1
         }
@@ -4081,53 +4046,32 @@ if ("pheno_year" %in% names(test_dly)) {
       }
 
       for(b in 1:n_boot) {
-        boot_cluster_cache[[b]] <- list()
+        boot_endmember_cache[[b]] <- list()
         
         for(v in valid_classes) {
-           boot_cluster_cache[[b]][[v]] <- list()
+           boot_endmember_cache[[b]][[v]] <- list()
            
            train_idx <- folds[[b]][[v]]$train
            if(length(train_idx) < min_cluster_size) {
-             # Fallback if bootstrap fold is empty/tiny: use all data
              train_idx <- 1:nrow(storage[[v]])
            }
            
            veg_mat_train <- storage[[v]][train_idx, , drop = FALSE]
-           veg_mat_w <- sweep(veg_mat_train, 2, w_vec, "*")
            
-           # Input for K-Means
-           veg_mat_input <- veg_mat_w
-
            for(k in k_ranges[[v]]) {
-             # Safe K-Means on this fold
-             # Adjust k if fold is smaller than expected (rare with bootstrap size, but possible)
-             if(nrow(veg_mat_input) < k) {
-               curr_k <- max(1, nrow(veg_mat_input))
-             } else {
-               curr_k <- k
-             }
+             curr_k <- min(k, nrow(veg_mat_train))
              
-             # Run K-Means
-             if(curr_k == 1) {
-                center_w <- apply(veg_mat_w, 2, median, na.rm=TRUE)
-                centers_unw <- center_w / w_vec
-                # Skip barren filter in OOB pre-compute for speed/robustness? 
-                # Better to apply it to match final logic.
-                boot_cluster_cache[[b]][[v]][[as.character(k)]] <- matrix(centers_unw, nrow=1)
-             } else {
-                km <- tryCatch(kmeans(veg_mat_input, centers = curr_k, nstart = 5, iter.max = 20), error = function(e) NULL)
-                if(!is.null(km)) {
-                  # Recover centroids
-                  centers_w <- km$centers
-                  centers_unw <- sweep(centers_w, 2, w_vec, "/")
-                  boot_cluster_cache[[b]][[v]][[as.character(k)]] <- centers_unw
-                }
+             # SAM-based endmember extraction (brightness-invariant)
+             endmembers <- sam_extract_endmembers(veg_mat_train, curr_k, w_vec)
+             
+             if(!is.null(endmembers) && nrow(endmembers) > 0) {
+               boot_endmember_cache[[b]][[v]][[as.character(k)]] <- endmembers
              }
            }
         }
       }
 
-      # 3. Grid Search: Evaluate Combinations on OOB Sets
+      # 3. Grid Search: Evaluate Combinations on OOB Sets using FCLS
       grid <- expand.grid(k_ranges)
       n_combos <- nrow(grid)
       if (n_combos > 500) {
@@ -4135,14 +4079,13 @@ if ("pheno_year" %in% names(test_dly)) {
         grid <- grid[sample(seq_len(n_combos), 500), , drop=FALSE]
       }
       
-      cat(sprintf("    Evaluating %d cluster combinations on %d OOB folds...\n", nrow(grid), n_boot))
+      cat(sprintf("    Evaluating %d endmember combinations on %d OOB folds (using SAM + FCLS)...\n", nrow(grid), n_boot))
       
       best_mean_score <- -1
       best_combo <- NULL
+      n_valid_combos_evaluated <- 0L
       
-      # Prepare OOB Test Matrices for speed
-      # oob_data[[b]] -> matrix of all OOB samples for that fold
-      # oob_labels[[b]] -> vector of labels
+      # Prepare OOB Test Matrices
       oob_sets <- list()
       for(b in 1:n_boot) {
          samples <- list(); lbls <- c()
@@ -4160,14 +4103,16 @@ if ("pheno_year" %in% names(test_dly)) {
          }
       }
       
-      run_solver <- function(y, M, w) {
-        sq_w <- sqrt(pmax(w, 0)); M_w <- sweep(M, 1, sq_w, "*"); y_w <- y * sq_w
-        tryCatch(nnls::nnls(M_w, y_w)$x, error=function(e) rep(0, ncol(M)))
+      # Use FCLS solver for evaluation (sum-to-one + non-negativity)
+      run_solver_fcls <- function(y, M, w) {
+        # NOTE: solve_weights_fcls expects E as (n_features x n_endmembers).
+        # Here, M is built as (n_features x n_endmembers), so do NOT transpose.
+        res <- solve_weights_fcls(M, y, feature_weights = w)
+        if (is.null(res)) return(rep(0, ncol(M)))
+        return(res$w)
       }
       
-      # Loop over Grid
-      # Parallelize this loop if possible? No, inner NNLS is fast enough.
-      
+      # Loop over Grid using SAM-extracted endmembers and FCLS solver
       for(i in seq_len(nrow(grid))) {
         combo <- grid[i, , drop=FALSE]
         fold_scores <- numeric(n_boot)
@@ -4176,18 +4121,17 @@ if ("pheno_year" %in% names(test_dly)) {
         for(b in 1:n_boot) {
            if(is.null(oob_sets[[b]])) next
            
-           # Construct Library from Boot Cache using this Combo
+           # Construct Library from SAM-based Endmember Cache
            cols <- list(); col_names <- c()
            valid_lib <- TRUE
            
            for(v in valid_classes) {
               k_val <- as.character(combo[[v]])
-              # Check if this fold has this k (might have failed or been skipped)
-              centers <- boot_cluster_cache[[b]][[v]][[k_val]]
-              if(is.null(centers)) { valid_lib <- FALSE; break }
+              endmembers <- boot_endmember_cache[[b]][[v]][[k_val]]
+              if(is.null(endmembers)) { valid_lib <- FALSE; break }
               
-              cols[[length(cols)+1]] <- t(centers)
-              col_names <- c(col_names, rep(v, nrow(centers)))
+              cols[[length(cols)+1]] <- t(endmembers)
+              col_names <- c(col_names, rep(v, nrow(endmembers)))
            }
            
            if(!valid_lib) next
@@ -4196,35 +4140,59 @@ if ("pheno_year" %in% names(test_dly)) {
            Y_test <- oob_sets[[b]]$Y
            labels_test <- oob_sets[[b]]$labels
            
-           # Evaluate
-           correct_by_class <- list(); total_by_class <- list()
-           for(vc in valid_classes) { correct_by_class[[vc]] <- 0; total_by_class[[vc]] <- 0 }
-           
-           # Batch or loop? Loop for now
+           # Evaluate using FCLS and compute confusion matrix for accuracy
+           cm_labels <- valid_classes
+           frac_mat <- matrix(0, nrow = length(cm_labels), ncol = length(cm_labels))
+           rownames(frac_mat) <- cm_labels
+           colnames(frac_mat) <- cm_labels
+           sample_count_by_true <- as.list(setNames(rep(0, length(cm_labels)), cm_labels))
+
            for(j in seq_len(nrow(Y_test))) {
               true_label <- labels_test[j]
-              total_by_class[[true_label]] <- total_by_class[[true_label]] + 1
-              
-              coefs <- run_solver(Y_test[j, ], M, params$weights)
+
+              # Use FCLS (fully constrained) for unmixing
+              coefs <- run_solver_fcls(Y_test[j, ], M, params$weights)
               sums <- tapply(coefs, col_names, sum)
-              
-              if (!true_label %in% names(sums)) next
-              score_true <- sums[[true_label]]
-              
-              competitors <- if (true_label == "barren") setdiff(names(sums), "barren") else setdiff(names(sums), c(true_label, "barren"))
-              score_max_other <- if(length(competitors)>0) max(sums[competitors]) else -1
-              
-              if (score_true > score_max_other) correct_by_class[[true_label]] <- correct_by_class[[true_label]] + 1
+
+              # Ensure all classes exist
+              for (vc in valid_classes) if (!(vc %in% names(sums))) sums[[vc]] <- 0
+
+              if (true_label %in% names(sums)) {
+                # Accumulate predicted fractions for the true class row
+                for (cc in cm_labels) {
+                  frac_mat[true_label, cc] <- frac_mat[true_label, cc] + as.numeric(sums[[cc]])
+                }
+                sample_count_by_true[[true_label]] <- sample_count_by_true[[true_label]] + 1
+              }
            }
-           
-           # Macro Accuracy (Vegetation Only)
-           accs <- c()
-           veg_classes_only <- setdiff(valid_classes, "barren")
-           for(vc in veg_classes_only) if(total_by_class[[vc]] > 0) accs <- c(accs, correct_by_class[[vc]]/total_by_class[[vc]])
-           
-           if(length(accs) > 0) {
-              fold_scores[b] <- mean(accs)
-              valid_folds <- valid_folds + 1
+
+           # Compute average predicted fractions
+           avg_pred_frac <- frac_mat
+           for (r in seq_len(nrow(frac_mat))) {
+             rname <- rownames(frac_mat)[r]
+             cnt <- sample_count_by_true[[rname]]
+             if (cnt > 0) {
+               avg_pred_frac[r, ] <- frac_mat[r, ] / cnt
+             } else {
+               avg_pred_frac[r, ] <- 0
+             }
+           }
+
+           # Compute veg-only confusion matrix and row-normalize
+           veg_cols <- setdiff(colnames(avg_pred_frac), "barren")
+           veg_rows <- setdiff(rownames(avg_pred_frac), "barren")
+           if (length(veg_cols) > 0 && length(veg_rows) > 0) {
+             veg_matrix <- avg_pred_frac[veg_rows, veg_cols, drop = FALSE]
+             row_sums_veg <- rowSums(veg_matrix, na.rm = TRUE)
+             for (ri in seq_len(nrow(veg_matrix))) {
+               if (row_sums_veg[ri] > 0) {
+                 veg_matrix[ri, ] <- veg_matrix[ri, ] / row_sums_veg[ri]
+               }
+             }
+             fold_scores[b] <- mean(diag(veg_matrix), na.rm = TRUE)
+             valid_folds <- valid_folds + 1
+           } else {
+             fold_scores[b] <- 0  # No veg classes to evaluate
            }
         }
         
@@ -4233,36 +4201,49 @@ if ("pheno_year" %in% names(test_dly)) {
         if (mean_score > best_mean_score) {
           best_mean_score <- mean_score
           best_combo <- combo
+          n_valid_combos_evaluated <- n_valid_combos_evaluated + 1L
         }
+        
+        # Progress logging every 50 combinations
+        if (i %% 50 == 0 || i == nrow(grid)) {
+          cat(sprintf("      [COMBO SEARCH] %d/%d combinations evaluated; best score so far: %.4f\n", 
+                      i, nrow(grid), best_mean_score))
+        }
+      }
+      
+      # If no valid combination was found, return NULL to trigger hard failure
+      if (is.null(best_combo)) {
+        cat("[ERROR] No valid combinations found during grid search.\n")
+        return(NULL)
       }
       
       cat(sprintf("    Best OOB Score: %.4f using combo: %s\n", best_mean_score, paste(names(best_combo), best_combo, sep="=", collapse=", ")))
       
-      # --- AGENT ADDITION: Average Confusion Matrix Calculation ---
-      cat("\n    Computing Average Confusion Matrix across OOB folds for best combination...\n")
+      # --- Confusion Matrix Calculation using SAM endmembers + FCLS ---
+      cat("\n    Computing Average Confusion Matrix across OOB folds for best combination (SAM + FCLS)...\n")
       
-      # Initialize Confusion Matrix
-      # Rows: True, Cols: Predicted
       cm_labels <- valid_classes
-      conf_mat <- matrix(0, nrow = length(cm_labels), ncol = length(cm_labels))
-      rownames(conf_mat) <- cm_labels
-      colnames(conf_mat) <- cm_labels
+      # Accumulate predicted fractions per true class (rows) and predicted class (cols)
+      frac_mat <- matrix(0, nrow = length(cm_labels), ncol = length(cm_labels))
+      rownames(frac_mat) <- cm_labels
+      colnames(frac_mat) <- cm_labels
+      sample_count_by_true <- as.list(setNames(rep(0, length(cm_labels)), cm_labels))
       
       total_samples <- 0
       
       for(b in 1:n_boot) {
          if(is.null(oob_sets[[b]])) next
          
-         # Construct Library for this fold
+         # Construct Library from SAM-based endmember cache
          cols <- list(); col_names <- c()
          valid_lib <- TRUE
          
          for(v in valid_classes) {
             k_val <- as.character(best_combo[[v]])
-            centers <- boot_cluster_cache[[b]][[v]][[k_val]]
-            if(is.null(centers)) { valid_lib <- FALSE; break }
-            cols[[length(cols)+1]] <- t(centers)
-            col_names <- c(col_names, rep(v, nrow(centers)))
+            endmembers <- boot_endmember_cache[[b]][[v]][[k_val]]
+            if(is.null(endmembers)) { valid_lib <- FALSE; break }
+            cols[[length(cols)+1]] <- t(endmembers)
+            col_names <- c(col_names, rep(v, nrow(endmembers)))
          }
          
          if(!valid_lib) next
@@ -4273,38 +4254,67 @@ if ("pheno_year" %in% names(test_dly)) {
          
          for(j in seq_len(nrow(Y_test))) {
             true_label <- labels_test[j]
-            coefs <- run_solver(Y_test[j, ], M, params$weights)
+            coefs <- run_solver_fcls(Y_test[j, ], M, params$weights)
             sums <- tapply(coefs, col_names, sum)
-            
-            # Predict class with max coefficient
-            if(length(sums) > 0) {
-                pred_label <- names(sums)[which.max(sums)]
-                
-                # Update Matrix
-                if(true_label %in% cm_labels && pred_label %in% cm_labels) {
-                    conf_mat[true_label, pred_label] <- conf_mat[true_label, pred_label] + 1
-                    total_samples <- total_samples + 1
-                }
+            if (!is.null(sums) && length(sums) > 0) {
+              # Ensure all labels present in sums
+              for (cc in cm_labels) if (!(cc %in% names(sums))) sums[[cc]] <- 0
+
+              # Accumulate predicted fractions for the true class row
+              for (cc in cm_labels) {
+                frac_mat[true_label, cc] <- frac_mat[true_label, cc] + as.numeric(sums[[cc]])
+              }
+              sample_count_by_true[[true_label]] <- sample_count_by_true[[true_label]] + 1
+              total_samples <- total_samples + 1
             }
          }
       }
-      
-      cat("\n    [OOB Confusion Matrix - Sum over all folds]\n")
-      print(conf_mat)
-      
-      # Row-normalized (Producer's Accuracy / Recall)
-      conf_mat_pct <- sweep(conf_mat, 1, rowSums(conf_mat), "/")
-      conf_mat_pct[is.nan(conf_mat_pct)] <- 0
-      
-      cat("\n    [OOB Confusion Matrix - Row Normalized (Recall)]\n")
-      print(round(conf_mat_pct, 2))
-      
-      # Compute Overall Accuracy on OOB
-      oa <- sum(diag(conf_mat)) / sum(conf_mat)
-      cat(sprintf("\n    Overall OOB Accuracy: %.2f%%\n", oa * 100))
-      
-      # --- END AGENT ADDITION ---
 
+      # Compute average predicted fraction matrix by dividing row sums by counts per true class
+      avg_pred_frac <- matrix(0, nrow = nrow(frac_mat), ncol = ncol(frac_mat))
+      rownames(avg_pred_frac) <- rownames(frac_mat)
+      colnames(avg_pred_frac) <- colnames(frac_mat)
+      for (r in seq_len(nrow(frac_mat))) {
+        rname <- rownames(frac_mat)[r]
+        cnt <- sample_count_by_true[[rname]]
+        if (cnt > 0) {
+          avg_pred_frac[r, ] <- frac_mat[r, ] / cnt
+        } else {
+          avg_pred_frac[r, ] <- 0
+        }
+      }
+
+      cat("\n    [OOB Average Predicted Fractions - Row Normalized (rows sum to 1, excluding barren)]\n")
+      # Compute row-normalized version
+      avg_pred_frac_pct <- avg_pred_frac
+      avg_pred_frac_pct[is.nan(avg_pred_frac_pct)] <- 0
+      row_sums_pct <- rowSums(avg_pred_frac_pct, na.rm = TRUE)
+      for (ri in seq_len(nrow(avg_pred_frac_pct))) {
+        if (row_sums_pct[ri] > 0) {
+          avg_pred_frac_pct[ri, ] <- avg_pred_frac_pct[ri, ] / row_sums_pct[ri]
+        }
+      }
+      
+      # Filter out barren from rows and columns for display
+      veg_cols <- setdiff(colnames(avg_pred_frac_pct), "barren")
+      veg_rows <- setdiff(rownames(avg_pred_frac_pct), "barren")
+      
+      if (length(veg_cols) > 0 && length(veg_rows) > 0) {
+        # Subset to vegetation only
+        veg_matrix <- avg_pred_frac_pct[veg_rows, veg_cols, drop = FALSE]
+        # Renormalize rows so they sum to 1 over vegetation classes only
+        row_sums_veg <- rowSums(veg_matrix, na.rm = TRUE)
+        for (ri in seq_len(nrow(veg_matrix))) {
+          if (row_sums_veg[ri] > 0) {
+            veg_matrix[ri, ] <- veg_matrix[ri, ] / row_sums_veg[ri]
+          }
+        }
+        print(round(veg_matrix, 3))
+      } else {
+        print(round(avg_pred_frac_pct, 3))
+      }
+      
+      # Return best combination (or NULL if none found)
       return(best_combo)
     }
     
@@ -4315,23 +4325,42 @@ if ("pheno_year" %in% names(test_dly)) {
     # 1. Run Optimization to get Best K-Combo
     best_combo <- optimize_library(n_boot = 5)
     
-    # 2. Re-Train Final Clusters on FULL Dataset using Best K
-    cat("\n[LIBRARY BUILD] Re-training final clusters on full dataset using optimal counts...\n")
+    # Fail hard if optimization failed to find a valid combo
+    if (is.null(best_combo) || length(best_combo) == 0) {
+      stop("[ERROR] optimize_library() failed to find any valid cluster combination. Aborting library build.")
+    } else {
+      cat(sprintf("[CLUSTER OPT] Best combination found: %s\n", 
+                  paste(names(best_combo), "=", sapply(best_combo, as.integer), collapse = ", ")))
+    }
+    
+    # 2. Extract Final Endmembers on FULL Dataset using SAM
+    cat("\n[LIBRARY BUILD] Extracting final SAM-based endmembers on full dataset...\n")
     
     final_lib_cache <- list()
     
-    # Pre-compute Barren Weighted Center for Final Filtering
-    barren_ref_w <- NULL
+    # Pre-compute Barren Reference(s) for Filtering (support multiple prototypes)
+    barren_refs_mat <- NULL
     if ("barren" %in% valid_classes) {
        b_mat <- storage[["barren"]]
-       b_mat_w <- sweep(b_mat, 2, w_vec, "*")
-       barren_ref_w <- apply(b_mat_w, 2, median, na.rm=TRUE)
+       if (!is.null(b_mat) && nrow(b_mat) > 0) {
+         n_bproto <- if (exists("RAW_BARREN_N_PROTOTYPES") && is.finite(RAW_BARREN_N_PROTOTYPES) && RAW_BARREN_N_PROTOTYPES >= 1) as.integer(RAW_BARREN_N_PROTOTYPES) else 1L
+         if (n_bproto > 1 && nrow(b_mat) >= n_bproto) {
+           # Use SAM selection to get representative barren prototypes (brightness-invariant)
+           pb <- sam_extract_endmembers(b_mat, min(n_bproto, nrow(b_mat)), w_vec)
+           if (!is.null(pb) && nrow(pb) > 0) {
+             barren_refs_mat <- pb
+           } else {
+             barren_refs_mat <- matrix(colMeans(b_mat, na.rm = TRUE), nrow = 1)
+           }
+         } else {
+           barren_refs_mat <- matrix(colMeans(b_mat, na.rm = TRUE), nrow = 1)
+         }
+       }
     }
 
     for(v in valid_classes) {
        k_opt <- as.numeric(best_combo[[v]])
        veg_mat <- storage[[v]]
-       veg_mat_w <- sweep(veg_mat, 2, w_vec, "*")
        
        # Check availability
        if(nrow(veg_mat) < k_opt) {
@@ -4339,51 +4368,38 @@ if ("pheno_year" %in% names(test_dly)) {
           cat(sprintf("  [WARNING] Reducing k for '%s' to %d (insufficient samples)\n", v, k_opt))
        }
        
-       # Final Clustering
-       final_centers_unw <- NULL
+       # SAM-based endmember extraction (brightness-invariant)
+       final_endmembers <- sam_extract_endmembers(veg_mat, k_opt, w_vec)
        
-       if (k_opt == 1) {
-          center_w <- apply(veg_mat_w, 2, median, na.rm=TRUE)
-          final_centers_unw <- matrix(center_w / w_vec, nrow=1)
-       } else {
-          # Use Euclidean K-Means (consistent with best practice for final shapes)
-          km <- tryCatch(kmeans(veg_mat_w, centers = k_opt, nstart = 20, iter.max = 50), error = function(e) NULL)
-          if(!is.null(km)) {
-             final_centers_unw <- sweep(km$centers, 2, w_vec, "/")
-          }
-       }
-       
-       # Filter Soil-Like Variants (Consistently applied)
-       if (!is.null(final_centers_unw) && v != "barren" && !is.null(barren_ref_w)) {
-           keep_mask <- apply(final_centers_unw, 1, function(row) {
-               row_w <- row * w_vec
-               num <- sum(row_w * barren_ref_w)
-               den <- sqrt(sum(row_w^2)) * sqrt(sum(barren_ref_w^2))
-               sim <- if (den > 1e-9) num/den else 0
-               return(sim <= 0.95)
+       # Filter Soil-Like Endmembers using Spectral Angle (brightness-invariant)
+       if (!is.null(final_endmembers) && v != "barren" && !is.null(barren_refs_mat)) {
+           # Compute spectral angles to barren prototype(s)
+           sam_threshold <- 0.15  # ~8.6 degrees - endmembers closer than this to barren are filtered
+           keep_mask <- apply(final_endmembers, 1, function(row) {
+               angles <- if (is.matrix(barren_refs_mat) && nrow(barren_refs_mat) > 1) apply(barren_refs_mat, 1, function(br) spectral_angle(row, br)) else spectral_angle(row, as.numeric(barren_refs_mat))
+               min_angle <- min(angles, na.rm = TRUE)
+               return(min_angle > sam_threshold)
            })
            # Always keep at least one
            if (any(keep_mask)) {
-               final_centers_unw <- final_centers_unw[keep_mask, , drop=FALSE]
+               final_endmembers <- final_endmembers[keep_mask, , drop=FALSE]
            } else {
-               cat(sprintf("  [WARNING] All variants for '%s' were too similar to barren. Keeping the most distinct one.\n", v))
-               sims <- apply(final_centers_unw, 1, function(row) {
-                   row_w <- row * w_vec
-                   num <- sum(row_w * barren_ref_w)
-                   den <- sqrt(sum(row_w^2)) * sqrt(sum(barren_ref_w^2))
-                   if (den > 1e-9) num/den else 0
+               cat(sprintf("  [WARNING] All endmembers for '%s' were too similar to barren prototypes. Keeping the most distinct one.\n", v))
+               angles <- apply(final_endmembers, 1, function(row) {
+                 a <- if (is.matrix(barren_refs_mat) && nrow(barren_refs_mat) > 1) apply(barren_refs_mat, 1, function(br) spectral_angle(row, br)) else spectral_angle(row, as.numeric(barren_refs_mat))
+                 min(a, na.rm = TRUE)
                })
-               best_idx <- which.min(sims)
-               final_centers_unw <- final_centers_unw[best_idx, , drop=FALSE]
+               best_idx <- which.max(angles)
+               final_endmembers <- final_endmembers[best_idx, , drop=FALSE]
            }
        }
        
-       if (!is.null(final_centers_unw)) {
-          final_lib_cache[[v]] <- final_centers_unw
+       if (!is.null(final_endmembers)) {
+          final_lib_cache[[v]] <- final_endmembers
        }
     }
     
-    # 3. Construct Final Library Structure (Legacy Format)
+    # 3. Construct Final Library Structure (Standard Format)
     res_lib <- list()
     for(v in names(final_lib_cache)) {
        mat <- final_lib_cache[[v]]
@@ -4400,7 +4416,71 @@ if ("pheno_year" %in% names(test_dly)) {
           )
        }
     }
-    
+
+    # Optional: Generate prototype plots (one plot per index/band) showing endmember centers across pentads
+    plot_vegetation_prototypes <- function(lib, indices = NULL, out_dir = if (exists("OUT_DIR")) OUT_DIR else ".", prefix = "veg_prototypes", save_png = TRUE, dpi = 150) {
+      if (is.null(lib) || length(lib) == 0) return(NULL)
+      if (is.null(indices)) {
+        if (exists("SINGLE_STAGE_PARAMS") && !is.null(SINGLE_STAGE_PARAMS) && !is.null(SINGLE_STAGE_PARAMS$indices)) indices <- SINGLE_STAGE_PARAMS$indices else indices <- OPTIMAL_INDICES
+      }
+      if (!requireNamespace("ggplot2", quietly = TRUE)) stop("ggplot2 required for prototype plotting")
+      if (!dir.exists(out_dir) && save_png) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+      # Build long dataframe for plotting
+      rows <- list()
+      for (v in names(lib)) {
+        variants <- lib[[v]]
+        for (var in variants) {
+          vec <- as.numeric(var$vec)
+          vid <- if (!is.null(var$id)) var$id else if (!is.null(var$variant_id)) var$variant_id else paste0(v, "_unknown")
+          n_idx <- length(indices)
+          expected_len <- n_idx * N_TEMPORAL_BINS
+          if (length(vec) < expected_len) {
+            # Skip malformed variants but warn
+            warning(sprintf("Skipping variant %s for veg %s: length(vec)=%d != expected=%d", vid, v, length(vec), expected_len))
+            next
+          }
+          for (k in seq_len(n_idx)) {
+            idx_name <- indices[k]
+            start <- (k-1) * N_TEMPORAL_BINS + 1
+            end <- k * N_TEMPORAL_BINS
+            vals <- vec[start:end]
+            df_tmp <- data.frame(pentad = seq_len(N_TEMPORAL_BINS), value = vals, Veg = v, variant_id = vid, index = idx_name, stringsAsFactors = FALSE)
+            rows[[length(rows) + 1]] <- df_tmp
+          }
+        }
+      }
+
+      if (length(rows) == 0) return(NULL)
+      proto_df <- do.call(rbind, rows)
+
+      plots <- list()
+      for (idx in unique(proto_df$index)) {
+        df_idx <- proto_df[proto_df$index == idx, , drop = FALSE]
+        p <- ggplot2::ggplot(df_idx, ggplot2::aes(x = pentad, y = value, color = Veg, group = variant_id)) +
+             ggplot2::geom_line(alpha = 0.9, size = 0.8) +
+             ggplot2::labs(title = sprintf("Vegetation prototypes: %s", idx), x = "Pentad", y = sprintf("%s (endmember center)", idx)) +
+             ggplot2::theme_minimal() +
+             ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5)) +
+             ggplot2::scale_color_brewer(palette = "Set1")
+        plots[[idx]] <- p
+        if (save_png) {
+          fn <- file.path(out_dir, sprintf("%s_%s.png", prefix, idx))
+          ggplot2::ggsave(filename = fn, plot = p, width = 8, height = 4, dpi = dpi)
+        }
+      }
+      invisible(plots)
+    }
+
+    if (exists("GENERATE_PROTO_PLOTS") && isTRUE(GENERATE_PROTO_PLOTS)) {
+      tryCatch({
+        plot_vegetation_prototypes(res_lib, indices = (if (!is.null(SINGLE_STAGE_PARAMS)) SINGLE_STAGE_PARAMS$indices else NULL), out_dir = file.path(if (exists("OUT_DIR")) OUT_DIR else ".", "prototype_plots"))
+        cat(sprintf("[NOTICE] Generated prototype plots to %s\n", file.path(if (exists("OUT_DIR")) OUT_DIR else ".", "prototype_plots")))
+      }, error = function(e) {
+        cat(sprintf("[WARN] Failed to generate prototype plots: %s\n", e$message))
+      })
+    }
+
     return(res_lib)
   }
 
@@ -4532,12 +4612,513 @@ print_weights_summary <- function(stage_name, params) {
   invisible(NULL)
 }
 
+# =============================================================================
+# SPLINE-BASED ENDMEMBER LIBRARY (Alternative Mode)
+# =============================================================================
+# When USE_SPLINE_ENDMEMBERS = TRUE, this function builds a smooth spline for
+# each class/index combination. The spline captures the phenological trajectory
+# and allows continuous evaluation at any DOY.
+# =============================================================================
+
+build_spline_library <- function(df_train, indices, allowed_veg, spar = SPLINE_SPAR, norm_params = NULL) {
+  cat("\n=== Building Spline Library (One Curve Per Class Per Index) ===\n")
+  
+  # Normalize training data if norm_params provided
+  if (!is.null(norm_params) && !is.null(norm_params$means) && !is.null(norm_params$sds)) {
+    cat("[SPLINE] Normalizing training data using provided params...\n")
+    cat(sprintf("[SPLINE] Available means names: %s\n", paste(head(names(norm_params$means), 5), collapse=", ")))
+    cat(sprintf("[SPLINE] Available sds names: %s\n", paste(head(names(norm_params$sds), 5), collapse=", ")))
+    n_normalized <- 0
+    for (idx in indices) {
+      if (!idx %in% names(df_train)) next
+      # Access by name, not by numeric index
+      mu <- norm_params$means[idx]
+      sigma <- norm_params$sds[idx]
+      if (is.null(mu) || is.na(mu) || !is.finite(mu)) {
+        cat(sprintf("[SPLINE WARNING] No mean for index '%s', using 0\n", idx))
+        mu <- 0
+      }
+      if (is.null(sigma) || is.na(sigma) || !is.finite(sigma) || sigma < 1e-8) sigma <- 1e-8
+      df_train[[idx]] <- (df_train[[idx]] - mu) / sigma
+      n_normalized <- n_normalized + 1
+    }
+    cat(sprintf("[SPLINE] Successfully normalized %d indices.\n", n_normalized))
+  } else {
+    cat("[SPLINE] No normalization params provided - fitting splines on raw data.\n")
+  }
+  
+  classes <- unique(c("barren", allowed_veg))
+  library_splines <- list()
+  
+  # Prepare plotting data for diagnostics
+  plot_data_list <- list()
+  
+  for (veg in classes) {
+    cat(sprintf("Fitting splines for class: %s\n", veg))
+    sub <- df_train[tolower(df_train$Veg) == veg, ]
+    
+    if (nrow(sub) < 10) {
+      cat(sprintf("  [WARNING] Not enough samples (%d) for %s. Using constant mean.\n", nrow(sub), veg))
+      # Create constant functions for all indices
+      class_splines <- list()
+      for (idx in indices) {
+        if (!idx %in% names(sub)) next
+        mean_val <- mean(sub[[idx]], na.rm = TRUE)
+        if (!is.finite(mean_val)) mean_val <- 0
+        class_splines[[idx]] <- list(
+          predict = local({
+            mv <- mean_val
+            function(new_doy) rep(mv, length(new_doy))
+          }),
+          n_samples = nrow(sub),
+          type = "constant"
+        )
+      }
+      library_splines[[veg]] <- class_splines
+      next
+    }
+    
+    class_splines <- list()
+    n_samples_veg <- nrow(sub)
+    
+    for (idx in indices) {
+      if (!idx %in% names(sub)) next
+      
+      # Prepare data: DOY and Value
+      d <- sub$doy
+      v <- sub[[idx]]
+      mask <- is.finite(d) & is.finite(v)
+      d <- d[mask]
+      v <- v[mask]
+      
+      if (length(d) < 5) {
+        mean_val <- mean(v, na.rm = TRUE)
+        if (!is.finite(mean_val)) mean_val <- 0
+        class_splines[[idx]] <- list(
+          predict = local({
+            mv <- mean_val
+            function(new_doy) rep(mv, length(new_doy))
+          }),
+          n_samples = length(d),
+          type = "constant"
+        )
+        next
+      }
+      
+      # Handle circularity: Pad data (Year-1, Year, Year+1) to ensure smooth wrapping
+      # DOY range: 1 to 365
+      d_aug <- c(d - 365, d, d + 365)
+      v_aug <- c(v, v, v)
+      
+      # Fit smoothing spline
+      fit <- tryCatch({
+        smooth.spline(x = d_aug, y = v_aug, spar = spar)
+      }, error = function(e) {
+        warning(paste("Spline fit failed for", veg, idx, ":", e$message))
+        NULL
+      })
+
+      if (is.null(fit)) {
+        mean_val <- mean(v, na.rm = TRUE)
+        if (!is.finite(mean_val)) mean_val <- 0
+        class_splines[[idx]] <- list(
+          predict = local({
+            mv <- mean_val
+            function(new_doy) rep(mv, length(new_doy))
+          }),
+          n_samples = length(d),
+          type = "constant"
+        )
+        next
+      }
+      
+      # Create a closure function that predicts for new DOYs
+      # Store fit object in the closure environment
+      spline_predict <- local({
+        fit_obj <- fit
+        function(new_doy) {
+          predict(fit_obj, new_doy)$y
+        }
+      })
+      
+      class_splines[[idx]] <- list(
+        predict = spline_predict,
+        fit = fit,
+        n_samples = length(d),
+        type = "spline"
+      )
+      
+      # For plotting/debug
+      pred_doy <- 1:365
+      pred_val <- spline_predict(pred_doy)
+      plot_data_list[[paste(veg, idx, sep = "_")]] <- data.frame(
+        Veg = veg, Index = idx, DOY = pred_doy, Value = pred_val, stringsAsFactors = FALSE
+      )
+    }
+    
+    library_splines[[veg]] <- class_splines
+    cat(sprintf("  Fitted %d indices for %s (n_samples=%d)\n", length(class_splines), veg, n_samples_veg))
+  }
+  
+  # Plot the splines if diagnostics enabled
+  if (isTRUE(ENABLE_DIAGNOSTICS) && length(plot_data_list) > 0) {
+    all_plots <- do.call(rbind, plot_data_list)
+    if (!is.null(all_plots) && nrow(all_plots) > 0) {
+      tryCatch({
+        p <- ggplot(all_plots, aes(x = DOY, y = Value, color = Veg)) +
+          geom_line(size = 1) +
+          facet_wrap(~Index, scales = "free_y") +
+          theme_minimal() +
+          labs(title = "Class Phenology Splines", x = "Day of Year", y = "Index Value")
+        out_path <- file.path(OUT_DIR, "spline_library_curves.png")
+        if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+        ggsave(out_path, p, width = 14, height = 10, dpi = 150)
+        cat(sprintf("[SPLINE] Saved spline library plot to %s\n", out_path))
+      }, error = function(e) {
+        cat(sprintf("[WARN] Failed to save spline plot: %s\n", e$message))
+      })
+    }
+  }
+  
+  return(library_splines)
+}
+
+# Spline-based unmixing solver: FCLS with sum-to-one constraint
+solve_weights_fcls_spline <- function(E, y, lambda = SPLINE_LAMBDA) {
+  if (is.null(E) || ncol(E) < 1 || length(y) == 0) return(rep(0, ncol(E)))
+  
+  # Handle NA values
+  valid_mask <- is.finite(y)
+  if (sum(valid_mask) < 2) return(rep(1/ncol(E), ncol(E)))
+  
+  E_valid <- E[valid_mask, , drop = FALSE]
+  y_valid <- y[valid_mask]
+  
+  # Augment for sum-to-one: [E; lambda] * w = [y; lambda]
+  E_aug <- rbind(E_valid, rep(lambda, ncol(E_valid)))
+  y_aug <- c(y_valid, lambda)
+  
+  # Solve NNLS
+  res <- tryCatch({
+    nnls::nnls(E_aug, y_aug)
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if (is.null(res)) return(rep(1/ncol(E), ncol(E)))
+  
+  w <- res$x
+  
+  # Normalize to sum to 1 strictly
+  if (sum(w) > 0) w <- w / sum(w) else w <- rep(1/ncol(E), ncol(E))
+  return(w)
+}
+
+# Fit a single observation (row) using spline library
+fit_observation_spline <- function(obs_row, doy, spline_lib, indices, params = NULL) {
+  # obs_row: named vector with index values
+  # doy: day of year for this observation
+  # spline_lib: output from build_spline_library
+  # indices: vector of index names to use
+  # params: normalization parameters (means, sds) - if NULL, use raw values
+  
+  classes <- names(spline_lib)
+  n_classes <- length(classes)
+  
+  if (is.na(doy) || !is.finite(doy)) {
+    return(list(weights = rep(NA, n_classes), rmse = NA, classes = classes))
+  }
+  
+  # Build endmember matrix E (rows = indices, cols = classes)
+  E <- matrix(0, nrow = length(indices), ncol = n_classes)
+  colnames(E) <- classes
+  rownames(E) <- indices
+  
+  y <- numeric(length(indices))
+  names(y) <- indices
+  valid_idx_mask <- rep(TRUE, length(indices))
+  
+  for (k in seq_along(indices)) {
+    idx <- indices[k]
+    
+    # Get observed value
+    val <- if (idx %in% names(obs_row)) obs_row[[idx]] else NA
+    if (!is.finite(val)) {
+      valid_idx_mask[k] <- FALSE
+      next
+    }
+    
+    # Normalize if params provided - access by index name, not numeric position
+    if (!is.null(params) && !is.null(params$means) && !is.null(params$sds)) {
+      mu <- params$means[idx]
+      sigma <- params$sds[idx]
+      if (!is.finite(mu)) mu <- 0
+      if (!is.finite(sigma) || sigma < 1e-8) sigma <- 1e-8
+      val <- (val - mu) / sigma
+    }
+    y[k] <- val
+    
+    # Evaluate each class's spline at this DOY
+    for (c_idx in seq_along(classes)) {
+      cls <- classes[c_idx]
+      spline_obj <- spline_lib[[cls]][[idx]]
+      
+      if (!is.null(spline_obj) && !is.null(spline_obj$predict)) {
+        pred_val <- spline_obj$predict(doy)
+        # NOTE: Splines are already fitted on normalized data, so do NOT normalize again
+        E[k, c_idx] <- pred_val
+      } else {
+        valid_idx_mask[k] <- FALSE
+      }
+    }
+  }
+  
+  # Filter to valid indices
+  if (sum(valid_idx_mask) < 2) {
+    # DEBUG: Log when we have insufficient valid indices
+    if (exists("TESTING_MODE") && isTRUE(TESTING_MODE)) {
+      cat(sprintf("[SPLINE OBS DEBUG] DOY=%d: Only %d valid indices (need >=2), skipping\n", doy, sum(valid_idx_mask)))
+    }
+    return(list(weights = rep(NA, n_classes), rmse = NA, classes = classes))
+  }
+  
+  E_curr <- E[valid_idx_mask, , drop = FALSE]
+  y_curr <- y[valid_idx_mask]
+  
+  # DEBUG: Print sample of E and y to understand the unmixing inputs
+  if (exists("SPLINE_DEBUG_COUNTER", envir = .GlobalEnv)) {
+    counter <- get("SPLINE_DEBUG_COUNTER", envir = .GlobalEnv)
+  } else {
+    counter <- 0
+  }
+  if (counter < 3) {
+    cat(sprintf("\n[SPLINE UNMIX DEBUG] DOY=%d, n_valid=%d\n", doy, sum(valid_idx_mask)))
+    cat(sprintf("  y (observation): %s\n", paste(sprintf("%.3f", head(y_curr, 5)), collapse=", ")))
+    cat("  E (endmember predictions per class):\n")
+    for (ci in seq_along(classes)) {
+      cat(sprintf("    %s: %s\n", classes[ci], paste(sprintf("%.3f", head(E_curr[, ci], 5)), collapse=", ")))
+    }
+    assign("SPLINE_DEBUG_COUNTER", counter + 1, envir = .GlobalEnv)
+  }
+  
+  # Solve unmixing
+  w <- solve_weights_fcls_spline(E_curr, y_curr)
+  
+  # DEBUG: Print the resulting weights
+  if (counter < 3) {
+    cat(sprintf("  Weights: %s\n", paste(sprintf("%s=%.3f", classes, w), collapse=", ")))
+  }
+  
+  # Calculate predicted values and residuals
+  pred <- E_curr %*% w
+  residuals_valid <- y_curr - as.numeric(pred)
+  rmse <- sqrt(mean(residuals_valid^2, na.rm = TRUE))
+  
+  # Construct full residual vector with NAs for invalid indices
+  residuals_full <- rep(NA_real_, length(indices))
+  residuals_full[valid_idx_mask] <- residuals_valid
+  names(residuals_full) <- indices
+  
+  return(list(weights = w, rmse = rmse, classes = classes, residuals = residuals_full, 
+              E = E_curr, y = y_curr, valid_mask = valid_idx_mask))
+}
+
+# Fit all observations for a location-year using spline library
+fit_one_task_spline <- function(task_data, spline_lib, indices, params, loc, yr) {
+  n_obs <- nrow(task_data)
+  classes <- names(spline_lib)
+  n_classes <- length(classes)
+  
+  # DEBUG: Log function entry and write diagnostic file (first 3 calls only)
+  if (!exists(".SPLINE_TASK_COUNTER", envir = .GlobalEnv)) {
+    assign(".SPLINE_TASK_COUNTER", 0L, envir = .GlobalEnv)
+  }
+  counter <- get(".SPLINE_TASK_COUNTER", envir = .GlobalEnv)
+  if (counter < 3) {
+    # Write to a fixed file to bypass sink suppression
+    debug_file <- "spline_debug_output.txt"
+    con <- file(debug_file, open = if (counter == 0) "wt" else "at")
+    writeLines(sprintf("\n=== SPLINE TASK DEBUG: loc=%s yr=%d n_obs=%d ===", loc, yr, n_obs), con)
+    writeLines(sprintf("Indices (%d): %s", length(indices), paste(head(indices, 5), collapse=", ")), con)
+    writeLines(sprintf("Classes: %s", paste(classes, collapse=", ")), con)
+    
+    # Test first observation
+    if (n_obs > 0) {
+      test_doy <- task_data$doy[1]
+      test_row <- as.list(task_data[1, ])
+      writeLines(sprintf("\nTest observation DOY=%d:", test_doy), con)
+      
+      # Show raw values for first 3 indices
+      for (idx in head(indices, 3)) {
+        raw_val <- if (idx %in% names(test_row)) test_row[[idx]] else NA
+        mu <- if (!is.null(params$means) && idx %in% names(params$means)) params$means[idx] else NA
+        sd <- if (!is.null(params$sds) && idx %in% names(params$sds)) params$sds[idx] else NA
+        norm_val <- if (!is.na(raw_val) && !is.na(mu) && !is.na(sd) && sd > 0) (raw_val - mu) / sd else NA
+        writeLines(sprintf("  %s: raw=%.4f, mu=%.4f, sd=%.4f, normalized=%.4f", idx, raw_val, mu, sd, norm_val), con)
+        
+        # Show spline predictions for each class
+        for (cls in classes) {
+          spline_obj <- spline_lib[[cls]][[idx]]
+          if (!is.null(spline_obj) && !is.null(spline_obj$predict)) {
+            pred_val <- spline_obj$predict(test_doy)
+            writeLines(sprintf("    -> %s spline prediction: %.4f", cls, pred_val), con)
+          }
+        }
+      }
+    }
+    close(con)
+    assign(".SPLINE_TASK_COUNTER", counter + 1L, envir = .GlobalEnv)
+  }
+  
+  # Pre-allocate results
+  coefs <- matrix(NA, nrow = n_obs, ncol = n_classes)
+  colnames(coefs) <- classes
+  rmses <- numeric(n_obs)
+  doys <- numeric(n_obs)
+  
+  # Store per-observation residuals for GLS MBB bootstrap
+  obs_residuals <- vector("list", n_obs)
+  obs_E <- vector("list", n_obs)  # Store endmember matrices
+  obs_y <- vector("list", n_obs)  # Store observed values
+  obs_valid_mask <- vector("list", n_obs)  # Store valid index masks
+  
+  # Get lat/lon from task_data if available
+  lat_val <- if ("lat" %in% names(task_data)) task_data$lat[1] else NA
+  lon_val <- if ("lon" %in% names(task_data)) task_data$lon[1] else NA
+  
+  for (i in seq_len(n_obs)) {
+    doy <- task_data$doy[i]
+    doys[i] <- doy
+    obs_row <- as.list(task_data[i, ])
+    
+    result <- fit_observation_spline(obs_row, doy, spline_lib, indices, params)
+    
+    if (!is.null(result) && !all(is.na(result$weights))) {
+      coefs[i, ] <- result$weights
+      rmses[i] <- result$rmse
+      obs_residuals[[i]] <- result$residuals
+      obs_E[[i]] <- result$E
+      obs_y[[i]] <- result$y
+      obs_valid_mask[[i]] <- result$valid_mask
+    }
+  }
+  
+  # DEBUG: Check if any coefficients were computed
+  n_valid_rows <- sum(apply(coefs, 1, function(r) !all(is.na(r))))
+  if (n_valid_rows == 0) {
+    cat(sprintf("[SPLINE DEBUG] loc=%s yr=%d: NO valid coefficients computed from %d observations!\n", loc, yr, n_obs))
+  } else if (isTRUE(TESTING_MODE) || n_obs <= 5) {
+    cat(sprintf("[SPLINE DEBUG] loc=%s yr=%d: %d/%d observations produced valid coefficients\n", loc, yr, n_valid_rows, n_obs))
+    cat(sprintf("[SPLINE DEBUG] Sample coefs (first valid): %s\n", paste(sprintf("%.3f", coefs[which(!is.na(coefs[,1]))[1], ]), collapse=", ")))
+  }
+  
+  # Aggregate to location-year level: mean fractions across observations
+  mean_coefs <- colMeans(coefs, na.rm = TRUE)
+  mean_rmse <- mean(rmses, na.rm = TRUE)
+  
+  # DEBUG: Check aggregated coefficients
+  if (all(is.na(mean_coefs)) || sum(mean_coefs, na.rm = TRUE) == 0) {
+    cat(sprintf("[SPLINE DEBUG] loc=%s yr=%d: mean_coefs all NA or zero! mean_coefs=%s\n", loc, yr, paste(sprintf("%.4f", mean_coefs), collapse=", ")))
+  }
+  
+  # Normalize mean_coefs to sum to 1
+  if (sum(mean_coefs, na.rm = TRUE) > 0) {
+    mean_coefs <- mean_coefs / sum(mean_coefs, na.rm = TRUE)
+  }
+  
+  # Build coefficient dataframe (same structure as standard MESMA output)
+  coef_rows <- lapply(seq_along(classes), function(ci) {
+    data.frame(
+      location_id = loc,
+      pheno_year = yr,
+      lat = lat_val,
+      lon = lon_val,
+      Veg = classes[ci],
+      variant_id = paste0(classes[ci], "_spline"),
+      coef = mean_coefs[ci],
+      rmse = mean_rmse,
+      coef_025 = NA_real_,
+      coef_975 = NA_real_,
+      coef_sd = sd(coefs[, ci], na.rm = TRUE),
+      interval = NA_real_,
+      n_obs = n_obs,
+      inseparable_variant_flag = FALSE,
+      inseparable_variant_details = NA_character_,
+      stringsAsFactors = FALSE
+    )
+  })
+  
+  coef_df <- do.call(rbind, coef_rows)
+  
+  # Build per-observation results for detailed output
+  obs_results <- cbind(task_data[, c("location_id", "pheno_year", "doy", "date")], 
+                       as.data.frame(coefs), 
+                       RMSE = rmses)
+  
+  # Diagnostics
+  diag_df <- data.frame(
+    location_id = loc,
+    pheno_year = yr,
+    n_obs = n_obs,
+    mean_rmse = mean_rmse,
+    stringsAsFactors = FALSE
+  )
+  for (ci in seq_along(classes)) {
+    diag_df[[paste0("frac_", classes[ci])]] <- mean_coefs[ci]
+  }
+  
+  # Concatenate all observation residuals into a single vector for MBB
+  # Order by DOY to preserve temporal autocorrelation structure
+  doy_order <- order(doys, na.last = TRUE)
+  residuals_concat <- unlist(obs_residuals[doy_order])
+  residuals_concat <- residuals_concat[!is.na(residuals_concat)]
+  
+  return(list(
+    coef_df = coef_df,
+    obs_results = obs_results,
+    diagnostics = diag_df,
+    mean_coefs = mean_coefs,
+    mean_rmse = mean_rmse,
+    # For GLS MBB bootstrap
+    residuals = residuals_concat,
+    obs_residuals = obs_residuals,
+    obs_E = obs_E,
+    obs_y = obs_y,
+    obs_valid_mask = obs_valid_mask,
+    doys = doys,
+    obs_coefs = coefs,
+    spline_lib = spline_lib,
+    indices = indices,
+    params = params
+  ))
+}
+
   cat("Building single-stage MESMA library with Z-score/PCA/LDA weighting...\n")
   # 'no.soil' mapping removed — 'no soil' column is deprecated and ignored; classification will use 'Veg' only
 
   # Create multi-class classification data: Barren vs Veg A vs Veg B ...
   # This maximizes separation between ALL classes in the feature space.
-  multi_class_data <- dplyr::mutate(df_train, target_class = tolower(as.character(Veg)))
+  # Ensure validation locations are excluded from PCA/LDA training when df_validation is present.
+  train_for_pipeline <- NULL
+  if (exists("df_train") && !is.null(df_train) && nrow(df_train) > 0) {
+    train_for_pipeline <- df_train
+  } else if (exists("df") && !is.null(df) && nrow(df) > 0) {
+    train_for_pipeline <- df
+  } else {
+    stop("No training data available for PCA/LDA training pipeline")
+  }
+
+  if (exists("df_validation") && !is.null(df_validation) && nrow(df_validation) > 0) {
+    val_locs <- unique(df_validation$location_id)
+    before_n <- nrow(train_for_pipeline)
+    train_for_pipeline <- train_for_pipeline[!(train_for_pipeline$location_id %in% val_locs), , drop = FALSE]
+    after_n <- nrow(train_for_pipeline)
+    cat(sprintf("[PCA/LDA] Excluded %d rows belonging to %d validation locations from PCA/LDA training (rows: %d -> %d)\n", before_n - after_n, length(val_locs), before_n, after_n))
+  } else {
+    cat(sprintf("[PCA/LDA] Training rows used for PCA/LDA: %d\n", nrow(train_for_pipeline)))
+  }
+
+  multi_class_data <- dplyr::mutate(train_for_pipeline, target_class = tolower(as.character(Veg)))
   multi_class_data <- dplyr::filter(multi_class_data, !is.na(target_class) & target_class != "")
   multi_class_data <- dplyr::select(multi_class_data, dplyr::all_of(c("location_id", "pheno_year", "date", "doy", "Veg", "target_class", avail)))
 
@@ -4583,6 +5164,111 @@ print_weights_summary <- function(stage_name, params) {
 
   # SINGLE-STAGE UNMIXING: All endmembers (barren + veg types) treated equally
   cat("[MODE] Single-stage unmixing ENABLED (barren and vegetation types treated as equals)\n")
+
+  # === SPLINE MODE BRANCH ===
+  # If USE_SPLINE_ENDMEMBERS is TRUE, build spline library instead of discrete endmembers
+  if (isTRUE(USE_SPLINE_ENDMEMBERS)) {
+    cat("\n=== SPLINE ENDMEMBER MODE ENABLED ===\n")
+    cat("Preparing training data for spline library (EXCLUDING validation locations)...\n")
+
+    # Prefer explicit df_train (should already exclude validation locations). If not present, fall back to filtering df
+    train_for_spline <- NULL
+    if (exists("df_train") && !is.null(df_train) && nrow(df_train) > 0) {
+      train_for_spline <- df_train
+    } else if (exists("df") && !is.null(df) && nrow(df) > 0) {
+      train_for_spline <- df
+    } else {
+      stop("No training data available for spline library building")
+    }
+
+    # If df_validation exists, ensure its locations are excluded
+    if (exists("df_validation") && !is.null(df_validation) && nrow(df_validation) > 0) {
+      val_locs <- unique(df_validation$location_id)
+      before_n <- nrow(train_for_spline)
+      train_for_spline <- train_for_spline[!(train_for_spline$location_id %in% val_locs), , drop = FALSE]
+      after_n <- nrow(train_for_spline)
+      cat(sprintf("  Excluded %d rows belonging to %d validation locations (training rows: %d -> %d)\n", before_n - after_n, length(val_locs), before_n, after_n))
+    } else {
+      cat(sprintf("  Training rows used for spline building: %d\n", nrow(train_for_spline)))
+    }
+
+    # Compute SPLINE-SPECIFIC normalization parameters from raw observations
+    # IMPORTANT: SINGLE_STAGE_PARAMS$means/sds are computed from pentad matrices (37 bins × K),
+    # but spline mode works with individual observations. We need per-index stats from raw data.
+    cat("[SPLINE] Computing observation-level normalization parameters...\n")
+    spline_means <- numeric(length(avail))
+    spline_sds <- numeric(length(avail))
+    names(spline_means) <- avail
+    names(spline_sds) <- avail
+    
+    for (idx in avail) {
+      if (idx %in% names(train_for_spline)) {
+        vals <- train_for_spline[[idx]]
+        vals <- vals[is.finite(vals)]
+        spline_means[idx] <- mean(vals, na.rm = TRUE)
+        spline_sds[idx] <- sd(vals, na.rm = TRUE)
+        if (!is.finite(spline_sds[idx]) || spline_sds[idx] < 1e-8) spline_sds[idx] <- 1
+      } else {
+        spline_means[idx] <- 0
+        spline_sds[idx] <- 1
+      }
+    }
+    cat(sprintf("[SPLINE] Computed normalization for %d indices from %d observations\n", 
+                length(avail), nrow(train_for_spline)))
+    cat(sprintf("[SPLINE] Sample means: %s\n", 
+                paste(sprintf("%s=%.3f", head(avail, 4), spline_means[head(avail, 4)]), collapse=", ")))
+    cat(sprintf("[SPLINE] Sample sds: %s\n", 
+                paste(sprintf("%s=%.3f", head(avail, 4), spline_sds[head(avail, 4)]), collapse=", ")))
+
+    # Store spline-specific normalization parameters
+    SPLINE_PARAMS <- list(
+      indices = avail,
+      means = spline_means,
+      sds = spline_sds,
+      weights = NULL  # Not used in spline mode
+    )
+
+    # Build spline library using the filtered training data WITH normalization
+    SPLINE_LIBRARY <- build_spline_library(train_for_spline, avail, ALLOWED_VEG, spar = SPLINE_SPAR, norm_params = SPLINE_PARAMS)
+
+    assign("SPLINE_LIBRARY", SPLINE_LIBRARY, envir = globalenv())
+    assign("SPLINE_PARAMS", SPLINE_PARAMS, envir = globalenv())
+
+    cat(sprintf("[SPLINE] Library built with %d classes: %s\n", 
+                length(SPLINE_LIBRARY), paste(names(SPLINE_LIBRARY), collapse = ", ")))
+    cat(sprintf("[SPLINE] Using %d indices: %s\n", length(avail), paste(avail, collapse = ", ")))
+    
+    # DIAGNOSTIC: Check class separability at key DOYs (summer peak DOY ~180)
+    cat("\n[SPLINE DIAGNOSTIC] Class separability check (DOY=180, peak growing season):\n")
+    test_doy <- 180
+    classes <- names(SPLINE_LIBRARY)
+    for (idx in head(avail, 5)) {
+      cat(sprintf("  %s: ", idx))
+      vals <- sapply(classes, function(cls) {
+        sp <- SPLINE_LIBRARY[[cls]][[idx]]
+        if (!is.null(sp) && !is.null(sp$predict)) sp$predict(test_doy) else NA
+      })
+      cat(paste(sprintf("%s=%.3f", names(vals), vals), collapse=", "))
+      cat(sprintf(" | range=%.3f\n", diff(range(vals, na.rm=TRUE))))
+    }
+    
+    cat("[SPLINE] Skipping SAM-based endmember extraction (not needed for spline mode)\n")
+
+    # Create minimal placeholder structures for compatibility
+    mesma_lib_single <- list()
+    OPTIMIZED_LIBRARY_SINGLE <- list()
+    mesma_lib <- list()
+    OPTIMIZED_LIBRARY <- list()
+    compressed_templates_accessor <- list()
+
+    assign("SINGLE_STAGE_PARAMS", SINGLE_STAGE_PARAMS, envir = globalenv())
+    assign("mesma_lib_single", mesma_lib_single, envir = globalenv())
+    assign("OPTIMIZED_LIBRARY_SINGLE", OPTIMIZED_LIBRARY_SINGLE, envir = globalenv())
+    assign("compressed_templates_accessor", compressed_templates_accessor, envir = globalenv())
+    assign(".COMPRESSED_TEMPLATES_ACCESSOR", compressed_templates_accessor, envir = globalenv())
+    
+  } else {
+  # === STANDARD SAM-BASED ENDMEMBER MODE ===
 
   cat("Building single-stage library (barren + all vegetation types)...\n")
   mesma_lib_single <- build_single_stage_library_weighted(df_train, avail, SINGLE_STAGE_PARAMS, ALLOWED_VEG)
@@ -4639,6 +5325,9 @@ print_weights_summary <- function(stage_name, params) {
       cat(sprintf("Failed to write MESMA cache: %s\n", e$message))
     })
   }
+  
+  } # END else (standard SAM-based mode)
+  # === END MODE BRANCH ===
 
 cat("[DEBUG] Reached line 6377 - about to define fit_one_task function\n")
 
@@ -4826,6 +5515,10 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
 
       # Perform single-stage MESMA using all endmembers (barren + all veg types)
       veg_kept <- names(mesma_lib)
+      # SAFEGUARD: Ensure a 'barren' endmember exists - we DO NOT subtract soil separately from y (barren acts as soil endmember)
+      if (!"barren" %in% veg_kept) {
+        warning("No 'barren' endmember found in MESMA library - ensure barren endmembers are present. The pipeline expects barren to be part of the endmember set and will not perform separate soil subtraction.")
+      }
       top_variants <- list()
 
       for(v in veg_kept) {
@@ -4853,8 +5546,8 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
         denom_sim <- sqrt(sum(y_for_sim^2, na.rm = TRUE)); if (denom_sim < 1e-12) denom_sim <- 1
         y_sim_norm <- y_for_sim / denom_sim
         sims <- as.numeric(lib_M_norm_masked %*% y_sim_norm)
-        best_idx <- order(sims, decreasing=TRUE)[1:min(length(sims), TOPK_VARIANTS)]
-
+        # Include all variants for consideration (remove similarity-based top-K filtering)
+        best_idx <- order(sims, decreasing=TRUE)
         top_variants[[v]] <- lapply(best_idx, function(i) {
           # Use masked template (only valid observations) for unmixing
           masked_vec <- lib_M_norm_masked[i, ]
@@ -4880,7 +5573,16 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
       # Evaluate all combinations of endmembers
       # Pass unweighted observation; weighting happens inside solve_weights_nnls_simple
       best_result <- tryCatch({
-        evaluate_all_combinations(y_for_unmixing, top_variants, lambda = 0, feature_weights = weights_masked)
+        use_robust <- exists("ROBUST_RESIDUALS_HUBER") && isTRUE(ROBUST_RESIDUALS_HUBER)
+        huber_delta <- if (exists("HUBER_DELTA") && is.finite(HUBER_DELTA)) as.numeric(HUBER_DELTA) else NULL
+        evaluate_all_combinations(
+          y_for_unmixing,
+          top_variants,
+          lambda = 0,
+          feature_weights = weights_masked,
+          loss = if (use_robust) "huber" else "rmse",
+          huber_delta = huber_delta
+        )
       }, error = function(e) {
         cat(sprintf("[ERROR fit_one_task] evaluate_all_combinations failed for loc=%s year=%d: %s\n", as.character(loc), as.integer(yr), e$message))
         NULL
@@ -4896,6 +5598,7 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
       coefs <- best_result$w
       rmse <- best_result$rmse
       residuals <- best_result$residuals
+      E_best_masked <- if (!is.null(best_result$E_best)) best_result$E_best else NULL
       
       # Calculate model selection uncertainty from top models
       coef_sd_vec <- rep(NA, length(coefs))
@@ -4911,6 +5614,85 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
          }
       }
 
+      # --- Monte Carlo error propagation through unmixing (optional) ---
+      mc_coef_sd <- NULL
+      mc_coef_q025 <- NULL
+      mc_coef_q975 <- NULL
+
+      run_monte_carlo <- isTRUE(ENABLE_UNCERTAINTY) && exists("ENABLE_MONTE_CARLO") && isTRUE(ENABLE_MONTE_CARLO)
+      n_mc <- if (exists("MC_N_DRAWS") && is.finite(MC_N_DRAWS)) as.integer(MC_N_DRAWS) else 0L
+
+      if (run_monte_carlo && n_mc >= 10 && !is.null(E_best_masked) && is.matrix(E_best_masked) && ncol(E_best_masked) == length(coefs)) {
+        # Noise model: y is z-scored; use residual scale by default.
+        mc_sigma <- rmse
+        if (exists("MC_NOISE_SD") && is.finite(MC_NOISE_SD) && MC_NOISE_SD > 0) mc_sigma <- as.numeric(MC_NOISE_SD)
+        if (exists("MC_NOISE_SCALE") && is.finite(MC_NOISE_SCALE) && MC_NOISE_SCALE > 0) mc_sigma <- mc_sigma * as.numeric(MC_NOISE_SCALE)
+        if (!is.finite(mc_sigma) || mc_sigma < 0) mc_sigma <- 0
+
+        # Optional: endmember bundles (sample endmembers from covariance estimated from the candidate pool)
+        enable_bundles <- exists("ENABLE_ENDMEMBER_BUNDLES") && isTRUE(ENABLE_ENDMEMBER_BUNDLES)
+        bundle_params <- NULL
+        if (enable_bundles) {
+          bundle_params <- list()
+          for (v in names(chosen_ids)) {
+            cand_list <- top_variants[[v]]
+            if (is.null(cand_list) || length(cand_list) < 3) next
+            Mv <- do.call(rbind, lapply(cand_list, function(z) as.numeric(z$vec)))
+            if (is.null(Mv) || nrow(Mv) < 3) next
+            mu <- colMeans(Mv, na.rm = TRUE)
+            C <- tryCatch(stats::cov(Mv, use = "pairwise.complete.obs"), error = function(e) NULL)
+            if (is.null(C) || any(!is.finite(C))) next
+            diag(C) <- diag(C) + 1e-6
+
+            ev <- tryCatch(eigen(C, symmetric = TRUE), error = function(e) NULL)
+            if (is.null(ev) || any(!is.finite(ev$values))) next
+            vals <- pmax(ev$values, 0)
+            A <- ev$vectors %*% diag(sqrt(vals), nrow = length(vals))
+
+            bundle_params[[v]] <- list(mu = mu, A = A)
+          }
+        }
+
+        sample_from_bundle <- function(mu, A) {
+          z <- stats::rnorm(length(mu))
+          x <- as.numeric(mu + A %*% z)
+          x[!is.finite(x)] <- 0
+          nrm <- sqrt(sum(x^2))
+          if (!is.finite(nrm) || nrm < 1e-9) return(mu)
+          x / nrm
+        }
+
+        w_draws <- matrix(NA_real_, nrow = length(coefs), ncol = n_mc)
+        rownames(w_draws) <- names(coefs)
+
+        for (b in seq_len(n_mc)) {
+          y_mc <- y_for_unmixing
+          if (mc_sigma > 0) y_mc <- y_mc + stats::rnorm(length(y_mc), mean = 0, sd = mc_sigma)
+
+          E_mc <- E_best_masked
+          if (enable_bundles && !is.null(bundle_params) && length(bundle_params) > 0) {
+            for (j in seq_along(names(chosen_ids))) {
+              v <- names(chosen_ids)[j]
+              bp <- bundle_params[[v]]
+              if (!is.null(bp) && !is.null(bp$mu) && !is.null(bp$A)) {
+                E_mc[, j] <- sample_from_bundle(bp$mu, bp$A)
+              }
+            }
+          }
+
+          res_mc <- solve_weights_nnls_simple(E_mc, y_mc, feature_weights = weights_masked)
+          if (!is.null(res_mc) && !is.null(res_mc$w) && length(res_mc$w) == length(coefs)) {
+            w_draws[, b] <- as.numeric(res_mc$w)
+          }
+        }
+
+        if (ncol(w_draws) > 1) {
+          mc_coef_sd <- apply(w_draws, 1, stats::sd, na.rm = TRUE)
+          mc_coef_q025 <- apply(w_draws, 1, stats::quantile, probs = 0.025, na.rm = TRUE)
+          mc_coef_q975 <- apply(w_draws, 1, stats::quantile, probs = 0.975, na.rm = TRUE)
+        }
+      }
+
       # Build coefficient dataframe with variant-level detail
       coef_df <- data.frame(
         location_id = loc,
@@ -4921,9 +5703,15 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
         variant_id = chosen_ids,
         coef = coefs,
         rmse = rmse,
-        coef_025 = NA,
-        coef_975 = NA,
-        coef_sd = as.numeric(coef_sd_vec),
+        coef_025 = if (!is.null(mc_coef_q025)) as.numeric(mc_coef_q025) else NA,
+        coef_975 = if (!is.null(mc_coef_q975)) as.numeric(mc_coef_q975) else NA,
+        coef_sd = {
+          base_sd <- as.numeric(coef_sd_vec)
+          if (!is.null(mc_coef_sd)) {
+            base_sd <- sqrt(pmax(base_sd, 0)^2 + pmax(as.numeric(mc_coef_sd), 0)^2)
+          }
+          base_sd
+        },
         interval = NA,
         n_obs = nrow(task_data),
         inseparable_variant_flag = FALSE,
@@ -5075,9 +5863,15 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
       if (sum_original_veg_coefs > 1e-9) {
          v_rows <- tolower(coef_df$Veg) != "barren"
          coef_df$coef[v_rows] <- coef_df$coef[v_rows] * scale_factor
+        if ("coef_sd" %in% names(coef_df)) coef_df$coef_sd[v_rows] <- coef_df$coef_sd[v_rows] * abs(scale_factor)
+        if ("coef_025" %in% names(coef_df)) coef_df$coef_025[v_rows] <- coef_df$coef_025[v_rows] * scale_factor
+        if ("coef_975" %in% names(coef_df)) coef_df$coef_975[v_rows] <- coef_df$coef_975[v_rows] * scale_factor
       } else {
          v_rows <- tolower(coef_df$Veg) != "barren"
          coef_df$coef[v_rows] <- 0
+        if ("coef_sd" %in% names(coef_df)) coef_df$coef_sd[v_rows] <- 0
+        if ("coef_025" %in% names(coef_df)) coef_df$coef_025[v_rows] <- 0
+        if ("coef_975" %in% names(coef_df)) coef_df$coef_975[v_rows] <- 0
       }
       
       if (nrow(coef_df) > 0) {
@@ -5090,6 +5884,9 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
         barren_row_df$Veg <- "barren"
         barren_row_df$variant_id <- "barren_ppi"
         barren_row_df$coef <- barren_fraction
+        if ("coef_sd" %in% names(barren_row_df)) barren_row_df$coef_sd <- 0
+        if ("coef_025" %in% names(barren_row_df)) barren_row_df$coef_025 <- NA
+        if ("coef_975" %in% names(barren_row_df)) barren_row_df$coef_975 <- NA
         coef_df <- rbind(coef_df, barren_row_df)
       } else {
         coef_df <- data.frame(
@@ -5163,7 +5960,20 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
     out <- tryCatch({
       for (yr in years) {
         year_data <- location_data[location_data$pheno_year == yr, , drop = FALSE]
-        res_yr <- fit_one_task(year_data)
+        
+        # === SPLINE MODE: Use spline-based unmixing if enabled ===
+        if (isTRUE(USE_SPLINE_ENDMEMBERS) && exists("SPLINE_LIBRARY") && exists("SPLINE_PARAMS")) {
+          res_yr <- tryCatch({
+            fit_one_task_spline(year_data, SPLINE_LIBRARY, SPLINE_PARAMS$indices, SPLINE_PARAMS, loc, yr)
+          }, error = function(e) {
+            if (isTRUE(TESTING_MODE)) cat(sprintf("[ERROR fit_one_task_spline] loc=%s yr=%d: %s\n", loc, yr, e$message))
+            NULL
+          })
+        } else {
+          # Standard MESMA unmixing
+          res_yr <- fit_one_task(year_data)
+        }
+        # === END SPLINE MODE BRANCH ===
 
         if (!is.null(res_yr)) {
           tryCatch({
@@ -5231,7 +6041,6 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
 
       if (isTRUE(ENABLE_UNCERTAINTY) && length(years) >= 1 && length(y_vecs_by_year) == length(years)) {
         # Get comp_templates from first successful year result
-        comp_templates_list <- list()
         top_variants <- NULL
 
         for (yr in years) {
@@ -5311,6 +6120,74 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
               sink(con_msg, type = "message")
 
               for (b in seq_len(B_loc)) {
+                
+                # === SPLINE MODE: GLS MBB bootstrap on per-observation residuals ===
+                if (isTRUE(USE_SPLINE_ENDMEMBERS) && !is.null(res_yr$obs_residuals)) {
+                  # Bootstrap residuals using MBB on the concatenated residual vector
+                  residuals_boot <- gls_mbb_bootstrap(res_yr$residuals, BOOTSTRAP_BLOCK_SIZE)
+                  
+                  # Refit each observation with bootstrapped residuals added to the original observations
+                  n_obs_yr <- length(res_yr$obs_residuals)
+                  boot_coefs_obs <- matrix(NA, nrow = n_obs_yr, ncol = length(res_yr$mean_coefs))
+                  colnames(boot_coefs_obs) <- names(res_yr$mean_coefs)
+                  
+                  resid_ptr <- 1  # Pointer into the concatenated bootstrapped residuals
+                  doy_order <- order(res_yr$doys, na.last = TRUE)  # Same order as residuals were concatenated
+                  
+                  for (obs_idx in doy_order) {
+                    obs_E <- res_yr$obs_E[[obs_idx]]
+                    obs_y <- res_yr$obs_y[[obs_idx]]
+                    
+                    if (is.null(obs_E) || is.null(obs_y) || length(obs_y) == 0) next
+                    
+                    # Get the bootstrapped residuals for this observation
+                    n_valid <- length(obs_y)
+                    if (resid_ptr + n_valid - 1 > length(residuals_boot)) break
+                    
+                    boot_resid <- residuals_boot[resid_ptr:(resid_ptr + n_valid - 1)]
+                    resid_ptr <- resid_ptr + n_valid
+                    
+                    # Add bootstrapped residuals to observed y to create perturbed observation
+                    y_boot_obs <- obs_y + boot_resid
+                    
+                    # Re-solve FCLS with perturbed observations
+                    w_boot <- tryCatch({
+                      solve_weights_fcls_spline(obs_E, y_boot_obs)
+                    }, error = function(e) NULL)
+                    
+                    if (!is.null(w_boot) && length(w_boot) == ncol(boot_coefs_obs)) {
+                      boot_coefs_obs[obs_idx, ] <- w_boot
+                    }
+                  }
+                  
+                  # Aggregate bootstrapped coefficients
+                  boot_mean_coefs <- colMeans(boot_coefs_obs, na.rm = TRUE)
+                  if (sum(boot_mean_coefs, na.rm = TRUE) > 0) {
+                    boot_mean_coefs <- boot_mean_coefs / sum(boot_mean_coefs, na.rm = TRUE)
+                  }
+                  
+                  # Collect bootstrapped coefficients by vegetation class
+                  for (ci in seq_along(names(boot_mean_coefs))) {
+                    vg <- names(boot_mean_coefs)[ci]
+                    val <- boot_mean_coefs[ci]
+                    if (!is.finite(val)) next
+                    if (is.null(boot_coef_by_veg[[vg]])) boot_coef_by_veg[[vg]] <- numeric(0)
+                    boot_coef_by_veg[[vg]] <- c(boot_coef_by_veg[[vg]], val)
+                  }
+                  
+                  # Compute bootstrapped RMSE for spline mode
+                  # RMSE is the standard deviation of residuals after bootstrap perturbation
+                  if (!is.null(res_yr$mean_rmse) && is.finite(res_yr$mean_rmse)) {
+                    # Add variability to RMSE estimate based on bootstrapped residuals
+                    boot_rmse_val <- sqrt(mean(residuals_boot^2, na.rm = TRUE))
+                    if (is.finite(boot_rmse_val)) {
+                      boot_rmse <- c(boot_rmse, boot_rmse_val)
+                    }
+                  }
+                  
+                  next  # Skip the standard MESMA bootstrap below
+                }
+                # === END SPLINE MODE ===
                 
                 residuals_boot <- gls_mbb_bootstrap(res_yr$residuals, BOOTSTRAP_BLOCK_SIZE)
                 y_boot <- res_yr$y_hat + residuals_boot
@@ -5465,7 +6342,17 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
     assign('TESTING_MODE', TRUE, envir = globalenv())
 
     cat(sprintf('\n=== DEBUG UNMIX: loc=%s pheno_year=%s ===\n', as.character(loc), as.character(yr)))
-    res <- tryCatch({ fit_one_task(task_data) }, error = function(e) { cat(sprintf('DEBUG UNMIX ERROR: %s\n', e$message)); NULL })
+    
+    # Use spline mode if enabled
+    if (isTRUE(USE_SPLINE_ENDMEMBERS) && exists("SPLINE_LIBRARY") && exists("SPLINE_PARAMS")) {
+      cat('[DEBUG] Using SPLINE MODE\n')
+      res <- tryCatch({ 
+        fit_one_task_spline(task_data, SPLINE_LIBRARY, SPLINE_PARAMS$indices, SPLINE_PARAMS, loc, yr)
+      }, error = function(e) { cat(sprintf('DEBUG UNMIX ERROR (spline): %s\n', e$message)); NULL })
+    } else {
+      res <- tryCatch({ fit_one_task(task_data) }, error = function(e) { cat(sprintf('DEBUG UNMIX ERROR: %s\n', e$message)); NULL })
+    }
+    
     if (!is.null(res)) {
       cat('--- RESULT SUMMARY ---\n')
       if (!is.null(res$diagnostics)) print(res$diagnostics)
@@ -5475,6 +6362,19 @@ gls_mbb_bootstrap <- function(residuals, block_size) {
     res
   }
   cat("Starting main processing loop...\n")
+  
+  # === SPLINE MODE STATUS ===
+  if (isTRUE(USE_SPLINE_ENDMEMBERS)) {
+    cat("\n")
+    cat("╔══════════════════════════════════════════════════════════════════╗\n")
+    cat("║  SPLINE ENDMEMBER MODE ACTIVE                                    ║\n")
+    cat("║  Each class represented by smooth spline curves across DOY       ║\n")
+    cat("║  Unmixing performed at observation-level with DOY-specific       ║\n")
+    cat("║  endmember values from spline functions                          ║\n")
+    cat("╚══════════════════════════════════════════════════════════════════╝\n")
+    cat("\n")
+  }
+  # === END SPLINE MODE STATUS ===
 
 TEMP_RESULTS_DIR <- "C:/MAP/temp_results"
 if (dir.exists(TEMP_RESULTS_DIR)) {
@@ -6378,20 +7278,8 @@ flush.console()
     val_coefs_labeled <- val_coefs %>% 
        dplyr::inner_join(labels_df, by = "location_id")
 
-     # Drop barren from classification accuracy; rely on PPI-based cover truth instead
-     if ("true_veg" %in% names(val_coefs_labeled)) {
-       barren_mask <- tolower(val_coefs_labeled$true_veg) == "barren"
-       if (any(barren_mask, na.rm = TRUE)) {
-        cat(sprintf("[NOTICE] Dropping %d validation rows with true_veg=='barren' from classification accuracy; using PPI cover truth instead when available.\n",
-                sum(barren_mask, na.rm = TRUE)))
-        val_coefs_labeled <- val_coefs_labeled[!barren_mask, , drop = FALSE]
-       }
-     }
-    
-     if (nrow(val_coefs_labeled) == 0) {
-       cat("[NOTICE] No labeled validation rows remain after removing barren truth.\n")
-       return(invisible(NULL))
-     }
+     # (Barren dropping logic removed to allow full confusion matrix calculation including barren)
+
     
     cat(sprintf("\n=== VALIDATION ACCURACY ON HELD-OUT SET%s ===\n", prefix))
     cat(sprintf("Validation set: %d locations, %d location-year pairs\n", 
@@ -6447,6 +7335,60 @@ flush.console()
     # Identify all fraction columns (now aggregated by class)
     all_veg_cols <- grep("^frac_", names(val_coefs_wide), value = TRUE)
     
+    # --- 2b. Winner-Takes-All Confusion Matrix (like OOB) ---
+    if (length(all_veg_cols) > 0) {
+      cat("\n--- CONFUSION MATRIX (Winner-Takes-All) ---\n")
+      
+      # We need to act on val_coefs_wide
+      # Ensure we have the matrix of fractions
+      frac_mat <- as.matrix(val_coefs_wide[, all_veg_cols])
+      
+      preds <- apply(frac_mat, 1, function(r) {
+         idx <- which.max(r)
+         if(length(idx) == 0) return(NA_character_)
+         sub("^frac_", "", all_veg_cols[idx])
+      })
+      
+      val_coefs_wide$predicted_class <- preds
+      
+      # Create Confusion Matrix
+      # Rows: True, Cols: Predicted
+      # Ensure all classes (True and Predicted) are represented
+      all_classes <- sort(unique(c(tolower(val_coefs_wide$true_veg), val_coefs_wide$predicted_class)))
+      all_classes <- all_classes[!is.na(all_classes)]
+      
+      conf_mat <- table(
+         True = factor(tolower(val_coefs_wide$true_veg), levels = all_classes),
+         Predicted = factor(val_coefs_wide$predicted_class, levels = all_classes)
+      )
+      
+      cat("\n[Validation Confusion Matrix - Counts (excluding barren)]\n")
+      # Filter out barren
+      veg_cols <- setdiff(colnames(conf_mat), "barren")
+      veg_rows <- setdiff(rownames(conf_mat), "barren")
+      
+      if (length(veg_cols) > 0 && length(veg_rows) > 0) {
+        print(conf_mat[veg_rows, veg_cols])
+      } else {
+        print(conf_mat)
+      }
+      
+      # Row-normalized
+      conf_mat_pct <- sweep(conf_mat, 1, rowSums(conf_mat), "/")
+      conf_mat_pct[is.nan(conf_mat_pct)] <- 0
+      
+      cat("\n[Validation Confusion Matrix - Row Normalized (Recall, excluding barren)]\n")
+      if (length(veg_cols) > 0 && length(veg_rows) > 0) {
+        print(round(conf_mat_pct[veg_rows, veg_cols], 2))
+      } else {
+        print(round(conf_mat_pct, 2))
+      }
+      
+      # Accuracy
+      oa <- sum(diag(conf_mat)) / sum(conf_mat)
+      cat(sprintf("\nOverall Validation Accuracy: %.2f%%\n", oa * 100))
+    }
+
     # For PPI analysis, we might exclude barren if strictly analyzing "vegetation" cover
     veg_cols_no_barren <- all_veg_cols[all_veg_cols != "frac_barren"]
 
@@ -6504,8 +7446,18 @@ flush.console()
           cat("Rows: True Class | Columns: Mean Predicted Fraction\n\n")
           
           # Group by true_veg (excluding barren rows) and calculate means for non-barren frac columns
-          avg_fractions <- val_coefs_wide %>%
+          # First, normalize veg fractions to sum to 1 for each prediction (excluding barren)
+          val_coefs_norm <- val_coefs_wide %>%
             dplyr::filter(tolower(true_veg) != "barren") %>%
+            dplyr::mutate(
+              veg_sum = rowSums(dplyr::across(dplyr::all_of(matrix_veg_cols), ~ .x), na.rm = TRUE)
+            ) %>%
+            dplyr::mutate(
+              dplyr::across(dplyr::all_of(matrix_veg_cols), ~ ifelse(veg_sum > 0, .x / veg_sum, 0))
+            ) %>%
+            dplyr::select(-veg_sum)
+          
+          avg_fractions <- val_coefs_norm %>%
             dplyr::group_by(true_veg) %>%
             dplyr::summarize(dplyr::across(dplyr::all_of(matrix_veg_cols), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
           
@@ -6532,18 +7484,28 @@ flush.console()
           mat_data <- mat_data[match(sorted_classes, rownames(mat_data)), match(sorted_classes, colnames(mat_data))]
           rownames(mat_data) <- sorted_classes # Restore rownames after subsetting/ordering might have dropped them if NAs
           
-          # Print with 3 decimal places
-          print(round(mat_data, 3))
+          # Row-normalize so each row sums to 1 (more interpretable as conditional distribution of predicted class given true class)
+          mat_rownorm <- mat_data
+          rs <- rowSums(mat_rownorm, na.rm = TRUE)
+          for (ri in seq_len(nrow(mat_rownorm))) {
+            if (rs[ri] > 0) {
+              mat_rownorm[ri, ] <- mat_rownorm[ri, ] / rs[ri]
+            } else {
+              mat_rownorm[ri, ] <- 0
+            }
+          }
+          cat("\n[Row-normalized confusion matrix (rows sum to 1):]\n")
+          print(round(mat_rownorm, 3))
           
-          # Print mean diagonal (average correctly predicted fraction across classes)
-          diag_vals <- diag(mat_data)
+          # Compute mean diagonal from row-normalized matrix (average correctly predicted fraction per class)
+          diag_vals <- diag(mat_rownorm)
           mean_diag <- mean(diag_vals, na.rm = TRUE)
           cat(sprintf("\nMean correctly predicted fraction (diagonal average): %.3f\n", mean_diag))
       }
     }
 
     # --- 5. Artificial Mix Logic ---
-    if (length(veg_cols) > 0) {
+    if (length(all_veg_cols) > 0) {
       # --- INTER-CLASS MIXTURE DISCRIMINATION TEST ---
       # Mix different vegetation classes to test if the model coefficients reflect the mix.
       # Note: This averages predictions (coefficients), so it tests linearity of the output space.
@@ -6570,7 +7532,7 @@ flush.console()
              idx_b <- sample(nrow(sub_b), n_mix, replace = TRUE)
              
              # Create mixed coefficients (average of A and B predictions)
-             mixed_coefs <- (sub_a[idx_a, veg_cols] + sub_b[idx_b, veg_cols]) / 2
+             mixed_coefs <- (sub_a[idx_a, all_veg_cols] + sub_b[idx_b, all_veg_cols]) / 2
              
              # Calculate relative fraction of Class A in the mix
              # Ideally should be 0.5 if A was 1.0 and B was 0.0 for A
@@ -6580,7 +7542,7 @@ flush.console()
              if (frac_col_a %in% names(mixed_coefs)) {
                # Rescale to total vegetation
                barren_col <- "frac_barren"
-               veg_frac_cols_local <- veg_cols[veg_cols != barren_col]
+               veg_frac_cols_local <- all_veg_cols[all_veg_cols != barren_col]
                
                # Calculate sum of mixed veg fractions
                sum_mixed <- sapply(1:nrow(mixed_coefs), function(i) {
@@ -6786,7 +7748,7 @@ flush.console()
     }
     all_coefs$location_id <- as.character(all_coefs$location_id)
     all_coefs$pheno_year <- as.integer(all_coefs$pheno_year)
-    # Ensure legacy 'year' column exists for downstream code that expects it
+    # Ensure backward-compatible 'year' column exists for downstream code that expects it
     if (!"year" %in% names(all_coefs)) all_coefs$year <- all_coefs$pheno_year
     all_coefs$Veg <- as.character(all_coefs$Veg)
     all_coefs$coef <- as.numeric(all_coefs$coef)
@@ -6951,6 +7913,22 @@ flush.console()
       if (!"task_key" %in% names(df_subset)) df_subset$task_key <- paste(df_subset$location_id, df_subset$pheno_year, sep = "_")
       task_list <- split(df_subset, df_subset$task_key)
 
+      # Wrapper function to handle both spline and standard modes
+      fit_task_wrapper <- function(task_data) {
+        if (is.null(task_data) || nrow(task_data) == 0) return(NULL)
+        loc <- as.character(task_data$location_id[1])
+        yr <- as.integer(task_data$pheno_year[1])
+        
+        if (isTRUE(USE_SPLINE_ENDMEMBERS) && exists("SPLINE_LIBRARY") && exists("SPLINE_PARAMS")) {
+          res <- tryCatch({
+            fit_one_task_spline(task_data, SPLINE_LIBRARY, SPLINE_PARAMS$indices, SPLINE_PARAMS, loc, yr)
+          }, error = function(e) NULL)
+        } else {
+          res <- fit_one_task(task_data)
+        }
+        return(res)
+      }
+
       sink_file <- tempfile()
       con_out <- file(sink_file, open = "wt")
       con_msg <- file(paste0(sink_file, ".msg"), open = "wt")
@@ -6959,7 +7937,7 @@ flush.console()
       tryCatch({
         sink(con_out, type = "output")
         sink(con_msg, type = "message")
-        results <- .run_map(task_list, fit_one_task, show_pb = FALSE)
+        results <- .run_map(task_list, fit_task_wrapper, show_pb = FALSE)
       }, error = function(e) {
         warning(sprintf("run_inference_silent: underlying inference error: %s", e$message))
       }, finally = {
@@ -8444,6 +9422,27 @@ process_inference <- function(BATCH_SIZE = BATCH_SIZE) {  # Reduced to 6 for mem
 
   cat(sprintf("[INFO process_inference] Processing %d inference tasks from %d locations in %d batches...\n", length(inference_target_keys), length(unique_locs), length(inference_key_batches)))
 
+  # Wrapper function to handle both spline and standard modes
+  fit_inference_task <- function(task_data) {
+    if (is.null(task_data) || nrow(task_data) == 0) return(NULL)
+    loc <- as.character(task_data$location_id[1])
+    yr <- as.integer(task_data$pheno_year[1])
+    
+    # === SPLINE MODE: Use spline-based unmixing if enabled ===
+    if (isTRUE(USE_SPLINE_ENDMEMBERS) && exists("SPLINE_LIBRARY") && exists("SPLINE_PARAMS")) {
+      res <- tryCatch({
+        fit_one_task_spline(task_data, SPLINE_LIBRARY, SPLINE_PARAMS$indices, SPLINE_PARAMS, loc, yr)
+      }, error = function(e) {
+        if (isTRUE(TESTING_MODE)) cat(sprintf("[ERROR fit_one_task_spline] loc=%s yr=%d: %s\n", loc, yr, e$message))
+        NULL
+      })
+    } else {
+      # Standard MESMA unmixing
+      res <- fit_one_task(task_data)
+    }
+    return(res)
+  }
+
   for (i in seq_along(inference_key_batches)) {
     batch_keys <- inference_key_batches[[i]]
     batch_df <- df_tasks_inference[df_tasks_inference$task_key %in% batch_keys, ]
@@ -8455,7 +9454,7 @@ process_inference <- function(BATCH_SIZE = BATCH_SIZE) {  # Reduced to 6 for mem
     tryCatch({
       sink(con_out, type = "output")
       sink(con_msg, type = "message")
-      batch_results <- .run_map(batch_task_list, fit_one_task, show_pb = FALSE)
+      batch_results <- .run_map(batch_task_list, fit_inference_task, show_pb = FALSE)
     }, finally = {
       try(sink(type = "message"), silent = TRUE)
       try(sink(type = "output"), silent = TRUE)
@@ -8695,8 +9694,6 @@ if (exists("process_batches") && exists("process_inference") && exists("aggregat
       }
     }
 }
-
-
 
 # Final memory cleanup
 cleanup_memory()
