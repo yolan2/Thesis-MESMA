@@ -41,9 +41,27 @@ if(getRversion() >= "2.15.1") utils::globalVariables(c(
 
 cat("=== HLS Visualization ===\n")
 if(!file.exists(INPUT_CSV)) stop("Input CSV not found: ", INPUT_CSV)
+# Optional visualization helpers (provide shading for excluded years)
+if (file.exists("mesma_helpers.R")) source("mesma_helpers.R")
+
 
 df <- suppressMessages(readr::read_csv(INPUT_CSV, show_col_types = FALSE))
 if(nrow(df) == 0) stop("No rows in input CSV")
+# Exclude years 1992-1999 from visualization dataset (greyed-out region will also be added to plots)
+if ("date" %in% names(df)) {
+  if (!lubridate::is.Date(df$date)) df$date <- as.Date(df$date)
+  n_before <- nrow(df)
+  years_to_drop <- 1992:1999
+  df <- df[!(lubridate::year(df$date) %in% years_to_drop), , drop = FALSE]
+  if (n_before != nrow(df)) cat(sprintf("[DATA FILTER] Dropped %d rows from years %d-%d from visualization input\n", n_before - nrow(df), min(years_to_drop), max(years_to_drop)))
+} else if ("year" %in% names(df)) {
+  n_before <- nrow(df)
+  years_to_drop <- 1992:1999
+  df <- df[!(as.integer(df$year) %in% years_to_drop), , drop = FALSE]
+  if (n_before != nrow(df)) cat(sprintf("[DATA FILTER] Dropped %d rows from years %d-%d from visualization input (using 'year' column)\n", n_before - nrow(df), min(years_to_drop), max(years_to_drop)))
+} else {
+  # No date/year column available; nothing to drop
+}
 
 # If Veg/coverage are missing, attach from GeoJSON by rounded coordinates (consistent with fitter)
 if(!("Veg" %in% names(df)) || all(is.na(df$Veg))) {

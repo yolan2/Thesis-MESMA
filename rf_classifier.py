@@ -76,7 +76,7 @@ def collect_training_data(downloads_dir="downloads", spatial_reference_list=None
         if typ == 'water': typ = 'barren'
         if typ.lower() == 'none': continue
 
-        allowed_classes = ['populus', 'barren', 'tamarix', 'phragmites']
+        allowed_classes = ['populus', 'barren', 'tamarix', 'herbs']
         
         # Check spatial match BEFORE type filtering for debug purposes
         is_pure = False
@@ -297,7 +297,7 @@ def predict_for_samples(downloads_dir, clf):
         if true_typ == 'water': true_typ = 'barren'
         if not true_typ or true_typ.lower() == 'none': continue
 
-        allowed_classes = ['populus', 'barren', 'tamarix', 'phragmites']
+        allowed_classes = ['populus', 'barren', 'tamarix', 'herbs']
         if true_typ not in allowed_classes: continue
 
         sr_tif = None

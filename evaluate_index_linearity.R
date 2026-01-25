@@ -40,10 +40,7 @@ cat("Loading real phenology data to extract true endmembers...\n")
 # Try to load from common data file locations
 data_file <- NULL
 possible_paths <- c(
-  "C:\\Users\\yolan\\Downloads\\LS_S2_Harmonized_Timeseries.csv",
-  "C:\\Users\\yolan\\OneDrive\\Documenten\\UGENT\\Master\\masterproef\\GIS\\landsat_lower.csv",
-  "../masterproef/GIS/landsat_lower.csv",
-  "landsat_lower.csv"
+  "C:\\Users\\yolan\\Downloads\\LS_S2_Harmonized_Timeseries.csv"
 )
 
 for (path in possible_paths) {
@@ -68,7 +65,34 @@ if ("vegetation" %in% names(df_raw) && !"Veg" %in% names(df_raw)) {
   df_raw$Veg <- df_raw$vegetation
   cat("[NOTICE] Renamed 'vegetation' -> 'Veg' in phenology data\n")
 }
-# Legacy 'no.soil'/'no_soil' columns are ignored and not used by this script
+# Support legacy 'no.soil'/'no_soil' columns: populate or fill missing `Veg` values when appropriate
+if (!"Veg" %in% names(df_raw)) {
+  if ("no.soil" %in% names(df_raw)) {
+    df_raw$Veg <- as.character(df_raw$no.soil)
+    cat("[NOTICE] Using legacy 'no.soil' column as 'Veg'\n")
+  } else if ("no_soil" %in% names(df_raw)) {
+    df_raw$Veg <- as.character(df_raw$no_soil)
+    cat("[NOTICE] Using legacy 'no_soil' column as 'Veg'\n")
+  }
+} else {
+  # Fill missing entries in Veg from legacy columns if present
+  if (any(is.na(df_raw$Veg)) && "no.soil" %in% names(df_raw)) {
+    na_idx <- which(is.na(df_raw$Veg) & !is.na(df_raw$no.soil))
+    if (length(na_idx) > 0) {
+      df_raw$Veg[na_idx] <- as.character(df_raw$no.soil[na_idx])
+      cat(sprintf("[NOTICE] Filled %d missing 'Veg' entries from 'no.soil'\n", length(na_idx)))
+    }
+  }
+  if (any(is.na(df_raw$Veg)) && "no_soil" %in% names(df_raw)) {
+    na_idx <- which(is.na(df_raw$Veg) & !is.na(df_raw$no_soil))
+    if (length(na_idx) > 0) {
+      df_raw$Veg[na_idx] <- as.character(df_raw$no_soil[na_idx])
+      cat(sprintf("[NOTICE] Filled %d missing 'Veg' entries from 'no_soil'\n", length(na_idx)))
+    }
+  }
+}
+# Normalize Veg to trimmed character values for downstream comparisons
+if ("Veg" %in% names(df_raw)) df_raw$Veg <- as.character(trimws(df_raw$Veg))
 
 # Require that Veg be present to extract endmembers
 if (!("Veg" %in% names(df_raw))) {
@@ -100,19 +124,19 @@ soil_spec <- c(
 cat("True soil endmember spectrum:\n")
 print(soil_spec)
 
-# Extract TRUE pure vegetation endmember (identified by Veg != 'barren')
-cat("\nExtracting TRUE pure vegetation endmember from data...\n")
+# Extract TRUE pure vegetation endmember (use only Veg == 'agri' or 'agriculture')
+cat("\nExtracting TRUE pure vegetation endmember from data (Veg in {agri, agriculture})...\n")
 pure_veg_data <- df_raw |> 
-  dplyr::filter(!is.na(Veg) & tolower(Veg) != 'barren') |> 
+  dplyr::filter(!is.na(Veg) & tolower(trimws(Veg)) %in% c('agri', 'agriculture')) |> 
   dplyr::filter(across(c(blue, green, red, nir, swir1, swir2), is.finite))
 
 if (nrow(pure_veg_data) == 0) {
-  stop("No pure vegetation data found (no vegetation types present)! Cannot extract true vegetation endmember.")
+  stop("No pure vegetation data found in Veg in {agri, agriculture}! Cannot extract true vegetation endmember.")
 }
 
-cat(sprintf("Found %d pure vegetation observations\n", nrow(pure_veg_data)))
+cat(sprintf("Found %d pure vegetation observations (agri/agriculture)\n", nrow(pure_veg_data)))
 
-# Calculate mean pure vegetation spectrum
+# Calculate mean pure vegetation spectrum from agri/agriculture pool
 veg_spec <- c(
   blue  = mean(pure_veg_data$blue, na.rm = TRUE),
   green = mean(pure_veg_data$green, na.rm = TRUE),
@@ -122,31 +146,76 @@ veg_spec <- c(
   swir2 = mean(pure_veg_data$swir2, na.rm = TRUE)
 )
 
-cat("True pure vegetation endmember spectrum:\n")
+cat("True pure vegetation endmember spectrum (agri/agriculture):\n")
 print(veg_spec)
 
 # Extract TRUE vegetation endmembers for each type from pure vegetation data
-cat("\nExtracting TRUE vegetation type endmembers from pure vegetation data...\n")
-veg_types <- c("populus", "tamarix", "phragmites")  # Focus on main types
+cat("\nExtracting TRUE vegetation type endmembers from the PURE vegetation pool (using legacy labels only when present in that pool)...\n")
+veg_types <- c("populus", "tamarix", "herbs")  # Focus on main types
 veg_endmembers <- list()
 
-for (veg_type in veg_types) {
-  veg_subset <- pure_veg_data |> 
-    dplyr::filter(!is.na(Veg) & tolower(Veg) == veg_type)
+# Operate only on the `pure_veg_data` subset (Veg in {agri, agriculture}) to ensure purity
+has_no_soil <- "no.soil" %in% names(pure_veg_data)
+has_no_soil_underscore <- "no_soil" %in% names(pure_veg_data)
 
-  if (nrow(veg_subset) > 0) {
-    veg_endmembers[[veg_type]] <- c(
-      blue  = mean(veg_subset$blue, na.rm = TRUE),
-      green = mean(veg_subset$green, na.rm = TRUE),
-      red   = mean(veg_subset$red, na.rm = TRUE),
-      nir   = mean(veg_subset$nir, na.rm = TRUE),
-      swir1 = mean(veg_subset$swir1, na.rm = TRUE),
-      swir2 = mean(veg_subset$swir2, na.rm = TRUE)
-    )
-    cat(sprintf("  %s: %d pure samples\n", veg_type, nrow(veg_subset)))
-  } else {
-    cat(sprintf("  %s: NO pure samples found, skipping\n", veg_type))
+for (veg_type in veg_types) {
+  # Safely aggregate candidate rows from whichever label columns exist, avoiding direct references
+  candidates <- df_raw[0, ]
+  if ("Veg" %in% names(df_raw)) {
+    candidates <- dplyr::bind_rows(candidates, df_raw |> dplyr::filter(!is.na(Veg) & tolower(trimws(as.character(Veg))) == veg_type))
   }
+  if ("no.soil" %in% names(df_raw)) {
+    candidates <- dplyr::bind_rows(candidates, df_raw |> dplyr::filter(!is.na(no.soil) & tolower(trimws(as.character(no.soil))) == veg_type))
+  }
+  if ("no_soil" %in% names(df_raw)) {
+    candidates <- dplyr::bind_rows(candidates, df_raw |> dplyr::filter(!is.na(no_soil) & tolower(trimws(as.character(no_soil))) == veg_type))
+  }
+
+  # Ensure samples have finite reflectance in all required bands and remove duplicates
+  candidates <- candidates |> dplyr::filter(across(c(blue, green, red, nir, swir1, swir2), is.finite)) |> dplyr::distinct()
+
+  if (nrow(candidates) == 0) {
+    cat(sprintf("  %s: NO labeled candidate samples found, skipping\n", veg_type))
+    next
+  }
+
+  # Compute NDVI for candidate set (if needed)
+  eps <- 1e-9
+  if (!"NDVI" %in% names(candidates)) {
+    candidates <- candidates |> dplyr::mutate(NDVI = (nir - red) / (nir + red + eps))
+  }
+
+  # Select high-NDVI samples to approximate 'pure' vegetation for the species
+  ndvi_thresh <- 0.60
+  selected <- candidates |> dplyr::filter(NDVI >= ndvi_thresh)
+
+  # If none meet the threshold, take the top 10% by NDVI (ensures we pick the most vegetated samples)
+  if (nrow(selected) == 0) {
+    top_frac <- 0.10
+    cutoff <- quantile(candidates$NDVI, probs = 1 - top_frac, na.rm = TRUE)
+    selected <- candidates |> dplyr::filter(NDVI >= cutoff)
+    cat(sprintf("[NOTICE] %s: no candidates >= %.2f NDVI; using top %.0f%% (NDVI >= %.3f) — %d samples\n", veg_type, ndvi_thresh, top_frac*100, cutoff, nrow(selected)))
+  } else {
+    cat(sprintf("  %s: %d candidates selected with NDVI >= %.2f\n", veg_type, nrow(selected), ndvi_thresh))
+  }
+
+  # Require a minimal number of samples; if too few, expand selection to top-50 samples by NDVI
+  min_samples <- 3
+  if (nrow(selected) < min_samples) {
+    selected <- candidates |> dplyr::arrange(dplyr::desc(NDVI)) |> dplyr::slice_head(n = 50)
+    cat(sprintf("[NOTICE] %s: insufficient selected samples (< %d). Falling back to top 50 NDVI candidates (%d samples)\n", veg_type, min_samples, nrow(selected)))
+  }
+
+  # Use the selected set to compute the mean spectrum
+  veg_endmembers[[veg_type]] <- c(
+    blue  = mean(selected$blue, na.rm = TRUE),
+    green = mean(selected$green, na.rm = TRUE),
+    red   = mean(selected$red, na.rm = TRUE),
+    nir   = mean(selected$nir, na.rm = TRUE),
+    swir1 = mean(selected$swir1, na.rm = TRUE),
+    swir2 = mean(selected$swir2, na.rm = TRUE)
+  )
+  cat(sprintf("  %s: computed endmember from %d selected samples (from %d candidates)\n", veg_type, nrow(selected), nrow(candidates)))
 }
 
 if (length(veg_endmembers) == 0) {
@@ -209,55 +278,13 @@ calculate_indices <- function(df) {
         zenith_rad <- calculate_solar_zenith(lat = 40, doy = 180, hour = 10.5)
 
         # Calculate PPI using ppi() function
-        df$PPI <- ppi(dvi = df$DVI, zenith.angle = zenith_rad, M = 0.7, dvi.soil = dvi_soil_val)
+        df$PPI <- ppi(dvi = df$DVI, zenith.angle = zenith_rad, dvi.soil = dvi_soil_val)
         cat(sprintf("Calculated PPI for synthetic mixing (dvi_soil=%.6f, zenith=%.4f rad)\n", dvi_soil_val, zenith_rad))
       }
     }
   }
 
   return(df)
-}
-
-# ==============================================================================
-# 2.5. Linearize Indices Function
-# ==============================================================================
-
-linearize_indices <- function(df) {
-  cat("Applying linearization transformations to indices...\n")
-  
-  # NIRv: 2*x - x^2 (M_NDVI transform)
-  if ("NIRv" %in% names(df)) {
-    cat("  Linearizing NIRv (2x - x^2)...\n")
-    df$NIRv <- 2 * df$NIRv - df$NIRv^2
-  }
-  
-  # MSAVI2: log(x + 1)
-  if ("MSAVI2" %in% names(df)) {
-    cat("  Linearizing MSAVI2 (log(x+1))...\n")
-    df$MSAVI2 <- log(df$MSAVI2 + 1)
-  }
-
-  # MSAVI: same treatment as MSAVI2 for comparability
-  if ("MSAVI" %in% names(df)) {
-    cat("  Linearizing MSAVI (log(x+1))...\n")
-    df$MSAVI <- log(df$MSAVI + 1)
-  }
-  
-  # PSRI: Signed Sqrt
-  if ("PSRI" %in% names(df)) {
-    cat("  Linearizing PSRI (signed sqrt)...\n")
-    df$PSRI <- sign(df$PSRI) * sqrt(abs(df$PSRI))
-  }
-  
-  # TCW: log(x + 1) - handle negatives safely
-  if ("TCW" %in% names(df)) {
-    cat("  Linearizing TCW (log(x+1))...\n")
-    # Ensure x+1 > 0. If TCW < -0.99, clamp?
-    # TCW is usually > -1.
-    df$TCW <- log(pmax(df$TCW + 1, 1e-6))
-  }
-  
-  df
 }
 
 # Raw spectral bands (optional - included if present)
@@ -371,301 +398,109 @@ for (b in bands) {
 # Calculate indices for all mixtures
 mixtures <- calculate_indices(mixtures)
 
-# Linearize indices
-# mixtures <- linearize_indices(mixtures)
-
 # ==============================================================================
-# 4. Evaluate Linearity
+# 4. Linearity Diagnostics & Plots
 # ==============================================================================
+cat("\nPerforming linearity diagnostics and generating plots for mixtures...\n")
 
-# Reshape to long format for plotting and analysis
-indices <- c("DVI", "OSAVI", "MCARI", "NIRv", "PSRI", "NBR",
-             "TCW", "NDVI", "MSAVI2", "MSAVI", "NDMI", "TCB", "GVI", "PPI", "SATVI", "EVI")
+# Prepare output directory
+out_dir <- "linearity_plots"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
-long_res <- melt(mixtures, id.vars = "fraction_veg", measure.vars = indices, 
-                 variable.name = "Index", value.name = "Value")
-
-target_aic_indices <- c("PPI", "NIRv", "OSAVI", "NDMI", "MSAVI", "NDVI", "SATVI", "EVI")
-
-compute_aic_table <- function(long_dt, response_col = "fraction_veg", value_col = "Value", index_col = "Index", targets = target_aic_indices) {
-  if (!data.table::is.data.table(long_dt)) long_dt <- as.data.table(long_dt)
-
-  results <- lapply(targets, function(idx) {
-    sub <- long_dt[get(index_col) == idx]
-    sub <- sub[is.finite(get(response_col)) & is.finite(get(value_col))]
-    n_obs <- nrow(sub)
-
-    if (n_obs < 3) {
-      return(data.table(Index = idx, AIC = NA_real_, LogLik = NA_real_, Df = NA_integer_, N = n_obs, Note = "insufficient data"))
-    }
-
-    fit <- tryCatch({
-      lm_out <- lm(sub[[response_col]] ~ sub[[value_col]])
-      list(aic = AIC(lm_out), loglik = as.numeric(logLik(lm_out)), df = length(coef(lm_out)))
-    }, error = function(e) NULL)
-
-    if (is.null(fit)) {
-      return(data.table(Index = idx, AIC = NA_real_, LogLik = NA_real_, Df = NA_integer_, N = n_obs, Note = "fit_failed"))
-    }
-
-    data.table(Index = idx, AIC = fit$aic, LogLik = fit$loglik, Df = fit$df, N = n_obs, Note = NA_character_)
-  })
-
-  out <- rbindlist(results, use.names = TRUE, fill = TRUE)
-  setorder(out, AIC)
-  out
+# Indices to check (intersect with available columns)
+# Include PPI when available (calculated if ppi_helpers.R is present)
+candidate_indices <- c("NDVI", "DVI", "NIRv", "OSAVI", "MSAVI2", "EVI", "PSRI", "NBR", "TCW", "TCB", "GVI", "NDMI", "PPI")
+indices_to_check <- intersect(candidate_indices, names(mixtures))
+if (length(indices_to_check) == 0) {
+  warning("No common indices found in mixtures to evaluate linearity.")
+} else {
+  cat(sprintf("Indices to be checked for linearity: %s\n", paste(indices_to_check, collapse = ", ")))
 }
 
-# Calculate Linearity Metrics using linear regression
-linearity_scores <- long_res[, {
-  # Fit linear model fraction ~ index
-  lm_fit <- lm(fraction_veg ~ Value)
-  r2 <- summary(lm_fit)$r.squared
-  residuals <- residuals(lm_fit)
-  rmse <- sqrt(mean(residuals^2))
-  max_dev <- max(abs(residuals))
-  range_val <- diff(range(Value))
-  norm_max_dev <- ifelse(range_val > 1e-6, max_dev / range_val, 0)
-  
-  list(
-    R2 = r2,
-    RMSE = rmse,
-    Max_Deviation = max_dev,
-    Normalized_Max_Dev = norm_max_dev,
-    Range = range_val
-  )
-}, by = Index]
-
-# Sort by linearity (R2 descending)
-setorder(linearity_scores, -R2)
-
-cat("\n=== LINEARITY EVALUATION (Sorted by R2 descending) ===\n")
-print(linearity_scores)
-
-# AIC comparison focused on key indices
-aic_table <- compute_aic_table(long_res, response_col = "fraction_veg", targets = target_aic_indices)
-cat("\n=== AIC COMPARISON (Lower is better) ===\n")
-print(aic_table)
-write.csv(aic_table, "target_index_aic.csv", row.names = FALSE)
-
-# Filter linearizable indices
-threshold_r2 <- 0.95
-linearizable <- linearity_scores[R2 >= threshold_r2]
-unlinearizable <- linearity_scores[R2 < threshold_r2]
-
-cat("\n=== LINEARIZABLE INDICES (R2 >= ", threshold_r2, ") ===\n")
-print(linearizable)
-
-cat("\n=== UNLINEARIZABLE INDICES ===\n")
-print(unlinearizable)
-
-# Save linearizable
-write.csv(linearizable, "linearizable_indices.csv", row.names = FALSE)
-
-# ==============================================================================
-# 5. Plotting
-# ==============================================================================
-
-# Add the ideal linear line to the plot data for visualization
-long_res[, Linear_Ref := {
-  y0 <- Value[fraction_veg == 0]
-  y1 <- Value[fraction_veg == 1]
-  y0 + (y1 - y0) * fraction_veg
-}, by = Index]
-
-p <- ggplot(long_res, aes(x = fraction_veg)) +
-  geom_line(aes(y = Linear_Ref), linetype = "dashed", color = "gray50") +
-  geom_line(aes(y = Value, color = Index), size = 1) +
-  facet_wrap(~Index, scales = "free_y") +
-  theme_minimal() +
-  labs(
-    title = "Linearity of Spectral Indices (Vegetation Fraction)",
-    subtitle = "Dashed line represents perfect linear mixing. Solid line is actual index behavior.",
-    x = "Vegetation Fraction (0 = Soil, 1 = Veg)",
-    y = "Index Value"
-  ) +
-  theme(legend.position = "none")
-
-# Save plot
-ggsave("index_linearity_check.png", p, width = 12, height = 10)
-
-# Save metrics
-write.csv(linearity_scores, "index_linearity_scores.csv", row.names = FALSE)
-
-# ==============================================================================
-# 6. Vegetation-Vegetation Mixing Analysis
-# ==============================================================================
-
-cat("\n=== VEGETATION-VEGETATION LINEARITY ANALYSIS ===\n")
-
-# Test mixing between different vegetation types
-veg_veg_results <- list()
-
-veg_pairs <- combn(names(veg_endmembers), 2, simplify = FALSE)
-
-for (pair in veg_pairs) {
-  veg1_name <- pair[1]
-  veg2_name <- pair[2]
-  veg1_spec <- veg_endmembers[[veg1_name]]
-  veg2_spec <- veg_endmembers[[veg2_name]]
-  
-  cat(sprintf("\nTesting %s vs %s mixing...\n", veg1_name, veg2_name))
-  
-  # Create mixing fractions
-  fractions <- seq(0, 1, by = 0.01)
-  veg_mixtures <- data.table(fraction_veg1 = fractions)
-  
-  # Linear mixing of reflectance bands
-  bands <- names(veg1_spec)
-  for (b in bands) {
-    veg_mixtures[[b]] <- fractions * veg1_spec[b] + (1 - fractions) * veg2_spec[b]
-  }
-  
-  # Calculate indices
-  veg_mixtures <- calculate_indices(veg_mixtures)
-  
-  # Linearize indices
-  # veg_mixtures <- linearize_indices(veg_mixtures)
-  
-  # Evaluate linearity for each index
-  indices <- c("DVI", "OSAVI", "MCARI", "NIRv", "PSRI", "NBR",
-               "TCW", "NDVI", "MSAVI2", "MSAVI", "NDMI", "TCB", "GVI", "PPI", "SATVI", "EVI")
-  
-  pair_results <- data.table(
-    Index = indices,
-    Veg1 = veg1_name,
-    Veg2 = veg2_name
-  )
-  
-  for (idx in indices) {
-    # Check if index exists and has valid data
-    if (!idx %in% names(veg_mixtures) || is.null(veg_mixtures[[idx]]) || all(is.na(veg_mixtures[[idx]]))) {
-      cat(sprintf("  Skipping %s (not available or all NA)\n", idx))
-      pair_results[Index == idx, `:=`(
-        R2 = NA_real_,
-        RMSE = NA_real_,
-        Max_Deviation = NA_real_,
-        Normalized_Max_Dev = NA_real_,
-        Range = NA_real_
-      )]
+# Helper to analyze a mixture dataframe and save plots + coefficients
+analyze_mixture <- function(df, label) {
+  results <- list()
+  for (idx in indices_to_check) {
+    # Skip non-finite values
+    dat <- df |> dplyr::select(fraction_veg, all_of(idx)) |> dplyr::filter(is.finite(.data[[idx]]))
+    if (nrow(dat) < 3 || var(dat[[idx]], na.rm = TRUE) == 0) {
+      cat(sprintf("[WARN] %s - index %s: insufficient data or zero variance, skipping\n", label, idx))
       next
     }
-    
-    # Fit linear model
+
+    fit <- tryCatch(lm(as.formula(paste(idx, "~ fraction_veg")), data = dat), error = function(e) return(NULL))
+    if (is.null(fit)) {
+      cat(sprintf("[WARN] %s - index %s: lm failed, skipping\n", label, idx))
+      next
+    }
+    s <- summary(fit)
+    slope <- coef(fit)["fraction_veg"]
+    intercept <- coef(fit)["(Intercept)"]
+    r2 <- as.numeric(s$r.squared)
+    residuals <- resid(fit)
+    rmse <- sqrt(mean(residuals^2, na.rm = TRUE))
+    pval <- coef(s)["fraction_veg", "Pr(>|t|)"]
+
+    # Build plot
+    y_max <- max(dat[[idx]], na.rm = TRUE)
+    y_min <- min(dat[[idx]], na.rm = TRUE)
+    ann_y <- y_max - 0.05 * (y_max - y_min)
+    p <- ggplot2::ggplot(dat, ggplot2::aes(x = fraction_veg, y = .data[[idx]])) +
+      ggplot2::geom_point(alpha = 0.6, size = 1) +
+      ggplot2::geom_smooth(method = "lm", se = FALSE, color = "#0072B2") +
+      ggplot2::labs(title = paste0(label, " — ", idx), x = "Fraction vegetation", y = idx) +
+      ggplot2::theme_minimal() +
+      ggplot2::annotate("text", x = 0.02, y = ann_y,
+                        label = sprintf("R²=%.3f\nRMSE=%.4f\nSlope=%.4f", r2, rmse, slope),
+                        hjust = 0, size = 3)
+
+    fname <- file.path(out_dir, sprintf("%s_%s.png", gsub("\\s+", "_", label), idx))
     tryCatch({
-      lm_fit <- lm(fractions ~ veg_mixtures[[idx]])
-      r2 <- summary(lm_fit)$r.squared
-      residuals <- residuals(lm_fit)
-      rmse <- sqrt(mean(residuals^2))
-      max_dev <- max(abs(residuals))
-      range_val <- diff(range(veg_mixtures[[idx]], na.rm = TRUE))
-      norm_max_dev <- ifelse(range_val > 1e-6, max_dev / range_val, 0)
-      
-      pair_results[Index == idx, `:=`(
-        R2 = r2,
-        RMSE = rmse,
-        Max_Deviation = max_dev,
-        Normalized_Max_Dev = norm_max_dev,
-        Range = range_val
-      )]
+      ggplot2::ggsave(filename = fname, plot = p, width = 6, height = 4, dpi = 150)
+      cat(sprintf("Saved plot: %s\n", fname))
     }, error = function(e) {
-      cat(sprintf("  Error fitting %s: %s\n", idx, e$message))
-      pair_results[Index == idx, `:=`(
-        R2 = NA_real_,
-        RMSE = NA_real_,
-        Max_Deviation = NA_real_,
-        Normalized_Max_Dev = NA_real_,
-        Range = NA_real_
-      )]
+      warning(sprintf("Failed to save plot %s: %s", fname, e$message))
     })
+
+    results[[length(results) + 1]] <- data.frame(
+      label = label,
+      index = idx,
+      slope = as.numeric(slope),
+      intercept = as.numeric(intercept),
+      r_squared = as.numeric(r2),
+      rmse = as.numeric(rmse),
+      p_value = as.numeric(pval),
+      n = nrow(dat)
+    )
   }
-  
-  veg_veg_results[[paste(veg1_name, veg2_name, sep = "_vs_")]] <- pair_results
+  if (length(results) == 0) return(NULL)
+  do.call(rbind, results)
 }
 
-# Combine all vegetation-vegetation results
-all_veg_veg <- rbindlist(veg_veg_results)
-
-# Summary statistics across all vegetation pairs
-veg_veg_summary <- all_veg_veg[, .(
-  Mean_R2 = mean(R2),
-  Max_R2 = max(R2),
-  Min_R2 = min(R2),
-  SD_R2 = sd(R2),
-  N_Pairs = .N
-), by = Index]
-
-setorder(veg_veg_summary, -Mean_R2)
-
-cat("\n=== VEGETATION-VEGETATION LINEARITY SUMMARY (Sorted by mean R2 descending) ===\n")
-print(veg_veg_summary)
-
-# Save vegetation-vegetation results
-write.csv(all_veg_veg, "veg_veg_linearity_scores.csv", row.names = FALSE)
-write.csv(veg_veg_summary, "veg_veg_linearity_summary.csv", row.names = FALSE)
-
-# Compare soil-veg vs veg-veg linearity
-comparison <- merge(
-  linearity_scores[, .(Index, Soil_Veg_R2 = R2)],
-  veg_veg_summary[, .(Index, Veg_Veg_Mean_R2 = Mean_R2)],
-  by = "Index"
-)
-
-setorder(comparison, -Veg_Veg_Mean_R2)
-
-cat("\n=== SOIL-VEG vs VEG-VEG LINEARITY COMPARISON ===\n")
-print(comparison)
-
-write.csv(comparison, "linearity_comparison.csv", row.names = FALSE)
-
-# Create visualization for vegetation-vegetation mixing
-# Use the first pair as example
-example_pair <- veg_pairs[[1]]
-veg1_name <- example_pair[1]
-veg2_name <- example_pair[2]
-
-fractions <- seq(0, 1, by = 0.01)
-example_mixtures <- data.table(fraction_veg1 = fractions)
-
-veg1_spec <- veg_endmembers[[veg1_name]]
-veg2_spec <- veg_endmembers[[veg2_name]]
-
-for (b in names(veg1_spec)) {
-  example_mixtures[[b]] <- fractions * veg1_spec[b] + (1 - fractions) * veg2_spec[b]
+# Analyze the 'agriculture' mixture (veg_spec) created earlier
+scores <- list()
+if (exists("mixtures")) {
+  sc <- analyze_mixture(mixtures, label = "agriculture")
+  if (!is.null(sc)) scores[[length(scores) + 1]] <- sc
 }
 
-example_mixtures <- calculate_indices(example_mixtures)
+# Also analyze each species-specific endmember mixture
+for (vt in names(veg_endmembers)) {
+  veg_s <- veg_endmembers[[vt]]
+  m <- data.table(fraction_veg = fractions)
+  for (b in names(veg_s)) m[[b]] <- fractions * veg_s[b] + (1 - fractions) * soil_spec[b]
+  m <- calculate_indices(m)
+  sc <- analyze_mixture(m, label = paste0("species_", vt))
+  if (!is.null(sc)) scores[[length(scores) + 1]] <- sc
+}
 
-# Linearize indices
-# example_mixtures <- linearize_indices(example_mixtures)
+# Combine and write out scores
+if (length(scores) > 0) {
+  scores_df <- do.call(rbind, scores)
+  scores_out <- "index_linearity_scores_with_coefficients.csv"
+  write.csv(scores_df, file = scores_out, row.names = FALSE)
+  cat(sprintf("Wrote linearity scores to %s\n", scores_out))
+} else {
+  warning("No linearity scores were produced — no index/species combos met criteria.")
+}
 
-# Reshape for plotting
-# Only use indices that are available in example_mixtures
-available_indices <- intersect(indices, names(example_mixtures))
-veg_veg_long <- melt(example_mixtures, id.vars = "fraction_veg1", 
-                     measure.vars = available_indices, 
-                     variable.name = "Index", value.name = "Value")
-
-# Add linear reference
-veg_veg_long[, Linear_Ref := {
-  y0 <- Value[fraction_veg1 == 0]
-  y1 <- Value[fraction_veg1 == 1]
-  y0 + (y1 - y0) * fraction_veg1
-}, by = Index]
-
-p_veg <- ggplot(veg_veg_long, aes(x = fraction_veg1)) +
-  geom_line(aes(y = Linear_Ref), linetype = "dashed", color = "gray50") +
-  geom_line(aes(y = Value, color = Index), size = 1) +
-  facet_wrap(~Index, scales = "free_y") +
-  theme_minimal() +
-  labs(
-    title = sprintf("Vegetation-Vegetation Linearity (%s vs %s)", veg1_name, veg2_name),
-    subtitle = "Dashed line represents perfect linear mixing. Solid line is actual index behavior.",
-    x = sprintf("Fraction of %s (0 = 100%% %s, 1 = 100%% %s)", veg1_name, veg2_name, veg1_name),
-    y = "Index Value"
-  ) +
-  theme(legend.position = "none")
-
-ggsave("veg_veg_linearity_check.png", p_veg, width = 12, height = 10)
-
-# Vegetation-vegetation analysis complete.

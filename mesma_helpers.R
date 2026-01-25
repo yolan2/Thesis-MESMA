@@ -69,7 +69,7 @@ analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor,
       }
 
       # Diagnostic for the first few attempts
-      if (diag_count < 5) {
+      if (diag_count < 5 && exists("TESTING_MODE") && isTRUE(TESTING_MODE)) {
          cat(sprintf("[DIAGNOSTIC] Checking veg='%s', vid='%s' -> Found? %s\n", veg, vid, !is.null(vec)))
          if (is.na(vid) || vid == "NA") {
              cat(sprintf("   [DEBUG] variant class: %s, names: %s\n", class(variant), paste(names(variant), collapse=", ")))
@@ -88,10 +88,79 @@ analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor,
 
   cat(sprintf("[DIAGNOSTIC] Collected %d variant vectors for similarity analysis.\n", length(all_vecs)))
 
-  # Print variant counts per vegetation type (without removing any)
+  # Apply barren similarity filter to vegetation variants (exclude barren-like vegetation)
+  barren_threshold_exists <- exists("BARREN_SIM_THRESHOLD", envir = globalenv())
+  cat(sprintf("[DEBUG] BARREN_SIM_THRESHOLD exists: %s\n", barren_threshold_exists))
+  
+  if (length(all_vecs) > 0 && barren_threshold_exists) {
+    barren_threshold <- get("BARREN_SIM_THRESHOLD", envir = globalenv())
+    cat(sprintf("[DEBUG] BARREN_SIM_THRESHOLD value: %.2f\n", barren_threshold))
+    
+    barren_indices <- which(tolower(all_vegs) == "barren")
+    cat(sprintf("[DEBUG] Found %d barren variants at indices: %s\n", 
+                length(barren_indices), paste(barren_indices, collapse=", ")))
+    
+    if (length(barren_indices) > 0) {
+      # Normalize all vectors
+      vec_mat_all <- do.call(rbind, all_vecs)
+      vec_mat_all[!is.finite(vec_mat_all)] <- 0
+      row_norms_all <- sqrt(rowSums(vec_mat_all^2))
+      row_norms_all[row_norms_all == 0] <- 1
+      vec_mat_norm_all <- vec_mat_all / row_norms_all
+      
+      # Get barren references
+      barren_refs <- vec_mat_norm_all[barren_indices, , drop = FALSE]
+      
+      # Calculate cosine similarity for non-barren vegetation variants
+      veg_indices <- which(tolower(all_vegs) != "barren")
+      cat(sprintf("[DEBUG] Found %d vegetation variants to check\n", length(veg_indices)))
+      
+      if (length(veg_indices) > 0) {
+        veg_vecs_norm <- vec_mat_norm_all[veg_indices, , drop = FALSE]
+        sim_to_barren <- veg_vecs_norm %*% t(barren_refs)
+        max_sim_to_barren <- apply(sim_to_barren, 1, function(x) suppressWarnings(max(x, na.rm = TRUE)))
+        
+        cat(sprintf("[DEBUG] Max similarities to barren: min=%.3f, max=%.3f, mean=%.3f\n",
+                    min(max_sim_to_barren, na.rm=TRUE), 
+                    max(max_sim_to_barren, na.rm=TRUE),
+                    mean(max_sim_to_barren, na.rm=TRUE)))
+        
+        # Filter out vegetation variants too similar to barren
+        keep_veg_mask <- max_sim_to_barren <= barren_threshold
+        filtered_veg_indices <- veg_indices[keep_veg_mask]
+        n_removed <- sum(!keep_veg_mask)
+        
+        if (n_removed > 0) {
+          cat(sprintf("[BARREN FILTER] Removed %d vegetation variant(s) with cosine similarity > %.2f to barren\n", 
+                      n_removed, barren_threshold))
+          # Show which variants were removed
+          removed_ids <- all_ids[veg_indices[!keep_veg_mask]]
+          removed_sims <- max_sim_to_barren[!keep_veg_mask]
+          for (j in seq_along(removed_ids)) {
+            cat(sprintf("  - %s (similarity: %.3f)\n", removed_ids[j], removed_sims[j]))
+          }
+        } else {
+          cat(sprintf("[BARREN FILTER] No vegetation variants exceeded similarity threshold of %.2f\n", barren_threshold))
+        }
+        
+        # Keep all barren variants + filtered vegetation variants
+        keep_indices <- c(barren_indices, filtered_veg_indices)
+        all_vecs <- all_vecs[keep_indices]
+        all_ids <- all_ids[keep_indices]
+        all_vegs <- all_vegs[keep_indices]
+        all_nsamples <- all_nsamples[keep_indices]
+        
+        cat(sprintf("[BARREN FILTER] Retained %d variants for heatmap after barren filtering\n", length(all_vecs)))
+      }
+    }
+  } else if (length(all_vecs) > 0 && !barren_threshold_exists) {
+    cat("[WARNING] BARREN_SIM_THRESHOLD not found in global environment - skipping barren filtering\n")
+  }
+
+  # Print variant counts per vegetation type (after barren filtering)
   if (length(all_vecs) > 0) {
     veg_counts <- table(all_vegs)
-    cat("[INFO] Variants per vegetation type:\n")
+    cat("[INFO] Variants per vegetation type (after filtering):\n")
     print(veg_counts)
     
     if (min(veg_counts) < 2 && length(veg_counts) > 1) {
@@ -211,6 +280,336 @@ analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor,
     cat(sprintf("[ERROR] Failed to generate similarity heatmap: %s\n", e$message))
   })
 
+  # === STAGE 1: WOODY vs HERBS SIMILARITY HEATMAP (with Stage 1 LDA weights) ===
+  # Generate a heatmap showing woody (populus+tamarix combined) vs herbs differentiation
+  woody_classes <- if (exists("HIERARCHICAL_WOODY_CLASSES", envir = globalenv())) {
+    get("HIERARCHICAL_WOODY_CLASSES", envir = globalenv())
+  } else {
+    c("populus", "tamarix")
+  }
+
+  # Get Stage 1 LDA weights if available
+  stage1_weights <- NULL
+  if (exists("HIERARCHICAL_LDA_PARAMS", envir = globalenv())) {
+    hlp <- get("HIERARCHICAL_LDA_PARAMS", envir = globalenv())
+    if (!is.null(hlp$stage1) && !is.null(hlp$stage1$weights)) {
+      stage1_weights <- hlp$stage1$weights
+      cat("[STAGE 1 HEATMAP] Using Stage 1 LDA weights for woody vs herbs similarity\n")
+    }
+  }
+
+  # Identify woody and herbs indices
+  woody_indices <- which(tolower(all_vegs) %in% tolower(woody_classes))
+  herbs_indices <- which(tolower(all_vegs) == "herbs")
+  stage1_indices <- c(woody_indices, herbs_indices)
+
+  if (length(woody_indices) >= 1 && length(herbs_indices) >= 1) {
+    cat("\n=== STAGE 1: WOODY vs HERBS VARIANT SIMILARITY ===\n")
+
+    s1_vecs <- all_vecs[stage1_indices]
+    s1_ids <- all_ids[stage1_indices]
+    s1_vegs <- all_vegs[stage1_indices]
+    s1_nsamples <- all_nsamples[stage1_indices]
+
+    # Create stage1 class labels (woody vs herbs)
+    s1_stage1_class <- ifelse(tolower(s1_vegs) %in% tolower(woody_classes), "woody", "herbs")
+
+    # Build matrix and apply Stage 1 weights if available
+    s1_vec_mat <- do.call(rbind, s1_vecs)
+    s1_vec_mat[!is.finite(s1_vec_mat)] <- 0
+
+    if (!is.null(stage1_weights) && length(stage1_weights) == ncol(s1_vec_mat)) {
+      # Apply Stage 1 LDA weights
+      s1_vec_mat_weighted <- sweep(s1_vec_mat, 2, sqrt(stage1_weights), "*")
+      cat(sprintf("  Applied Stage 1 weights to %d features\n", length(stage1_weights)))
+    } else {
+      s1_vec_mat_weighted <- s1_vec_mat
+      if (!is.null(stage1_weights)) {
+        cat(sprintf("[WARNING] Stage 1 weights length (%d) != features (%d), using unweighted\n",
+                    length(stage1_weights), ncol(s1_vec_mat)))
+      }
+    }
+
+    # Normalize and compute similarity
+    s1_row_norms <- sqrt(rowSums(s1_vec_mat_weighted^2))
+    s1_row_norms[s1_row_norms == 0] <- 1
+    s1_vec_mat_norm <- s1_vec_mat_weighted / s1_row_norms
+    s1_sim_mat <- tcrossprod(s1_vec_mat_norm)
+    s1_sim_mat[s1_sim_mat > 1.01] <- 1.01
+    s1_sim_mat[s1_sim_mat < -0.01] <- -0.01
+
+    rownames(s1_sim_mat) <- s1_ids
+    colnames(s1_sim_mat) <- s1_ids
+
+    s1_sim_df <- as.data.frame(as.table(s1_sim_mat))
+    colnames(s1_sim_df) <- c("Var1", "Var2", "Similarity")
+
+    # Order by stage1 class (herbs first, then woody)
+    s1_ord_idx <- order(s1_stage1_class, s1_ids)
+    s1_ordered_ids <- s1_ids[s1_ord_idx]
+    s1_ordered_classes <- s1_stage1_class[s1_ord_idx]
+
+    # Use sample counts for weighting
+    s1_count_map <- setNames(s1_nsamples, s1_ids)
+    s1_counts_ordered <- as.numeric(s1_count_map[s1_ordered_ids])
+    s1_counts_ordered[is.na(s1_counts_ordered)] <- 0
+    s1_total_counts <- sum(s1_counts_ordered)
+
+    if (!is.finite(s1_total_counts) || s1_total_counts <= 0) {
+      s1_widths_prop <- rep(1 / length(s1_ordered_ids), length(s1_ordered_ids))
+    } else {
+      s1_widths_prop <- s1_counts_ordered / s1_total_counts
+      eps <- 1e-6
+      s1_widths_prop[s1_widths_prop == 0] <- eps
+      s1_widths_prop <- s1_widths_prop / sum(s1_widths_prop)
+    }
+
+    s1_cumw <- cumsum(s1_widths_prop)
+    s1_lefts <- c(0, s1_cumw[-length(s1_cumw)])
+    s1_rights <- s1_cumw
+    names(s1_lefts) <- s1_ordered_ids
+    names(s1_rights) <- s1_ordered_ids
+
+    s1_lefts_rev <- rev(s1_lefts)
+    s1_rights_rev <- rev(s1_rights)
+    names(s1_lefts_rev) <- rev(s1_ordered_ids)
+    names(s1_rights_rev) <- rev(s1_ordered_ids)
+
+    s1_sim_df$xmin <- s1_lefts[as.character(s1_sim_df$Var1)]
+    s1_sim_df$xmax <- s1_rights[as.character(s1_sim_df$Var1)]
+    s1_sim_df$ymin <- s1_lefts_rev[as.character(s1_sim_df$Var2)]
+    s1_sim_df$ymax <- s1_rights_rev[as.character(s1_sim_df$Var2)]
+
+    s1_x_centers <- (s1_lefts + s1_rights) / 2
+    s1_y_centers <- (s1_lefts_rev + s1_rights_rev) / 2
+
+    # Boundaries at stage1 class changes
+    if (length(s1_ordered_classes) > 1) {
+      s1_change_idx <- which(s1_ordered_classes[-1] != s1_ordered_classes[-length(s1_ordered_classes)])
+      s1_vlines_x <- cumsum(s1_widths_prop)[s1_change_idx]
+      s1_hlines_y <- cumsum(s1_widths_prop)[s1_change_idx]
+    } else {
+      s1_vlines_x <- numeric(0)
+      s1_hlines_y <- numeric(0)
+    }
+
+    # Build Stage 1 heatmap
+    p_heat_s1 <- ggplot(s1_sim_df) +
+      geom_rect(aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = Similarity), color = NA) +
+      geom_vline(xintercept = s1_vlines_x, color = "black", size = 1.2) +
+      geom_hline(yintercept = s1_hlines_y, color = "black", size = 1.2) +
+      scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0.8, limits = c(-0.01, 1.01), na.value = "white") +
+      scale_x_continuous(expand = c(0,0), breaks = s1_x_centers, labels = s1_ordered_ids) +
+      scale_y_continuous(expand = c(0,0), breaks = s1_y_centers, labels = rev(s1_ordered_ids)) +
+      coord_equal() +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 7),
+            axis.text.y = element_text(size = 7)) +
+      labs(title = "Stage 1: Woody vs Herbs Variant Similarity (LDA-weighted)",
+           x = NULL, y = NULL)
+
+    tryCatch({
+      ggsave(file.path(OUT_DIR, "variant_similarity_stage1_woody_herbs.png"), p_heat_s1, width = 10, height = 8)
+      write.csv(s1_sim_mat, file.path(OUT_DIR, "variant_similarity_stage1_woody_herbs.csv"))
+      cat(sprintf("Saved Stage 1 (woody vs herbs) similarity heatmap to: %s\n",
+                  file.path(OUT_DIR, "variant_similarity_stage1_woody_herbs.png")))
+
+      # Print cross-class similarity statistics
+      woody_idx_local <- which(s1_stage1_class == "woody")
+      herbs_idx_local <- which(s1_stage1_class == "herbs")
+
+      if (length(woody_idx_local) > 0 && length(herbs_idx_local) > 0) {
+        cross_sims_s1 <- s1_sim_mat[woody_idx_local, herbs_idx_local, drop = FALSE]
+        cat(sprintf("\n[STAGE 1: WOODY-HERBS CROSS-SIMILARITY STATS]\n"))
+        cat(sprintf("  Min: %.3f, Max: %.3f, Mean: %.3f, Median: %.3f\n",
+                    min(cross_sims_s1), max(cross_sims_s1), mean(cross_sims_s1), median(cross_sims_s1)))
+      }
+    }, error = function(e) {
+      cat(sprintf("[ERROR] Failed to generate Stage 1 similarity heatmap: %s\n", e$message))
+    })
+
+    cat("================================================\n\n")
+  } else {
+    cat(sprintf("[INFO] Skipping Stage 1 heatmap: woody=%d, herbs=%d variants\n",
+                length(woody_indices), length(herbs_indices)))
+  }
+
+  # === STAGE 2: POPULUS vs TAMARIX SIMILARITY HEATMAP (with Stage 2 LDA weights) ===
+  # Generate a dedicated heatmap showing populus vs tamarix differentiation using Stage 2 weights
+
+  # Get Stage 2 LDA weights if available
+  stage2_weights <- NULL
+  if (exists("HIERARCHICAL_LDA_PARAMS", envir = globalenv())) {
+    hlp <- get("HIERARCHICAL_LDA_PARAMS", envir = globalenv())
+    if (!is.null(hlp$stage2) && !is.null(hlp$stage2$weights)) {
+      stage2_weights <- hlp$stage2$weights
+      cat("[STAGE 2 HEATMAP] Using Stage 2 LDA weights for populus vs tamarix similarity\n")
+    }
+  }
+
+  pt_indices <- which(tolower(all_vegs) %in% tolower(woody_classes))
+
+  if (length(pt_indices) >= 2) {
+    cat("\n=== STAGE 2: POPULUS vs TAMARIX VARIANT SIMILARITY ===\n")
+
+    pt_vecs <- all_vecs[pt_indices]
+    pt_ids <- all_ids[pt_indices]
+    pt_vegs <- all_vegs[pt_indices]
+    pt_nsamples <- all_nsamples[pt_indices]
+
+    # Build matrix and apply Stage 2 weights if available
+    pt_vec_mat <- do.call(rbind, pt_vecs)
+    pt_vec_mat[!is.finite(pt_vec_mat)] <- 0
+
+    if (!is.null(stage2_weights) && length(stage2_weights) == ncol(pt_vec_mat)) {
+      # Apply Stage 2 LDA weights
+      pt_vec_mat_weighted <- sweep(pt_vec_mat, 2, sqrt(stage2_weights), "*")
+      cat(sprintf("  Applied Stage 2 weights to %d features\n", length(stage2_weights)))
+    } else {
+      pt_vec_mat_weighted <- pt_vec_mat
+      if (!is.null(stage2_weights)) {
+        cat(sprintf("[WARNING] Stage 2 weights length (%d) != features (%d), using unweighted\n",
+                    length(stage2_weights), ncol(pt_vec_mat)))
+      }
+    }
+
+    # Normalize and compute similarity
+    pt_row_norms <- sqrt(rowSums(pt_vec_mat_weighted^2))
+    pt_row_norms[pt_row_norms == 0] <- 1
+    pt_vec_mat_norm <- pt_vec_mat_weighted / pt_row_norms
+    pt_sim_mat <- tcrossprod(pt_vec_mat_norm)
+    pt_sim_mat[pt_sim_mat > 1.01] <- 1.01
+    pt_sim_mat[pt_sim_mat < -0.01] <- -0.01
+
+    rownames(pt_sim_mat) <- pt_ids
+    colnames(pt_sim_mat) <- pt_ids
+
+    pt_sim_df <- as.data.frame(as.table(pt_sim_mat))
+    colnames(pt_sim_df) <- c("Var1", "Var2", "Similarity")
+
+    # Order by vegetation type
+    pt_ord_idx <- order(pt_vegs, pt_ids)
+    pt_ordered_ids <- pt_ids[pt_ord_idx]
+    pt_ordered_vegs <- pt_vegs[pt_ord_idx]
+
+    # Use sample counts for weighting
+    pt_count_map <- setNames(pt_nsamples, pt_ids)
+    pt_counts_ordered <- as.numeric(pt_count_map[pt_ordered_ids])
+    pt_counts_ordered[is.na(pt_counts_ordered)] <- 0
+    pt_total_counts <- sum(pt_counts_ordered)
+
+    if (!is.finite(pt_total_counts) || pt_total_counts <= 0) {
+      pt_n_ord <- length(pt_ordered_ids)
+      pt_widths_prop <- rep(1 / pt_n_ord, pt_n_ord)
+    } else {
+      pt_widths_prop <- pt_counts_ordered / pt_total_counts
+      eps <- 1e-6
+      pt_widths_prop[pt_widths_prop == 0] <- eps
+      pt_widths_prop <- pt_widths_prop / sum(pt_widths_prop)
+    }
+
+    pt_cumw <- cumsum(pt_widths_prop)
+    pt_lefts <- c(0, pt_cumw[-length(pt_cumw)])
+    pt_rights <- pt_cumw
+    names(pt_lefts) <- pt_ordered_ids
+    names(pt_rights) <- pt_ordered_ids
+
+    pt_lefts_rev <- rev(pt_lefts)
+    pt_rights_rev <- rev(pt_rights)
+    names(pt_lefts_rev) <- rev(pt_ordered_ids)
+    names(pt_rights_rev) <- rev(pt_ordered_ids)
+
+    pt_sim_df$xmin <- pt_lefts[as.character(pt_sim_df$Var1)]
+    pt_sim_df$xmax <- pt_rights[as.character(pt_sim_df$Var1)]
+    pt_sim_df$ymin <- pt_lefts_rev[as.character(pt_sim_df$Var2)]
+    pt_sim_df$ymax <- pt_rights_rev[as.character(pt_sim_df$Var2)]
+
+    pt_x_centers <- (pt_lefts + pt_rights) / 2
+    pt_y_centers <- (pt_lefts_rev + pt_rights_rev) / 2
+
+    # Boundaries at vegetation type changes
+    if (length(pt_ordered_vegs) > 1) {
+      pt_change_idx <- which(pt_ordered_vegs[-1] != pt_ordered_vegs[-length(pt_ordered_vegs)])
+      pt_vlines_x <- cumsum(pt_widths_prop)[pt_change_idx]
+      pt_hlines_y <- cumsum(pt_widths_prop)[pt_change_idx]
+    } else {
+      pt_vlines_x <- numeric(0)
+      pt_hlines_y <- numeric(0)
+    }
+
+    # Build Stage 2 heatmap
+    p_heat_pt <- ggplot(pt_sim_df) +
+      geom_rect(aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = Similarity), color = NA) +
+      geom_vline(xintercept = pt_vlines_x, color = "black", size = 1.2) +
+      geom_hline(yintercept = pt_hlines_y, color = "black", size = 1.2) +
+      scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0.8, limits = c(-0.01, 1.01), na.value = "white") +
+      scale_x_continuous(expand = c(0,0), breaks = pt_x_centers, labels = pt_ordered_ids) +
+      scale_y_continuous(expand = c(0,0), breaks = pt_y_centers, labels = rev(pt_ordered_ids)) +
+      coord_equal() +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8),
+            axis.text.y = element_text(size = 8)) +
+      labs(title = "Stage 2: Populus vs Tamarix Variant Similarity (LDA-weighted)",
+           x = NULL, y = NULL)
+
+    tryCatch({
+      ggsave(file.path(OUT_DIR, "variant_similarity_stage2_populus_tamarix.png"), p_heat_pt, width = 10, height = 8)
+      write.csv(pt_sim_mat, file.path(OUT_DIR, "variant_similarity_stage2_populus_tamarix.csv"))
+      cat(sprintf("Saved Stage 2 (populus vs tamarix) similarity heatmap to: %s\n",
+                  file.path(OUT_DIR, "variant_similarity_stage2_populus_tamarix.png")))
+
+      # Print cross-class similarity statistics
+      populus_idx <- which(tolower(pt_vegs) == "populus")
+      tamarix_idx <- which(tolower(pt_vegs) == "tamarix")
+
+      if (length(populus_idx) > 0 && length(tamarix_idx) > 0) {
+        cross_sims <- pt_sim_mat[populus_idx, tamarix_idx, drop = FALSE]
+        cat(sprintf("\n[STAGE 2: POPULUS-TAMARIX CROSS-SIMILARITY STATS]\n"))
+        cat(sprintf("  Min: %.3f, Max: %.3f, Mean: %.3f, Median: %.3f\n",
+                    min(cross_sims), max(cross_sims), mean(cross_sims), median(cross_sims)))
+
+        # Identify most similar pairs
+        top_n <- min(5, length(cross_sims))
+        cross_df <- data.frame(
+          Populus = rep(rownames(cross_sims), ncol(cross_sims)),
+          Tamarix = rep(colnames(cross_sims), each = nrow(cross_sims)),
+          Similarity = as.vector(cross_sims)
+        )
+        cross_df <- cross_df[order(-cross_df$Similarity), ]
+        cat(sprintf("  Top %d most similar populus-tamarix pairs:\n", top_n))
+        for (i in seq_len(top_n)) {
+          cat(sprintf("    %s <-> %s: %.3f\n",
+                      cross_df$Populus[i], cross_df$Tamarix[i], cross_df$Similarity[i]))
+        }
+
+        # Store high-similarity (>0.9) populus-tamarix pairs for "woody_unknown" renaming
+        WOODY_UNKNOWN_THRESHOLD <- 0.9
+        high_sim_pairs <- cross_df[cross_df$Similarity > WOODY_UNKNOWN_THRESHOLD, , drop = FALSE]
+        if (nrow(high_sim_pairs) > 0) {
+          # Collect all variant IDs that should be renamed to "woody_unknown"
+          woody_unknown_variants <- unique(c(as.character(high_sim_pairs$Populus),
+                                              as.character(high_sim_pairs$Tamarix)))
+          assign("WOODY_UNKNOWN_VARIANTS", woody_unknown_variants, envir = globalenv())
+          cat(sprintf("\n[WOODY UNKNOWN] Identified %d variants with cross-class similarity > %.2f:\n",
+                      length(woody_unknown_variants), WOODY_UNKNOWN_THRESHOLD))
+          for (vid in woody_unknown_variants) {
+            cat(sprintf("    - %s\n", vid))
+          }
+        } else {
+          assign("WOODY_UNKNOWN_VARIANTS", character(0), envir = globalenv())
+          cat(sprintf("\n[WOODY UNKNOWN] No variants exceeded cross-class similarity threshold of %.2f\n",
+                      WOODY_UNKNOWN_THRESHOLD))
+        }
+      }
+    }, error = function(e) {
+      cat(sprintf("[ERROR] Failed to generate Stage 2 similarity heatmap: %s\n", e$message))
+    })
+
+    cat("================================================\n\n")
+  } else {
+    cat(sprintf("[INFO] Skipping Stage 2 heatmap: only %d variants found for woody classes\n", length(pt_indices)))
+  }
+
   # == AGENT FIX: Print #loc-years per variant ==
   cat("\n=== VARIANT SAMPLE SIZES (Loc-Years) ===\n")
   sample_stats <- data.frame(
@@ -267,92 +666,42 @@ test_analyze_library_similarity <- function() {
 
 # Helper: ensure the variant similarity heatmap is generated once and early
 ensure_global_dvi_soil_baseline <- function() {
-  if (exists("GLOBAL_TRAINING_DVI_SOIL", envir = globalenv()) && !is.na(get("GLOBAL_TRAINING_DVI_SOIL", envir = globalenv())) && is.finite(get("GLOBAL_TRAINING_DVI_SOIL", envir = globalenv()))) {
-    cat(sprintf("[PPI] GLOBAL_TRAINING_DVI_SOIL already set: %.6f\n", get("GLOBAL_TRAINING_DVI_SOIL", envir = globalenv())))
-    return(invisible(get("GLOBAL_TRAINING_DVI_SOIL", envir = globalenv())))
-  }
+  stop("[PPI ERROR] GLOBAL DVI soil baseline functionality has been removed. Compute per-location DJF medians or provide explicit dvi_soil to add_ppi_columns().")
+}
 
-  cat("[PPI] GLOBAL_TRAINING_DVI_SOIL not found or invalid. Attempting to restore or recalculate...\n")
-  dvi_soil_found <- FALSE
-  dvi_soil_val <- NA_real_
-
-  # 1. Attempt to restore from cache metadata or raw templates (existing logic)
-  possible_cache_dirs <- unique(c(if (exists("OUT_DIR")) file.path(OUT_DIR, "mesma_cache") else NULL,
-                                  "phenology_results/veg_mixture_fit/mesma_cache",
-                                  file.path("mesma_cache")))
-  for (cd in possible_cache_dirs) {
-    if (!is.null(cd)) {
-      # Try from training_metadata.rds
-      if (!dvi_soil_found && file.exists(file.path(cd, "training_metadata.rds"))) {
-        tryCatch({
-          tm <- readRDS(file.path(cd, "training_metadata.rds"))
-          if (!is.null(tm$dvi_soil) && is.finite(tm$dvi_soil)) {
-            dvi_soil_val <- tm$dvi_soil
-            assign("GLOBAL_TRAINING_DVI_SOIL", dvi_soil_val, envir = globalenv())
-            cat(sprintf("[PPI] Restored GLOBAL_TRAINING_DVI_SOIL=%.6f from cache metadata\n", dvi_soil_val))
-            dvi_soil_found <- TRUE
-          }
-        }, error = function(e) { cat(sprintf("[PPI ERROR] Failed to read dvi_soil from training_metadata.rds: %s\n", e$message)) })
-      }
-      
-      # Try from raw_templates.rds if not yet found
-      if (!dvi_soil_found && file.exists(file.path(cd, "raw_templates.rds"))) {
-        tryCatch({
-          raw_tpl <- readRDS(file.path(cd, "raw_templates.rds"))
-          if (!is.null(raw_tpl[["barren"]])) {
-            barren_raw <- raw_tpl[["barren"]]
-            dvi_vals <- NULL
-            if (is.data.frame(barren_raw) || is.matrix(barren_raw)) {
-              if ("DVI" %in% colnames(barren_raw)) {
-                dvi_vals <- barren_raw[, "DVI"]
-              } else if ("nir" %in% colnames(barren_raw) && "red" %in% colnames(barren_raw)) {
-                dvi_vals <- barren_raw[, "nir"] - barren_raw[, "red"]
-              }
-            }
-            if (!is.null(dvi_vals) && length(dvi_vals) > 0 && any(is.finite(dvi_vals))) {
-              dvi_soil_val <- median(dvi_vals, na.rm=TRUE)
-              assign("GLOBAL_TRAINING_DVI_SOIL", dvi_soil_val, envir = globalenv())
-              cat(sprintf("[PPI] Computed fallback GLOBAL_TRAINING_DVI_SOIL=%.6f from cached raw 'barren' templates\n", dvi_soil_val))
-              dvi_soil_found <- TRUE
-            }
-          }
-        }, error = function(e) { cat(sprintf("[PPI ERROR] Failed to compute dvi_soil from raw_templates.rds: %s\n", e$message)) })
-      }
-      if (dvi_soil_found) break # Stop searching if found
-    }
+# Helper: add a shaded rectangle covering excluded years (1992-1999) for ggplot2 time-series plots.
+# Usage: + add_excluded_years_shade(is_date = TRUE)  # x axis is Date
+#        + add_excluded_years_shade(is_date = FALSE) # x axis is numeric (year)
+add_excluded_years_shade <- function(start_year = 1992, end_year = 1999, is_date = FALSE, fill = "grey70", alpha = 0.35) {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) return(NULL)
+  if (is_date) {
+    xmin <- as.Date(paste0(start_year, "-01-01"))
+    xmax <- as.Date(paste0(end_year, "-12-31"))
+    return(ggplot2::annotate("rect", xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = fill, alpha = alpha))
+  } else {
+    return(ggplot2::annotate("rect", xmin = start_year, xmax = end_year, ymin = -Inf, ymax = Inf, fill = fill, alpha = alpha))
   }
+}
 
-  # 2. If still not found, try to recalculate from df_train if available
-  if (!dvi_soil_found && exists("df_train") && !is.null(df_train) && nrow(df_train) > 0) {
-    cat("[PPI] No DVI soil baseline found in cache. Attempting to recalculate from df_train...\n")
-    df_train_copy <- df_train # Work on a copy to avoid side effects
-    
-    # Ensure DVI and Veg columns for calculation
-    if (!"DVI" %in% names(df_train_copy) && all(c("nir", "red") %in% names(df_train_copy))) {
-      df_train_copy$DVI <- df_train_copy$nir - df_train_copy$red
-    }
-    
-    if ("Veg" %in% names(df_train_copy) && "DVI" %in% names(df_train_copy)) {
-      barren_dvi <- df_train_copy$DVI[is.finite(df_train_copy$DVI) & tolower(df_train_copy$Veg) == 'barren']
-      if (length(barren_dvi) > 0) {
-        dvi_soil_val <- as.numeric(median(barren_dvi, na.rm = TRUE))
-        assign("GLOBAL_TRAINING_DVI_SOIL", dvi_soil_val, envir = globalenv())
-        cat(sprintf("[PPI] Recalculated GLOBAL_TRAINING_DVI_SOIL=%.6f from df_train 'barren' observations\n", dvi_soil_val))
-        dvi_soil_found <- TRUE
-      } else {
-        cat("[PPI WARNING] df_train exists but contains no 'barren' observations for recalculation.\n")
-      }
-    } else {
-      cat("[PPI WARNING] df_train exists but missing 'Veg' or 'DVI' columns for recalculation.\n")
-    }
-  } else if (!dvi_soil_found) {
-    cat("[PPI WARNING] df_train not found in memory, skipping recalculation from training data.\n")
+# Helper: add vertical lines at specified years and label them with letters and the year in brackets (e.g., A (2007))
+# Usage: + add_year_lines()  # numeric year x-axis
+#        + add_year_lines(is_date = TRUE) # Date x-axis
+add_year_lines <- function(years = c(2007, 2010, 2014), labels = NULL, is_date = FALSE, color = "black", linetype = "dashed", size = 0.6, text_size = 3, text_vjust = -0.5) {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) return(NULL)
+  if (is.null(labels)) {
+    # Default to letters (A,B,C,...) and append the year in brackets
+    base_labels <- LETTERS[seq_along(years)]
+    labels <- paste0(base_labels, " (", years, ")")
+  } else {
+    # If user provided labels, still append years in brackets for clarity
+    labels <- paste0(labels, " (", years, ")")
   }
-
-  if (!dvi_soil_found) {
-    stop("[PPI ERROR] GLOBAL_TRAINING_DVI_SOIL could not be established after all attempts (cache or recalculation from df_train). Cannot proceed with PPI calculation.")
-  }
-  return(invisible(dvi_soil_val))
+  xs <- if (is_date) as.Date(paste0(years, "-01-01")) else as.numeric(years)
+  layers <- unlist(lapply(seq_along(xs), function(i) list(
+    ggplot2::geom_vline(xintercept = xs[i], color = color, linetype = linetype, size = size),
+    ggplot2::annotate("text", x = xs[i], y = Inf, label = labels[i], vjust = text_vjust, size = text_size)
+  )), recursive = FALSE)
+  return(layers)
 }
 
 ensure_library_and_templates <- function(force = FALSE) {
@@ -377,88 +726,7 @@ ensure_library_and_templates <- function(force = FALSE) {
   # If still missing, attempt to build them from available inputs
 
 
-  # If still missing, try to load from saved cache files
-  if (is.null(ms)) {
-    possible_cache_dirs <- unique(c(if (exists("OUT_DIR")) file.path(OUT_DIR, "mesma_cache") else NULL,
-                                    "phenology_results/veg_mixture_fit/mesma_cache",
-                                    file.path("mesma_cache")))
-    cat(sprintf("[DEBUG] Checking possible cache dirs for 'mesma_library.rds': %s\n", paste(possible_cache_dirs, collapse = ", ")))
-    for (cd in possible_cache_dirs) {
-      if (is.null(cd)) next
-      lib_path <- file.path(cd, "mesma_library.rds")
-      cat(sprintf("[DEBUG] Checking %s -> exists=%s\n", normalizePath(cd, mustWork = FALSE), file.exists(lib_path)))
-      if (file.exists(lib_path)) {
-        tryCatch({
-          ms_load <- readRDS(lib_path)
-          if ("mesma_lib" %in% names(ms_load) && is.list(ms_load$mesma_lib)) {
-             ms <- ms_load$mesma_lib
-             cat("[INFO] Extracted 'mesma_lib' from cached wrapper object.\n")
-          } else {
-             ms <- ms_load
-          }
-          assign("mesma_lib", ms, envir = globalenv())
-          cat(sprintf("[INFO] Loaded 'mesma_lib' from cache: %s\n", lib_path))
-          break
-        }, error = function(e) {
-          cat(sprintf("[ERROR] Failed to read '%s': %s\n", lib_path, e$message))
-        })
-      }
-    }
-  }
-
-  if (!is.null(ms) && is.null(ct)) {
-    # Try to load compressed templates from cache dirs
-    possible_cache_dirs <- unique(c(if (exists("OUT_DIR")) file.path(OUT_DIR, "mesma_cache") else NULL,
-                                    "phenology_results/veg_mixture_fit/mesma_cache",
-                                    file.path("mesma_cache")))
-    cat(sprintf("[DEBUG] Checking possible cache dirs for 'compressed_templates.rds': %s\n", paste(possible_cache_dirs, collapse = ", ")))
-    for (cd in possible_cache_dirs) {
-      if (is.null(cd)) next
-      tpl_path <- file.path(cd, "compressed_templates.rds")
-      cat(sprintf("[DEBUG] Checking %s -> exists=%s\n", normalizePath(cd, mustWork = FALSE), file.exists(tpl_path)))
-      if (file.exists(tpl_path)) {
-        tryCatch({
-          ct2 <- readRDS(tpl_path)
-          
-          # FIX: Check for flat keys and restructure if needed to ensure nested [[veg]][[vid]][[grid_type]] format
-          is_flat <- FALSE
-          if (length(ct2) > 0 && is.list(ct2[[1]]) && length(ct2[[1]]) > 0) {
-             first_key <- names(ct2[[1]])[1]
-             if (!is.null(first_key) && grepl("|", first_key, fixed=TRUE)) is_flat <- TRUE
-          }
-          
-          if (is_flat) {
-             cat("[INFO] Detected flat-key cache structure. Restructuring to nested format...\n")
-             ct_nested <- list()
-             for (veg in names(ct2)) {
-                ct_nested[[veg]] <- list()
-                for (key in names(ct2[[veg]])) {
-                   parts <- strsplit(key, "|", fixed=TRUE)[[1]]
-                   # key constructed as: paste(veg, variant$variant_id, grid_type, sep = "|")
-                   # So parts[1]=veg, parts[last]=grid_type, middle=vid
-                   if (length(parts) >= 3) {
-                      gtype <- parts[length(parts)]
-                      vid <- paste(parts[2:(length(parts)-1)], collapse="|")
-                      
-                      if (is.null(ct_nested[[veg]][[vid]])) ct_nested[[veg]][[vid]] <- list()
-                      ct_nested[[veg]][[vid]][[gtype]] <- ct2[[veg]][[key]]
-                   }
-                }
-             }
-             ct2 <- ct_nested
-          }
-          
-          assign("compressed_templates_accessor", ct2, envir = globalenv())
-          assign(".COMPRESSED_TEMPLATES_ACCESSOR", ct2, envir = globalenv())
-          ct <- ct2
-          cat(sprintf("[INFO] Loaded 'compressed_templates_accessor' from cache: %s\n", tpl_path))
-          break
-        }, error = function(e) {
-          cat(sprintf("[ERROR] Failed to read '%s': %s\n", tpl_path, e$message))
-        })
-      }
-    }
-  }
+  # Cache loading removed - library should already exist in session
 
   if (is.null(ms) || is.null(ct)) {
     cat("[WARN] After attempts, 'mesma_lib' or 'compressed_templates_accessor' still not available. Some visualizations may be skipped.\n")

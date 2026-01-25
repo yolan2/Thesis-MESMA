@@ -52,6 +52,12 @@ if (file.exists("ppi_helpers.R")) {
 } else {
   warning("ppi_helpers.R not found; using local inline PPI logic (ensure ppi_helpers.R in project root for consistent PPI calculation)")
 }
+# Optional visualization helpers (provide shading for excluded years)
+if (file.exists("mesma_helpers.R")) {
+  source("mesma_helpers.R")
+} else {
+  # mesma_helpers.R not found; shading helper will be unavailable
+} 
 
 # --- Main Script ---
 
@@ -63,6 +69,21 @@ OUTPUT_DIR <- "C:/Users/yolan/OneDrive/Documenten/UGENT/Master/masterproef/pheno
 # Load the phenology data
 cat("Loading data from:", INPUT_CSV, "\n")
 df <- readr::read_csv(INPUT_CSV, show_col_types = FALSE)
+# Exclude years 1992-1999 from plotting and analysis (if present)
+if ("date" %in% names(df)) {
+  if (!lubridate::is.Date(df$date)) df$date <- as.Date(df$date)
+  n_before <- nrow(df)
+  years_to_drop <- 1992:1999
+  df <- df[!(lubridate::year(df$date) %in% years_to_drop), , drop = FALSE]
+  if (n_before != nrow(df)) cat(sprintf("[DATA FILTER] Dropped %d rows from years %d-%d from input in plotting script\n", n_before - nrow(df), min(years_to_drop), max(years_to_drop)))
+} else if ("year" %in% names(df)) {
+  n_before <- nrow(df)
+  years_to_drop <- 1992:1999
+  df <- df[!(as.integer(df$year) %in% years_to_drop), , drop = FALSE]
+  if (n_before != nrow(df)) cat(sprintf("[DATA FILTER] Dropped %d rows from years %d-%d from input in plotting script (using 'year' column)\n", n_before - nrow(df), min(years_to_drop), max(years_to_drop)))
+} else {
+  # No date/year column available; nothing to drop
+}
 
 # --- Location ID and Join Logic (Copied from january_averages.R) ---
 # Check if location_id already exists and is useful
@@ -120,7 +141,13 @@ if (file.exists(MAPPING_CSV)) {
     cat("Loading vegetation mapping from:", MAPPING_CSV, "\n")
     map_df <- readr::read_csv(MAPPING_CSV, show_col_types = FALSE)
     veg_cols <- names(map_df)[tolower(names(map_df)) %in% c("vegetation", "veg", "class")]
-    if (length(veg_cols) > 0) map_df$Veg <- as.character(map_df[[veg_cols[1]]])
+    if (length(veg_cols) > 0) {
+      map_df$Veg <- as.character(map_df[[veg_cols[1]]])
+      map_df$Veg <- tolower(trimws(as.character(map_df$Veg)))
+      map_df$Veg <- ifelse(grepl("phragmites", map_df$Veg, ignore.case = TRUE) |
+                           map_df$Veg %in% c("herbs", "alhagi", "salicornia", "halocnemum"),
+                           "herbs", map_df$Veg)
+    }
 
     if (!"location_id" %in% names(map_df) && all(c("lon", "lat") %in% names(map_df))) {
       map_df$location_id <- make_location_id(map_df$lon, map_df$lat)
@@ -190,7 +217,7 @@ if ("DVI" %in% names(df) && "zenith.angle" %in% names(df) && "DVI_max" %in% name
     if (any(complete_idx)) {
         dsoil <- if (exists("PPI_DVI_SOIL", envir = .GlobalEnv)) get("PPI_DVI_SOIL", envir = .GlobalEnv) else 0.09
         # Use fixed M=0.7 per standardized PPI implementation
-        df$PPI[complete_idx] <- ppi(df$DVI[complete_idx], df$zenith.angle[complete_idx], M = 0.7, dvi.soil = dsoil)
+        df$PPI[complete_idx] <- ppi(df$DVI[complete_idx], df$zenith.angle[complete_idx], dvi.soil = dsoil)
     }
 }
 
@@ -199,8 +226,8 @@ if ("DVI" %in% names(df) && "zenith.angle" %in% names(df) && "DVI_max" %in% name
 cat("Aggregating data...\n")
 
 # Filter out rows with missing PPI or Veg
-# And filter for specific vegetation types: barren, phragmites, populus, tamarix
-target_veg <- c("barren", "phragmites", "populus", "tamarix")
+# And filter for specific vegetation types: barren, herbs, populus, tamarix
+target_veg <- c("barren", "herbs", "populus", "tamarix", "woody_unknown")
 
 plot_data <- df |> 
   dplyr::filter(!is.na(PPI), !is.na(Veg)) |> 
@@ -222,6 +249,7 @@ ppi_summary <- plot_data |>
 cat("Generating plot...\n")
 
 p <- ggplot(ppi_summary, aes(x = date, y = mean_PPI, color = Veg, fill = Veg)) +
+  add_excluded_years_shade(is_date = TRUE) + add_year_lines(is_date = TRUE) +
   geom_line(size = 1) +
   geom_ribbon(aes(ymin = mean_PPI - se_PPI, ymax = mean_PPI + se_PPI), alpha = 0.2, color = NA) +
   labs(title = "Average Plant Phenology Index (PPI) over Time by Vegetation Type",
