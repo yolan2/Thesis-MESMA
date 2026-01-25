@@ -49,3 +49,6 @@ training_visualizations/
 *.bat
 *.json
 .Rprofile
+
+# Ignore R binary data files
+*.rds
