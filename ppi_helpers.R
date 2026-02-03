@@ -1,8 +1,34 @@
 ## Centralized PPI helpers for consistent calculation
 ## Provides: safe_as_numeric, calculate_solar_zenith, ppi, add_ppi_columns, auto_add_ppi_columns
+## Also provides shared utility functions: make_location_id, assign_pheno_year, pheno_doy
 
 safe_as_numeric <- function(x) {
   as.numeric(as.character(x))
+}
+
+make_location_id <- function(lon, lat) {
+  lon <- as.numeric(lon)
+  lat <- as.numeric(lat)
+  invalid_mask <- !is.finite(lon) | !is.finite(lat)
+  res <- sprintf("L_%0.6f_%0.6f", round(lat, 6), round(lon, 6))
+  res[invalid_mask] <- NA_character_
+  res
+}
+
+assign_pheno_year <- function(d) {
+  d <- as.Date(d)
+  ifelse(is.na(d), NA_integer_, ifelse(lubridate::month(d) >= 3, lubridate::year(d), lubridate::year(d) - 1))
+}
+
+pheno_doy <- function(d) {
+  d <- tryCatch(as.Date(d), error = function(e) NA)
+  month <- lubridate::month(d)
+  ifelse(is.na(d), NA_integer_,
+    ifelse(month >= 3,
+      as.integer(d - as.Date(paste0(lubridate::year(d), "-03-01"))) + 1L,
+      as.integer(d - as.Date(paste0(lubridate::year(d) - 1, "-03-01"))) + 1L
+    )
+  )
 }
 
 calculate_solar_zenith <- function(lat, doy, hour = 10.5) {

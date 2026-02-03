@@ -431,6 +431,8 @@ if (!"location_id" %in% names(raw_df)) stop(sprintf("Input CSV '%s' missing requ
 
 # Keep selected Vegs
 raw_df$Veg <- tolower(as.character(raw_df$Veg))
+# Treat certain classes as herbs (match behavior in fit_veg_mixture_mesma.R)
+raw_df$Veg <- ifelse(trimws(raw_df$Veg) %in% c("herbs", "alhagi", "salicornia", "halocnemum", "phragmites"), "herbs", raw_df$Veg)
 selected_vegs <- c("herbs", "populus", "tamarix", "barren")
 df <- raw_df[raw_df$Veg %in% selected_vegs, ]
 if (nrow(df) == 0) stop("No training rows after Veg filtering")

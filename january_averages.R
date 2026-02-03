@@ -81,7 +81,7 @@ compute_indices_from_bands <- function(df) {
 
 # Outlier configuration defined early so helper can be used during initial filtering
 ENABLE_OUTLIER_REMOVAL <- FALSE
-OUTLIER_MAD_THRESHOLD <- 2.5
+OUTLIER_MAD_THRESHOLD <- 3.5
 
 # Remove large outliers robustly per (location_id, pheno_year) where possible, otherwise per-location.
 # Uses spline-based outlier detection for groups with sufficient data, otherwise falls back to MAD.

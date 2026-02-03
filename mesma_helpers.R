@@ -259,7 +259,6 @@ analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor,
 
   # Build heatmap using fixed rectangles (no gaps between adjacent variants)
   if (!requireNamespace("ggplot2", quietly = TRUE)) stop("ggplot2 required")
-  library(ggplot2)
   p_heat <- ggplot(sim_df) +
     geom_rect(aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = Similarity), color = NA) +
     # Add thick black lines at vegetation boundaries
@@ -280,6 +279,55 @@ analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor,
     cat(sprintf("[ERROR] Failed to generate similarity heatmap: %s\n", e$message))
   })
 
+  # --- Detect high-similarity populus/tamarix variants (cross-class similarity > 0.95) ---
+  # These variants are spectrally indistinguishable and should be labeled as "woody_unknown"
+  WOODY_CROSS_SIM_THRESHOLD <- 0.95
+  populus_indices <- which(tolower(all_vegs) == "populus")
+  tamarix_indices <- which(tolower(all_vegs) == "tamarix")
+
+  woody_unknown_variants <- character(0)
+
+  if (length(populus_indices) > 0 && length(tamarix_indices) > 0) {
+    cat(sprintf("\n[CROSS-CLASS SIMILARITY] Checking %d populus vs %d tamarix variants (threshold: %.2f)\n",
+                length(populus_indices), length(tamarix_indices), WOODY_CROSS_SIM_THRESHOLD))
+
+    # Extract cross-class similarities from the similarity matrix
+    for (p_idx in populus_indices) {
+      for (t_idx in tamarix_indices) {
+        sim_val <- sim_mat[p_idx, t_idx]
+        if (!is.na(sim_val) && sim_val > WOODY_CROSS_SIM_THRESHOLD) {
+          # Both variants are indistinguishable - add both to woody_unknown list
+          p_id <- all_ids[p_idx]
+          t_id <- all_ids[t_idx]
+          if (!(p_id %in% woody_unknown_variants)) {
+            woody_unknown_variants <- c(woody_unknown_variants, p_id)
+            cat(sprintf("  - %s (populus) has similarity %.3f with %s (tamarix)\n", p_id, sim_val, t_id))
+          }
+          if (!(t_id %in% woody_unknown_variants)) {
+            woody_unknown_variants <- c(woody_unknown_variants, t_id)
+            cat(sprintf("  - %s (tamarix) has similarity %.3f with %s (populus)\n", t_id, sim_val, p_id))
+          }
+        }
+      }
+    }
+
+    if (length(woody_unknown_variants) > 0) {
+      cat(sprintf("[CROSS-CLASS SIMILARITY] Found %d variants with cross-class similarity > %.2f\n",
+                  length(woody_unknown_variants), WOODY_CROSS_SIM_THRESHOLD))
+      cat(sprintf("  Variants: %s\n", paste(woody_unknown_variants, collapse = ", ")))
+    } else {
+      cat(sprintf("[CROSS-CLASS SIMILARITY] No populus/tamarix variants exceed similarity threshold of %.2f\n",
+                  WOODY_CROSS_SIM_THRESHOLD))
+    }
+  } else {
+    cat("[CROSS-CLASS SIMILARITY] Skipping: need both populus and tamarix variants present\n")
+  }
+
+  # Store in global environment for use during MESMA fitting
+  assign("WOODY_UNKNOWN_VARIANTS", woody_unknown_variants, envir = globalenv())
+  cat(sprintf("[CROSS-CLASS SIMILARITY] Assigned WOODY_UNKNOWN_VARIANTS to global env (%d variants)\n",
+              length(woody_unknown_variants)))
+
   # == AGENT FIX: Print #loc-years per variant ==
   cat("\n=== VARIANT SAMPLE SIZES (Loc-Years) ===\n")
   sample_stats <- data.frame(
@@ -298,81 +346,44 @@ analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor,
 }
 
 
-# Small test helper to exercise analyze_library_similarity without running the whole pipeline
-# This can be invoked with: test_analyze_library_similarity()
-
-test_analyze_library_similarity <- function() {
-  cat("Running test_analyze_library_similarity()...\n")
-  # Build minimal synthetic mesma_lib / compressed_templates_accessor
-  pequena_lib <- list(
-    vegA = list(list(variant_id = "vegA_v1", n_samples = 12)),
-    vegB = list(list(variant_id = "vegB_v1", n_samples = 15))
-  )
-  compressed <- list(
-    vegA = list(vegA_v1 = list(full = rep(1.0, 24))),
-    vegB = list(vegB_v1 = list(full = rep(0.9, 24)))
-  )
-
-  # Use a temporary OUT_DIR to avoid clobbering real output
-  tmp_out <- file.path(tempdir(), "test_variant_similarity")
-  dir.create(tmp_out, showWarnings = FALSE, recursive = TRUE)
-  old_out <- if (exists("OUT_DIR", inherits = FALSE)) get("OUT_DIR") else NULL
-  assign("OUT_DIR", tmp_out, envir = .GlobalEnv)
-
-  res <- tryCatch({
-    analyze_library_similarity(pequena_lib, compressed)
-    list(success = TRUE, dir = tmp_out, files = list.files(tmp_out))
-  }, error = function(e) {
-    list(success = FALSE, error = e$message)
-  })
-
-  if (!is.null(old_out)) assign("OUT_DIR", old_out, envir = .GlobalEnv) else rm("OUT_DIR", envir = .GlobalEnv)
-
-  cat(sprintf("Test result: %s\n", if (isTRUE(res$success)) "OK" else paste0("FAILED: ", res$error)))
-  if (!is.null(res$files)) cat(sprintf("Files created: %s\n", paste(res$files, collapse = ", ")))
-  invisible(TRUE)
-}
-
-
-# Helper: ensure the variant similarity heatmap is generated once and early
-ensure_global_dvi_soil_baseline <- function() {
-  stop("[PPI ERROR] GLOBAL DVI soil baseline functionality has been removed. Compute per-location DJF medians or provide explicit dvi_soil to add_ppi_columns().")
-}
 
 # Helper: add a shaded rectangle covering excluded years (1992-1999) for ggplot2 time-series plots.
 # Usage: + add_excluded_years_shade(is_date = TRUE)  # x axis is Date
 #        + add_excluded_years_shade(is_date = FALSE) # x axis is numeric (year)
 add_excluded_years_shade <- function(start_year = 1992, end_year = 1999, is_date = FALSE, fill = "grey70", alpha = 0.35) {
   if (!requireNamespace("ggplot2", quietly = TRUE)) return(NULL)
+  # Two shaded regions: 1992-1999 and 2007-2009
   if (is_date) {
-    xmin <- as.Date(paste0(start_year, "-01-01"))
-    xmax <- as.Date(paste0(end_year, "-12-31"))
-    return(ggplot2::annotate("rect", xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = fill, alpha = alpha))
+    xmin1 <- as.Date(paste0(start_year, "-01-01"))
+    xmax1 <- as.Date(paste0(end_year, "-12-31"))
+    xmin2 <- as.Date("2007-01-01")
+    xmax2 <- as.Date("2009-12-31")
+    return(list(
+      ggplot2::annotate("rect", xmin = xmin1, xmax = xmax1, ymin = -Inf, ymax = Inf, fill = fill, alpha = alpha),
+      ggplot2::annotate("rect", xmin = xmin2, xmax = xmax2, ymin = -Inf, ymax = Inf, fill = fill, alpha = alpha)
+    ))
   } else {
-    return(ggplot2::annotate("rect", xmin = start_year, xmax = end_year, ymin = -Inf, ymax = Inf, fill = fill, alpha = alpha))
+    return(list(
+      ggplot2::annotate("rect", xmin = start_year, xmax = end_year, ymin = -Inf, ymax = Inf, fill = fill, alpha = alpha),
+      ggplot2::annotate("rect", xmin = 2007, xmax = 2009, ymin = -Inf, ymax = Inf, fill = fill, alpha = alpha)
+    ))
   }
 }
 
-# Helper: add vertical lines at specified years and label them with letters and the year in brackets (e.g., A (2007))
-# Usage: + add_year_lines()  # numeric year x-axis
-#        + add_year_lines(is_date = TRUE) # Date x-axis
-add_year_lines <- function(years = c(2007, 2010, 2014), labels = NULL, is_date = FALSE, color = "black", linetype = "dashed", size = 0.6, text_size = 3, text_vjust = -0.5) {
+# Helper: add vertical lines at year boundaries for ggplot2 time-series plots.
+# Usage: + add_year_lines(is_date = TRUE)  # x axis is Date
+#        + add_year_lines(is_date = FALSE) # x axis is numeric (year)
+add_year_lines <- function(start_year = 1985, end_year = 2025, is_date = FALSE, color = "grey50", linetype = "dashed", alpha = 0.5) {
   if (!requireNamespace("ggplot2", quietly = TRUE)) return(NULL)
-  if (is.null(labels)) {
-    # Default to letters (A,B,C,...) and append the year in brackets
-    base_labels <- LETTERS[seq_along(years)]
-    labels <- paste0(base_labels, " (", years, ")")
+  years <- seq(start_year, end_year, by = 1)
+  if (is_date) {
+    xintercepts <- as.Date(paste0(years, "-01-01"))
+    return(ggplot2::geom_vline(xintercept = as.numeric(xintercepts), color = color, linetype = linetype, alpha = alpha))
   } else {
-    # If user provided labels, still append years in brackets for clarity
-    labels <- paste0(labels, " (", years, ")")
+    return(ggplot2::geom_vline(xintercept = years, color = color, linetype = linetype, alpha = alpha))
   }
-  xs <- if (is_date) as.Date(paste0(years, "-01-01")) else as.numeric(years)
-  layers <- unlist(lapply(seq_along(xs), function(i) list(
-    ggplot2::geom_vline(xintercept = xs[i], color = color, linetype = linetype, size = size),
-    ggplot2::annotate("text", x = xs[i], y = Inf, label = labels[i], vjust = text_vjust, size = text_size)
-  )), recursive = FALSE)
-  return(layers)
 }
+
 
 ensure_library_and_templates <- function(force = FALSE) {
   # Attempt to construct or expose `mesma_lib` and `compressed_templates_accessor`
@@ -395,8 +406,6 @@ ensure_library_and_templates <- function(force = FALSE) {
 
   # If still missing, attempt to build them from available inputs
 
-
-  # Cache loading removed - library should already exist in session
 
   if (is.null(ms) || is.null(ct)) {
     cat("[WARN] After attempts, 'mesma_lib' or 'compressed_templates_accessor' still not available. Some visualizations may be skipped.\n")
