@@ -1,54 +1,14 @@
-# Ignore generated data folders
-modis/
-landsat/
-phenology_results/
-downloads/
+# Ignore everything
+*
 
-# Python virtual environments
-venv/
-.venv/
-venv.*
+# But not these files...
+!.gitignore
 
-# Local editor/IDE settings
-.idea/
+# Allow R scripts
+!*.R
 
-# Project folders
-path/
-scripts/
-training_visualizations/
+# Allow Python scripts
+!*.py
 
-# R-specific
-.vscode/    # ignore VS Code workspace settings (keep this line to ignore the folder)
-.gemini/
-.claude/
-.path/
-.Rhistory
-.RData
-.Rproj.user/
-*.png
-*.csv
-.rds
-*.rda
-*.RDA
-*.log
-*.LOG
-*.pdf
-*.PDF
-.Ruserdata
-.Rbuildignore
-.Rproj
-.Rhistory
-.bak
-.proj
-*.png
-# Temporary MESMA results
-/temp_results/
-
-# Additional file types to ignore
-*.txt
-*.bat
-*.json
-.Rprofile
-
-# Ignore R binary data files
-*.rds
+# Allow directories (needed to traverse into them)
+!*/
