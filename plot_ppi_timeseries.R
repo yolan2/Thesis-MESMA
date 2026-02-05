@@ -64,7 +64,8 @@ if (file.exists("mesma_helpers.R")) {
 # Define input file paths
 INPUT_CSV <- "C:/Users/yolan/OneDrive/Documenten/UGENT/Master/masterproef/phenology_results/hls_phenology_data.csv"
 GEOJSON_PATH <- "C:/Users/yolan/OneDrive/Documenten/UGENT/Master/masterproef/GIS/updated_zuizer_zonder_foto_UTM.geojson"
-OUTPUT_DIR <- "C:/Users/yolan/OneDrive/Documenten/UGENT/Master/masterproef/phenology_results"
+OUTPUT_DIR <- "C:/MAP/ppi_timeseries_results"
+if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
 
 # Load the phenology data
 cat("Loading data from:", INPUT_CSV, "\n")

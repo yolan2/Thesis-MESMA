@@ -15,12 +15,13 @@ library(lubridate)
 library(ggplot2) # plotting (prototype plots)
 
 # --- CONFIG ---
-INPUT_CSV <- ifelse(length(commandArgs(trailingOnly = TRUE)) >= 1, commandArgs(trailingOnly = TRUE)[1],
-                    "C:/Users/yolan/Downloads/LS_S2_Harmonized_Timeseries.csv")
+INPUT_CSV <- "C:\Users\yolan\Downloads\LS_S2_Harmonized_Timeseries_training.csv"
 INFERENCE_CSV <- "C:/Users/yolan/OneDrive/Documenten/UGENT/Master/masterproef/GIS/landsat_lower_inference.csv"
+OUTPUT_DIR <- "C:/MAP/svm_results"
+if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
 OOB_TUNING_FRACTION <- ifelse(length(commandArgs(trailingOnly = TRUE)) >= 2, as.numeric(commandArgs(trailingOnly = TRUE)[2]), 0.10)
 SVM_COST <- ifelse(length(commandArgs(trailingOnly = TRUE)) >= 3, as.numeric(commandArgs(trailingOnly = TRUE)[3]), 1)
-PCA_LDA_THRESHOLD_CANDIDATES <- c(0, 0.10, 0.20, 0.30, 0.40, 0.50)
+PCA_LDA_THRESHOLD_CANDIDATES <- c(0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95)
 TEMPORAL_AGGREGATION_DAYS <- 10L
 TEMPORAL_BUDGET <- ceiling(365 / TEMPORAL_AGGREGATION_DAYS)
 PRUNE_ZERO_MIN_FEATURES <- 1
@@ -258,7 +259,7 @@ plot_vegetation_prototypes <- function(lib, indices = NULL, out_dir = "prototype
   if (is.null(lib) || length(lib) == 0) return(NULL)
   if (is.null(indices)) indices <- avail
   if (!requireNamespace("ggplot2", quietly = TRUE)) stop("ggplot2 required for prototype plotting")
-  if (!dir.exists(out_dir) && save_png) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  if (!dir.exists(file.path(OUTPUT_DIR, out_dir)) && save_png) dir.create(file.path(OUTPUT_DIR, out_dir), recursive = TRUE, showWarnings = FALSE)
 
   rows <- list()
   for (v in names(lib)) {
@@ -361,7 +362,7 @@ plot_vegetation_prototypes <- function(lib, indices = NULL, out_dir = "prototype
 
     plots[[idx]] <- p
     if (save_png) {
-      fn <- file.path(out_dir, sprintf("%s_%s.png", prefix, idx))
+      fn <- file.path(OUTPUT_DIR, out_dir, sprintf("%s_%s.png", prefix, idx))
       ggplot2::ggsave(filename = fn, plot = p, width = 8, height = 4, dpi = dpi)
     }
   }
@@ -462,7 +463,6 @@ compute_indices_from_bands <- function(df) {
 
   if (all(c('nir','red') %in% names(df))) df$MSAVI2 <- (2 * as.numeric(df$nir) + 1 - sqrt(pmax(0, (2 * as.numeric(df$nir) + 1)^2 - 8 * (as.numeric(df$nir) - as.numeric(df$red))))) / 2
   if (all(c('nir','swir1') %in% names(df))) df$NDMI <- (as.numeric(df$nir) - as.numeric(df$swir1)) / (as.numeric(df$nir) + as.numeric(df$swir1) + eps)
-  if ('WDVI' %in% names(df) && 'swir1' %in% names(df)) df$WDVI_BY_SWIR1 <- as.numeric(df$WDVI) / (as.numeric(df$swir1) + eps)
   if (all(c('nir','red','blue') %in% names(df))) df$EVI <- 2.5 * ((as.numeric(df$nir) - as.numeric(df$red)) / (as.numeric(df$nir) + 6 * as.numeric(df$red) - 7.5 * as.numeric(df$blue) + 1 + eps))
   if (all(c('swir1','swir2') %in% names(df))) df$NDTI <- (as.numeric(df$swir1) - as.numeric(df$swir2)) / (as.numeric(df$swir1) + as.numeric(df$swir2) + eps)
   if (all(c('green','swir1') %in% names(df))) df$NDSI <- (as.numeric(df$green) - as.numeric(df$swir1)) / (as.numeric(df$green) + as.numeric(df$swir1) + eps)
@@ -497,7 +497,7 @@ if ("NDVI" %in% names(df)) {
 }
 
 # Simple index normalization (use column set from data)
-cols_to_norm <- intersect(names(df), c("WDVI","WDVI_BY_SWIR1","GVI","NIRv","PSRI","MSAVI2","NDMI","PPI","EVI","NDTI","SATVI","CIG","BSI","NBR","TCW","TCB","TCG","NDWI","NDBI","MSI","VARI","SIPI","ARVI","GNDVI"))
+cols_to_norm <- intersect(names(df), c("WDVI","GVI","NIRv","PSRI","MSAVI2","NDMI","EVI","NDTI","SATVI","CIG","BSI","TCW","TCB","TCG","NDWI","NDBI","MSI","SIPI","ARVI","GNDVI"))
 norm_res <- normalize_mesma_data(df, cols_to_norm)
 df <- norm_res$df
 
@@ -593,12 +593,12 @@ cat(sprintf("[SVM] Final OOB accuracy = %.4f (n=%d)\n", acc, length(y_oob)))
 tryCatch({
   cm <- table(True = y_oob, Predicted = preds)
   # Save raw confusion matrix
-  cm_file <- "svm_oob_confusion_matrix.csv"
+  cm_file <- file.path(OUTPUT_DIR, "svm_oob_confusion_matrix.csv")
   write.csv(as.data.frame.matrix(cm), file = cm_file, row.names = TRUE)
   cat(sprintf("[SAVE] Wrote OOB confusion matrix to %s\n", cm_file))
 
   # Save row-normalized confusion matrix (recall per class)
-  cm_row_file <- "svm_oob_confusion_matrix_row_normalized.csv"
+  cm_row_file <- file.path(OUTPUT_DIR, "svm_oob_confusion_matrix_row_normalized.csv")
   write.csv(as.data.frame.matrix(prop.table(cm, 1)), file = cm_row_file, row.names = TRUE)
   cat(sprintf("[SAVE] Wrote row-normalized OOB confusion matrix to %s\n", cm_row_file))
 
@@ -606,7 +606,7 @@ tryCatch({
   recall <- ifelse(rowSums(cm) > 0, diag(cm) / rowSums(cm), NA_real_)
   precision <- ifelse(colSums(cm) > 0, diag(cm) / colSums(cm), NA_real_)
   metrics <- data.frame(class = names(recall), recall = as.numeric(recall), precision = as.numeric(precision))
-  write.csv(metrics, file = "svm_oob_confusion_metrics.csv", row.names = FALSE)
+  write.csv(metrics, file = file.path(OUTPUT_DIR, "svm_oob_confusion_metrics.csv"), row.names = FALSE)
   cat("[SAVE] Wrote OOB confusion metrics to svm_oob_confusion_metrics.csv\n")
 
   # Plot heatmap using ggplot2 if available
@@ -619,7 +619,7 @@ tryCatch({
       ggplot2::scale_fill_gradient(low = "white", high = "steelblue") +
       ggplot2::theme_minimal() +
       ggplot2::labs(title = "SVM OOB Confusion Matrix", x = "Predicted", y = "True")
-    ggsave_file <- "svm_oob_confusion_matrix.png"
+    ggsave_file <- file.path(OUTPUT_DIR, "svm_oob_confusion_matrix.png")
     ggplot2::ggsave(ggsave_file, plot = p, width = 6, height = 5, dpi = 150)
     cat(sprintf("[SAVE] Wrote OOB confusion matrix plot to %s\n", ggsave_file))
   } else {
@@ -660,7 +660,7 @@ tryCatch({
     lower <- apply(bs_mat, 1, quantile, probs = 0.025, na.rm = TRUE)
     upper <- apply(bs_mat, 1, quantile, probs = 0.975, na.rm = TRUE)
     out_df <- data.frame(class = rownames(bs_mat), prop = mean_prop, lower = lower, upper = upper)
-    write.csv(out_df, file = "svm_oob_location_fraction_bootstrap.csv", row.names = FALSE)
+    write.csv(out_df, file = file.path(OUTPUT_DIR, "svm_oob_location_fraction_bootstrap.csv"), row.names = FALSE)
     cat("[SAVE] Wrote location-level bootstrap fractions to svm_oob_location_fraction_bootstrap.csv\n")
 
     # Plot
@@ -670,7 +670,7 @@ tryCatch({
         ggplot2::geom_errorbar(ggplot2::aes(ymin = lower, ymax = upper), width = 0.2) +
         ggplot2::labs(title = "OOB: % of locations predicted per class (bootstrap 95% CI)", x = "Class", y = "Proportion of locations") +
         ggplot2::theme_minimal()
-      ggplot2::ggsave("svm_oob_location_fraction.png", plot = p2, width = 6, height = 4, dpi = 150)
+      ggplot2::ggsave(file.path(OUTPUT_DIR, "svm_oob_location_fraction.png"), plot = p2, width = 6, height = 4, dpi = 150)
       cat("[SAVE] Wrote OOB location fraction plot to svm_oob_location_fraction.png\n")
     } else {
       cat("[WARN] ggplot2 not available; skipping location-level fraction plot\n")
@@ -682,7 +682,7 @@ tryCatch({
 
 # Save training normalization parameters for inference use
 TRAINING_NORM_PARAMS <- list(INDEX_SCALES = norm_res$INDEX_SCALES)
-saveRDS(TRAINING_NORM_PARAMS, file = "training_norm_params.rds")
+saveRDS(TRAINING_NORM_PARAMS, file = file.path(OUTPUT_DIR, "training_norm_params.rds"))
 cat("[SAVE] Saved training normalization params to training_norm_params.rds\n")
 
 # Build simple prototype library (medoid per class) and generate prototype plots to match original pipeline
@@ -718,7 +718,7 @@ for (cls in unique_classes) {
 
 # Generate prototype plots (matches original behavior)
 tryCatch({
-  plot_vegetation_prototypes(res_lib, indices = avail, out_dir = file.path("prototype_plots"))
+  plot_vegetation_prototypes(res_lib, indices = avail, out_dir = file.path(OUTPUT_DIR, "prototype_plots"))
   cat(sprintf("[PLOTS] Generated prototype plots (dir=prototype_plots)\n"))
 }, error = function(e) cat(sprintf("[WARN] Prototype plotting failed: %s\n", e$message)))
 
@@ -730,7 +730,7 @@ if (file.exists(INFERENCE_CSV)) {
   if (!"pheno_year" %in% names(df_inf)) df_inf$pheno_year <- assign_pheno_year(df_inf$date)
   if (!"doy" %in% names(df_inf)) df_inf$doy <- pheno_doy(df_inf$date)
   df_inf <- apply_stored_normalization(df_inf, TRAINING_NORM_PARAMS)
-  saveRDS(df_inf, file = "df_inference_processed.rds")
+  saveRDS(df_inf, file = file.path(OUTPUT_DIR, "df_inference_processed.rds"))
   cat("[INFERENCE] Saved processed inference data to df_inference_processed.rds\n")
 
   # Build per-trace pentad vectors for inference and predict class probabilities using final SVM
@@ -784,7 +784,7 @@ if (file.exists(INFERENCE_CSV)) {
       # Ensure probability columns are numeric
       prob_cols <- setdiff(names(pred_df), c("location_id", "pheno_year", "predicted"))
       for (cname in prob_cols) pred_df[[cname]] <- as.numeric(as.character(pred_df[[cname]]))
-      write.csv(pred_df, file = "svm_inference_cover.csv", row.names = FALSE)
+      write.csv(pred_df, file = file.path(OUTPUT_DIR, "svm_inference_cover.csv"), row.names = FALSE)
       cat(sprintf("[INFERENCE] Saved SVM inference cover predictions to svm_inference_cover.csv (rows=%d)\n", nrow(pred_df)))
     } else {
       cat("[INFERENCE] No valid inference traces produced predictions\n")
@@ -796,10 +796,10 @@ if (file.exists(INFERENCE_CSV)) {
 }
 
 # Save final artifacts (SVM model, thresholds, and training splits)
-saveRDS(svm_model, file = "svm_pca_lda_model.rds")
-write.csv(threshold_results, file = "svm_threshold_results.csv", row.names = FALSE)
-saveRDS(df_train_model, file = "df_train_model.rds")
-saveRDS(df_train_oob, file = "df_train_oob.rds")
+saveRDS(svm_model, file = file.path(OUTPUT_DIR, "svm_pca_lda_model.rds"))
+write.csv(threshold_results, file = file.path(OUTPUT_DIR, "svm_threshold_results.csv"), row.names = FALSE)
+saveRDS(df_train_model, file = file.path(OUTPUT_DIR, "df_train_model.rds"))
+saveRDS(df_train_oob, file = file.path(OUTPUT_DIR, "df_train_oob.rds"))
 cat("[SAVE] Saved svm model, threshold results, and train/oob datasets\n")
 
 # Exit normally

@@ -133,14 +133,16 @@ remove_large_outliers <- function(df, candidates = NULL, mad_thresh = OUTLIER_MA
         tryCatch({
           x <- sub$doy[finite_idx]
           y <- colv[finite_idx]
-          fit1 <- stats::smooth.spline(x, y, df = min(5, length(x)/2))
+          n_unique <- length(unique(x))
+          fit1 <- stats::smooth.spline(x, y, df = min(5, length(x)/2, n_unique - 1))
           pred1 <- predict(fit1, x)$y
           res1 <- y - pred1
           mad1 <- stats::mad(res1, na.rm = TRUE)
           if (!is.finite(mad1) || mad1 <= 1e-6) stop("Invalid MAD")
           keep_mask <- abs(res1 - stats::median(res1, na.rm = TRUE)) <= (mad_thresh * 1.5 * mad1)
           if (sum(keep_mask) >= 5) {
-            fit2 <- stats::smooth.spline(x[keep_mask], y[keep_mask], df = min(5, sum(keep_mask)/2))
+            n_unique2 <- length(unique(x[keep_mask]))
+            fit2 <- stats::smooth.spline(x[keep_mask], y[keep_mask], df = min(5, sum(keep_mask)/2, n_unique2 - 1))
             pred_final <- predict(fit2, x)$y
           } else {
             pred_final <- pred1
@@ -1187,7 +1189,7 @@ estimate_fvc_from_index <- function(df, index_name, model_list = FVC_MODELS) {
 assign("FVC_CALIBRATION_MODELS", FVC_MODELS, envir = globalenv())
 cat("FVC calibration models stored in global environment as 'FVC_CALIBRATION_MODELS'\n")
 # Persist models to disk so other scripts (e.g., fit_veg_mixture_mesma.R) can load them without re-fitting
-model_file <- file.path(getwd(), "fvc_calibration_models.rds")
+model_file <- file.path(output_dir, "fvc_calibration_models.rds")
 tryCatch({
   # Before saving, ensure MSAVI canonical key points to the best-performing MSAVI variant
   msavi_candidates <- intersect(names(FVC_MODELS), c("MSAVI_median", "MSAVI2_median", "MSAVI", "MSAVI2"))
@@ -1439,7 +1441,7 @@ for (idx in plot_candidates) {
   leg_pch <- c(rep(NA_integer_, length(legend_txt)), rep(20L, length(legend_labels)))
 
   # Open PNG device and create the plot
-  plot_file <- file.path(getwd(), sprintf("fvc_vs_%s_allveg.png", idx))
+  plot_file <- file.path(output_dir, sprintf("fvc_vs_%s_allveg.png", idx))
   png(plot_file, width = 800, height = 600)
   plot(plot_df[[idx]], plot_df$fraction_veg, pch = 20, col = point_cols, xlab = idx, ylab = "Fraction vegetation (ground truth)", main = sprintf("FVC vs %s (all veg types)", idx), ylim = c(0,1), xlim = c(min(x_seq, na.rm=TRUE), max(x_seq, na.rm=TRUE)))
   lines(x_seq, y_pred_grid, col = "blue", lwd = 2)
@@ -1497,7 +1499,7 @@ if (length(median_cols) == 0) {
 }
 
 # --- Plot FVC vs PPI (prefer median variant if available) and save R² and RMSE ---
-plot_file <- file.path(getwd(), sprintf("fvc_vs_ppi_median.png"))
+plot_file <- file.path(output_dir, sprintf("fvc_vs_ppi_median.png"))
 ppi_col <- if ("PPI_median" %in% names(mixtures)) "PPI_median" else if ("PPI" %in% names(mixtures)) "PPI" else NA_character_
 if (!is.na(ppi_col)) {
   plot_df <- mixtures[is.finite(mixtures[[ppi_col]]) & is.finite(mixtures$fraction_veg), , drop = FALSE]
@@ -1638,7 +1640,7 @@ if (!is.na(ppi_col)) {
       y_pred_grid[!is.finite(y_pred_grid)] <- NA_real_
 
       # Use fixed filename (no date/time) to avoid embedding system timestamps
-      ndvi_plot_file <- file.path(getwd(), "fvc_vs_ndvi.png")
+      ndvi_plot_file <- file.path(output_dir, "fvc_vs_ndvi.png")
       png(ndvi_plot_file, width = 800, height = 600)
       if ("Veg" %in% names(plot_df)) {
         veg_levels <- unique(na.omit(as.character(plot_df$Veg)))
@@ -1709,7 +1711,7 @@ if (!is.na(evi_col)) {
       y_pred_grid[!is.finite(y_pred_grid)] <- NA_real_
 
       # Use fixed filename (no date/time) to avoid embedding system timestamps
-      evi_plot_file <- file.path(getwd(), "fvc_vs_evi.png")
+      evi_plot_file <- file.path(output_dir, "fvc_vs_evi.png")
       png(evi_plot_file, width = 800, height = 600)
       if ("Veg" %in% names(plot_df)) {
         veg_levels <- unique(na.omit(as.character(plot_df$Veg)))
@@ -1742,7 +1744,7 @@ if (!is.na(evi_col)) {
       # Save EVI estimator to disk alongside other models (FVC_MODELS already saved earlier), also save individual plot path to model_entry if useful
       # Add model_entry to FVC_MODELS (should already be present), then resave models file
       tryCatch({
-        model_file <- file.path(getwd(), "FVC_MODELS.rds")
+        model_file <- file.path(output_dir, "FVC_MODELS.rds")
         if (exists("FVC_MODELS", envir = globalenv())) saveRDS(get("FVC_MODELS", envir = globalenv()), file = model_file)
         cat(sprintf("[FVC] Saved FVC_MODELS (including EVI) to: %s\n", model_file))
       }, error = function(e) cat(sprintf("[FVC] Failed to save FVC_MODELS: %s\n", e$message)))
@@ -2717,7 +2719,7 @@ cat("\n=== SUMMARY TABLE (excluding Veg=='barren') ===\n")
 print(summary_table)
 
 # Optional: Save results to Excel
-output_dir <- "C:/Users/yolan/OneDrive/Documenten/UGENT/Master/masterproef/phenology_results"
+output_dir <- "C:/MAP/january_averages_results"
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
 results_list <- list(

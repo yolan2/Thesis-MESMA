@@ -404,7 +404,8 @@ mixtures <- calculate_indices(mixtures)
 cat("\nPerforming linearity diagnostics and generating plots for mixtures...\n")
 
 # Prepare output directory
-out_dir <- "linearity_plots"
+OUTPUT_DIR <- "C:/MAP/linearity_results"
+out_dir <- file.path(OUTPUT_DIR, "linearity_plots")
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
 # Indices to check (intersect with available columns)
@@ -497,7 +498,7 @@ for (vt in names(veg_endmembers)) {
 # Combine and write out scores
 if (length(scores) > 0) {
   scores_df <- do.call(rbind, scores)
-  scores_out <- "index_linearity_scores_with_coefficients.csv"
+  scores_out <- file.path(OUTPUT_DIR, "index_linearity_scores_with_coefficients.csv")
   write.csv(scores_df, file = scores_out, row.names = FALSE)
   cat(sprintf("Wrote linearity scores to %s\n", scores_out))
 } else {
