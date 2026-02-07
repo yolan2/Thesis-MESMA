@@ -53,9 +53,9 @@ if (!exists("setup_parallel_backend", mode = "function")) {
   stop("`setup_parallel_backend` function not found after attempting to source 'init_mesma.R'. Please ensure 'init_mesma.R' is present and defines this function.")
 }
 
-INPUT_CSV <- "C:\\Users\\yolan\\Downloads\\LS_S2_Harmonized_Timeseries_training.csv"
+INPUT_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_train.csv"
                                  # Path to the input CSV used for training. Replace with your own file path.
-INFERENCE_CSV <- "C:\\Users\\yolan\\Downloads\\LS_S2_Harmonized_Timeseries_kon.csv"
+INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_mid.csv"
                                  # Path for spatial inference input (set to NA to disable inference steps).
 
 
@@ -69,7 +69,7 @@ QUIET_MODE <- TRUE
 
 PARALLEL_ENABLE <- TRUE
 
-PARALLEL_WORKERS <- 3            # # workers to spawn when PARALLEL_ENABLE=TRUE for general tasks (keep small for memory reasons)
+PARALLEL_WORKERS <- 4            # # workers to spawn when PARALLEL_ENABLE=TRUE for general tasks (keep small for memory reasons)
 PERMUTATION_PARALLEL_WORKERS <- 30  # # workers to use specifically for permutation testing (can be larger than PARALLEL_WORKERS)
 # Stage-2 (pentad-level) significance threshold - less strict than index-level
 
@@ -214,11 +214,6 @@ MIN_UNIQUE_DOY_INFERENCE <- 3L  # Less strict for inference to allow sparse inpu
 # Modeling/algorithmic caps and defaults
 ENABLE_LDA_L2_NORMALIZATION <- TRUE # L2-normalize training samples to focus on temporal shape rather than amplitude.
                                      # Set TRUE to emphasize shape; FALSE to preserve brightness differences.
-                                     # Ignored if ENABLE_DUAL_REPRESENTATION is TRUE.
-
-ENABLE_DUAL_REPRESENTATION <- FALSE  # If TRUE, include BOTH raw and L2-normalized features in the model.
-                                     # This doubles the feature count but lets the model learn which
-                                     # representation works best for each index. Overrides ENABLE_LDA_L2_NORMALIZATION.
 
 GAM_K_MAX <- 10                  # Max basis dimension for GAM fits. Larger -> more flexible curves but risk overfitting.
 GAM_GAMMA <- 1.0                 # Regularization / smoothing strength for GAM (higher -> smoother).
@@ -261,9 +256,9 @@ PRUNE_ZERO_MIN_FEATURES <- 3
 # Features whose permutation doesn't significantly degrade performance are pruned.
 OOB_TUNING_FRACTION <- 0.10         # Fraction held out for cluster optimization evaluation
 PERMUTATION_N_ITER <- 200            # Number of permutations per feature for significance testing
-PERMUTATION_ALPHA <- 0.1          # Significance level (one-sided test)
+PERMUTATION_ALPHA <- 0.01          # Significance level (one-sided test)
 # Higher alpha = easier to keep pentads (more lenient)
-PERMUTATION_PENTAD_ALPHA <- 0.40
+PERMUTATION_PENTAD_ALPHA <- 0.05
 PERMUTATION_MIN_SAMPLES <- 20       # Minimum OOB samples required for testing
 
 
@@ -581,17 +576,6 @@ if ("location_id" %in% names(raw_df) && !is.character(raw_df$location_id)) {
 
 
 df <- raw_df
-
-# === FILTER OUT SENTINEL-2 RECORDS ===
-# Keep only Landsat observations (LANDSAT_8, LANDSAT_9), exclude SENTINEL_2
-if ("satellite" %in% names(df)) {
-  total_before <- nrow(df)
-  sentinel_count <- sum(grepl("SENTINEL", df$satellite, ignore.case = TRUE), na.rm = TRUE)
-  df <- df[!grepl("SENTINEL", df$satellite, ignore.case = TRUE), , drop = FALSE]
-  cat(sprintf("[SATELLITE FILTER] Filtered out %d Sentinel-2 observations (keeping Landsat only)\n", sentinel_count))
-  cat(sprintf("[SATELLITE FILTER] Dataset after Sentinel filtering: %d rows from %d locations\n",
-              nrow(df), length(unique(df$location_id))))
-}
 
 # Preserve zenith.angle if present (e.g. from metadata), otherwise allow recalculation
 if ("zenith.angle" %in% names(df)) {
@@ -1260,9 +1244,7 @@ cat(sprintf("Temporal aggregation: %d days (%d bins)\n", TEMPORAL_AGGREGATION_DA
 
 cat("\n=== TRAIN/INFERENCE DATA CONFIGURATION ===\n")
 cat(sprintf("Training years (config): %s\n", paste(TRAIN_YEARS, collapse = ", ")))
-if (isTRUE(ENABLE_DUAL_REPRESENTATION)) {
-  cat("Feature representation: DUAL (raw + L2-normalized)\n")
-} else if (isTRUE(ENABLE_LDA_L2_NORMALIZATION)) {
+if (isTRUE(ENABLE_LDA_L2_NORMALIZATION)) {
   cat("Feature representation: L2-normalized only\n")
 } else {
   cat("Feature representation: Raw only\n")
@@ -1622,28 +1604,9 @@ train_feature_pipeline <- function(df, class_col, feature_cols) {
   n_idx_local <- length(feature_cols)
 
   # Determine representation mode
-  dual_mode <- isTRUE(ENABLE_DUAL_REPRESENTATION)
-  l2_only_mode <- !dual_mode && isTRUE(ENABLE_LDA_L2_NORMALIZATION)
+  l2_only_mode <- isTRUE(ENABLE_LDA_L2_NORMALIZATION)
 
-  if (dual_mode) {
-    # DUAL REPRESENTATION: include both raw and L2-normalized features
-    cat(sprintf("  DUAL REPRESENTATION: creating both raw and L2-normalized features for %d indices...\n", n_idx_local))
-
-    # Create L2-normalized version
-    X_mat_l2 <- t(apply(X_mat_raw, 1, function(r) {
-      l2_normalize_perindex(r, n_idx_local, n_bins_local)
-    }))
-
-    # Concatenate: [raw_idx1, raw_idx2, ..., l2_idx1, l2_idx2, ...]
-    X_mat <- cbind(X_mat_raw, X_mat_l2)
-
-    # Create combined feature names
-    l2_feature_cols <- paste0("L2norm_", feature_cols)
-    all_feature_cols <- c(feature_cols, l2_feature_cols)
-
-    cat(sprintf("  Created %d total features: %d raw + %d L2-normalized\n",
-                length(all_feature_cols), length(feature_cols), length(l2_feature_cols)))
-  } else if (l2_only_mode) {
+  if (l2_only_mode) {
     # L2 ONLY: replace raw with L2-normalized
     cat(sprintf("  L2-normalizing training samples for %d indices (%d pentads each)...\n",
                 n_idx_local, n_bins_local))
@@ -1734,7 +1697,6 @@ train_feature_pipeline <- function(df, class_col, feature_cols) {
       weights = final_weights,
       indices = all_feature_cols,
       base_indices = feature_cols,
-      dual_mode = dual_mode,
       l2_normalize = l2_only_mode
     ))
   }
@@ -1764,7 +1726,6 @@ train_feature_pipeline <- function(df, class_col, feature_cols) {
     weights = final_weights,
     indices = all_feature_cols,
     base_indices = feature_cols,
-    dual_mode = dual_mode,
     l2_normalize = l2_only_mode
   ))
 }
@@ -4058,6 +4019,10 @@ load_and_prepare_inference_data <- function() {
 
       dvi_soil_arg <- NA_real_
       
+      # Defensive: ensure `ppi_inf_res` exists so downstream checks do not error when
+      # the auto-add branch is skipped (was causing "object 'ppi_inf_res' not found").
+      ppi_inf_res <- NULL
+      
       # If PPI not in df_inf, try to add it
       if (exists("auto_add_ppi_columns") && "PPI" %in% avail && !"PPI" %in% names(df_inf)) {
                     # Attempt to auto-add PPI to inference data using per-location baselines only.
@@ -4769,7 +4734,6 @@ load_and_prepare_inference_data <- function() {
 
     # Helper function to build storage from a dataframe
     build_storage_from_df <- function(df_source, storage_list, meta_list, source_name = "train") {
-      dual_mode <- isTRUE(params$dual_mode)
       l2_normalize <- isTRUE(params$l2_normalize)
       base_indices <- if (!is.null(params$base_indices)) params$base_indices else indices
       n_base_idx <- length(base_indices)
@@ -4800,13 +4764,7 @@ load_and_prepare_inference_data <- function() {
           veg_mat_raw <- do.call(rbind, veg_list)
 
           if(ncol(veg_mat_raw) == expected_base_cols) {
-            if (dual_mode) {
-              # DUAL MODE: create both raw and L2-normalized, then concatenate
-              veg_mat_l2 <- t(apply(veg_mat_raw, 1, function(r) {
-                l2_normalize_perindex(r, n_base_idx, TEMPORAL_BUDGET)
-              }))
-              veg_mat <- cbind(veg_mat_raw, veg_mat_l2)
-            } else if (l2_normalize) {
+            if (l2_normalize) {
               # L2 ONLY MODE
               veg_mat <- t(apply(veg_mat_raw, 1, function(r) {
                 l2_normalize_perindex(r, n_base_idx, TEMPORAL_BUDGET)
@@ -5522,13 +5480,42 @@ load_and_prepare_inference_data <- function() {
     }
 
     # Optional: Generate prototype plots (one plot per index/band) showing endmember centers across pentads
-    plot_vegetation_prototypes <- function(lib, indices = NULL, out_dir = if (exists("OUT_DIR")) OUT_DIR else ".", prefix = "veg_prototypes", save_png = TRUE, dpi = 150) {
+    plot_vegetation_prototypes <- function(lib, indices = NULL, out_dir = if (exists("OUT_DIR")) OUT_DIR else ".", prefix = "veg_prototypes", save_png = TRUE, dpi = 150, feature_weights = NULL) {
       if (is.null(lib) || length(lib) == 0) return(NULL)
       if (is.null(indices)) {
         if (exists("MESMA_PARAMS") && !is.null(MESMA_PARAMS) && !is.null(MESMA_PARAMS$indices)) indices <- MESMA_PARAMS$indices else indices <- OPTIMAL_INDICES
       }
       if (!requireNamespace("ggplot2", quietly = TRUE)) stop("ggplot2 required for prototype plotting")
       if (!dir.exists(out_dir) && save_png) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+      # Precompute pentad-to-month mapping for x-axis (pheno year: Mar=1)
+      # Month start days in phenological DOY (March 1 = day 1)
+      pheno_month_starts <- c(1, 32, 62, 93, 123, 154, 184, 215, 245, 276, 306, 337)
+      pheno_month_labels <- c("Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec","Jan","Feb")
+      # Convert month-start pheno DOY to pentad position: pentad = ceil(doy / agg_days)
+      month_breaks_pentad <- ceiling(pheno_month_starts / TEMPORAL_AGGREGATION_DAYS)
+      # Keep only unique breaks within the temporal budget
+      keep <- month_breaks_pentad >= 1 & month_breaks_pentad <= TEMPORAL_BUDGET & !duplicated(month_breaks_pentad)
+      month_breaks_pentad <- month_breaks_pentad[keep]
+      month_labels <- pheno_month_labels[keep]
+
+      # Build per-index significance mask from feature_weights (0 = pruned / non-significant)
+      sig_mask <- NULL
+      if (!is.null(feature_weights) && length(feature_weights) == length(indices) * TEMPORAL_BUDGET) {
+        sig_mask <- list()
+        for (k in seq_len(length(indices))) {
+          w_start <- (k - 1) * TEMPORAL_BUDGET + 1
+          w_end <- k * TEMPORAL_BUDGET
+          sig_mask[[indices[k]]] <- feature_weights[w_start:w_end] > 0
+        }
+        # Drop fully-excluded indices (all pentad weights zero)
+        excluded <- names(sig_mask)[vapply(sig_mask, function(m) !any(m), logical(1))]
+        if (length(excluded) > 0) {
+          cat(sprintf("[PROTO PLOT] Skipping %d fully-excluded indices: %s\n", length(excluded), paste(excluded, collapse = ", ")))
+          indices <- setdiff(indices, excluded)
+          sig_mask <- sig_mask[indices]
+        }
+      }
 
       # Build long dataframe for plotting
       rows <- list()
@@ -5549,7 +5536,8 @@ load_and_prepare_inference_data <- function() {
             start <- (k-1) * TEMPORAL_BUDGET + 1
             end <- k * TEMPORAL_BUDGET
             vals <- vec[start:end]
-            df_tmp <- data.frame(pentad = seq_len(TEMPORAL_BUDGET), value = vals, Veg = v, variant_id = vid, index = idx_name, stringsAsFactors = FALSE)
+            sig <- if (!is.null(sig_mask) && idx_name %in% names(sig_mask)) sig_mask[[idx_name]] else rep(TRUE, TEMPORAL_BUDGET)
+            df_tmp <- data.frame(pentad = seq_len(TEMPORAL_BUDGET), value = vals, Veg = v, variant_id = vid, index = idx_name, significant = sig, stringsAsFactors = FALSE)
             rows[[length(rows) + 1]] <- df_tmp
           }
         }
@@ -5601,10 +5589,61 @@ load_and_prepare_inference_data <- function() {
         y_range <- y_max - y_min
         y_pad <- if (y_range > 0) y_range * 0.05 else 0.1
 
-        p <- ggplot2::ggplot(df_idx, ggplot2::aes(x = pentad, y = value, color = Veg, group = variant_id)) +
-             ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", size = 0.4) +
-             ggplot2::geom_line(alpha = 0.9, size = 0.8) +
-             ggplot2::labs(title = sprintf("Vegetation prototypes: %s", idx), x = "Pentad", y = sprintf("%s (endmember center)", idx)) +
+        # Determine which pentads are non-significant for this index
+        has_nonsig <- "significant" %in% names(df_idx) && any(!df_idx$significant)
+
+        p <- ggplot2::ggplot(df_idx, ggplot2::aes(x = pentad, y = value, group = variant_id)) +
+             ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", size = 0.4)
+
+        if (has_nonsig) {
+          # Add grey shading behind non-significant pentads
+          nonsig_pentads <- unique(df_idx$pentad[!df_idx$significant])
+          shade_df <- data.frame(xmin = nonsig_pentads - 0.5, xmax = nonsig_pentads + 0.5,
+                                 ymin = y_min - y_pad, ymax = y_max + y_pad)
+          p <- p + ggplot2::geom_rect(data = shade_df, inherit.aes = FALSE,
+                                      ggplot2::aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+                                      fill = "grey90", alpha = 0.5)
+
+          # Build segment data for each variant: colour segments by significance of both endpoints
+          seg_rows <- list()
+          for (vid in unique(df_idx$variant_id)) {
+            df_v <- df_idx[df_idx$variant_id == vid, , drop = FALSE]
+            df_v <- df_v[order(df_v$pentad), , drop = FALSE]
+            if (nrow(df_v) < 2) next
+            for (r in seq_len(nrow(df_v) - 1)) {
+              seg_rows[[length(seg_rows) + 1]] <- data.frame(
+                x = df_v$pentad[r], xend = df_v$pentad[r + 1],
+                y = df_v$value[r], yend = df_v$value[r + 1],
+                Veg = df_v$Veg[r], variant_id = vid,
+                seg_sig = df_v$significant[r] && df_v$significant[r + 1],
+                stringsAsFactors = FALSE
+              )
+            }
+          }
+          seg_df <- do.call(rbind, seg_rows)
+
+          # Draw non-significant segments greyed out
+          seg_nonsig <- seg_df[!seg_df$seg_sig, , drop = FALSE]
+          if (nrow(seg_nonsig) > 0) {
+            p <- p + ggplot2::geom_segment(data = seg_nonsig, inherit.aes = FALSE,
+                                           ggplot2::aes(x = x, xend = xend, y = y, yend = yend, group = variant_id),
+                                           color = "grey75", alpha = 0.5, size = 0.6)
+          }
+          # Draw significant segments with veg color
+          seg_sig <- seg_df[seg_df$seg_sig, , drop = FALSE]
+          if (nrow(seg_sig) > 0) {
+            p <- p + ggplot2::geom_segment(data = seg_sig, inherit.aes = FALSE,
+                                           ggplot2::aes(x = x, xend = xend, y = y, yend = yend, color = Veg, group = variant_id),
+                                           alpha = 0.9, size = 0.8)
+          }
+        } else {
+          # All pentads significant (or no weight info) - draw normally
+          p <- p + ggplot2::geom_line(ggplot2::aes(color = Veg), alpha = 0.9, size = 0.8)
+        }
+
+        p <- p +
+             ggplot2::labs(title = sprintf("Vegetation prototypes: %s", idx), x = "Month", y = sprintf("%s (endmember center)", idx)) +
+             ggplot2::scale_x_continuous(breaks = month_breaks_pentad, labels = month_labels) +
              ggplot2::theme_minimal() +
              ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5)) +
              ggplot2::scale_color_manual(values = veg_palette) +
@@ -5622,7 +5661,8 @@ load_and_prepare_inference_data <- function() {
       tryCatch({
         # Use params$indices (passed to this function) instead of MESMA_PARAMS which may not exist yet
         plot_indices <- if (!is.null(params) && !is.null(params$indices)) params$indices else indices
-        plot_vegetation_prototypes(res_lib, indices = plot_indices, out_dir = file.path(if (exists("OUT_DIR")) OUT_DIR else ".", "prototype_plots"))
+        plot_weights <- if (!is.null(params) && !is.null(params$weights)) params$weights else NULL
+        plot_vegetation_prototypes(res_lib, indices = plot_indices, out_dir = file.path(if (exists("OUT_DIR")) OUT_DIR else ".", "prototype_plots"), feature_weights = plot_weights)
         cat(sprintf("[NOTICE] Generated prototype plots to %s\n", file.path(if (exists("OUT_DIR")) OUT_DIR else ".", "prototype_plots")))
       }, error = function(e) {
         cat(sprintf("[WARN] Failed to generate prototype plots: %s\n", e$message))
@@ -5965,11 +6005,15 @@ build_spline_library <- function(df_train, indices, allowed_veg, spar = SPLINE_S
     all_plots <- do.call(rbind, plot_data_list)
     if (!is.null(all_plots) && nrow(all_plots) > 0) {
       tryCatch({
+        # Month-start positions in phenological DOY (March 1 = day 1)
+        spline_month_starts <- c(1, 32, 62, 93, 123, 154, 184, 215, 245, 276, 306, 337)
+        spline_month_labels <- c("Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec","Jan","Feb")
         p <- ggplot(all_plots, aes(x = DOY, y = Value, color = Veg)) +
           geom_line(size = 1) +
           facet_wrap(~Index, scales = "free_y") +
+          scale_x_continuous(breaks = spline_month_starts, labels = spline_month_labels) +
           theme_minimal() +
-          labs(title = "Class Phenology Splines", x = "Day of Year", y = "Index Value") +
+          labs(title = "Class Phenology Splines", x = "Month", y = "Index Value") +
           coord_cartesian(ylim = c(0, NA))
         out_path <- file.path(OUT_DIR, "spline_library_curves.png")
         if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
@@ -6417,16 +6461,12 @@ fit_one_task_spline <- function(task_data, spline_lib, indices, params, loc, yr)
     # Check minimum sample size
     n_oob_samples <- nrow(unique(oob_for_eval[, c("location_id", "pheno_year")]))
     if (n_oob_samples < PERMUTATION_MIN_SAMPLES) {
-      cat(sprintf("[PERMUTATION] WARNING: Only %d OOB samples (< min=%d). Skipping permutation testing.\n",
-                  n_oob_samples, PERMUTATION_MIN_SAMPLES))
-      optimal_threshold <- 0
-      pruned_indices <- avail
-      MESMA_PARAMS <- MESMA_PARAMS_INITIAL
+      stop(sprintf("[PERMUTATION] FATAL: Only %d OOB samples (< min=%d). Need more training data for permutation testing.",
+                   n_oob_samples, PERMUTATION_MIN_SAMPLES))
     } else {
 
       # Use feature list from params for permutation testing
       perm_indices <- if (!is.null(MESMA_PARAMS_INITIAL$indices)) MESMA_PARAMS_INITIAL$indices else avail
-      dual_mode <- isTRUE(MESMA_PARAMS_INITIAL$dual_mode)
       l2_normalize <- isTRUE(MESMA_PARAMS_INITIAL$l2_normalize)
 
       # Permutation importance support
@@ -6458,7 +6498,6 @@ fit_one_task_spline <- function(task_data, spline_lib, indices, params, loc, yr)
         indices <- params$indices
         base_indices <- if (!is.null(params$base_indices)) params$base_indices else indices
         n_base_idx <- length(base_indices)
-        dual_mode <- isTRUE(params$dual_mode)
         l2_normalize <- isTRUE(params$l2_normalize)
 
         oob_vecs <- vector("list", nrow(oob_traces))
@@ -6477,10 +6516,7 @@ fit_one_task_spline <- function(task_data, spline_lib, indices, params, loc, yr)
           vec_raw <- as.numeric(mat)
 
           # Build feature vector based on representation mode
-          if (dual_mode) {
-            vec_l2 <- l2_normalize_perindex(vec_raw, n_base_idx, n_bins)
-            vec <- c(vec_raw, vec_l2)
-          } else if (l2_normalize) {
+          if (l2_normalize) {
             vec <- l2_normalize_perindex(vec_raw, n_base_idx, n_bins)
           } else {
             vec <- vec_raw
@@ -6560,7 +6596,7 @@ fit_one_task_spline <- function(task_data, spline_lib, indices, params, loc, yr)
       cat(sprintf("[PERMUTATION] Baseline score (all features): %.4f\n", baseline_score))
 
       # === STAGE 1: Test indices ===
-      mode_str <- if (dual_mode) "DUAL" else if (l2_normalize) "L2" else "RAW"
+      mode_str <- if (l2_normalize) "L2" else "RAW"
       cat(sprintf("\n[PERMUTATION STAGE 1] Testing %d indices (%d permutations each) [mode=%s]...\n",
                   length(perm_indices), PERMUTATION_N_ITER, mode_str))
 
@@ -7179,39 +7215,30 @@ fit_one_task_spline <- function(task_data, spline_lib, indices, params, loc, yr)
       }
 
       # Re-train PCA-LDA with pruned features if pruning occurred
-      # IMPORTANT: train_feature_pipeline expects BASE indices only (not L2norm prefixed)
-      # In dual mode, it will add L2norm variants itself. So we need to extract base indices
-      # from pruned_indices (which may contain both raw and L2norm names).
-      pruned_base_indices <- unique(gsub("^L2norm_", "", pruned_indices))
+      pruned_base_indices <- unique(pruned_indices)
 
       if (length(pruned_base_indices) < length(avail)) {
-        cat(sprintf("\n[PERMUTATION] Re-training PCA-LDA with %d pruned base features...\n", length(pruned_base_indices)))
-        MESMA_PARAMS <- train_feature_pipeline(multi_class_data, "target_class", pruned_base_indices)
-        if (is.null(MESMA_PARAMS)) {
-          cat("[PERMUTATION] ERROR: Re-training failed. Using original features.\n")
-          MESMA_PARAMS <- MESMA_PARAMS_INITIAL
-          MESMA_PARAMS$weights <- apply_pruning_rules(MESMA_PARAMS$weights, MESMA_PARAMS$indices, TEMPORAL_BUDGET,
-                                                      indices_to_prune_stage1_full, repr_prune_full, pentads_to_prune)
-        } else {
-          cat(sprintf("[PERMUTATION] Re-training complete. New feature weights computed.\n"))
-          MESMA_PARAMS$weights <- apply_pruning_rules(MESMA_PARAMS$weights, MESMA_PARAMS$indices, TEMPORAL_BUDGET,
-                                                      indices_to_prune_stage1_full, repr_prune_full, pentads_to_prune)
-          # Update avail to use pruned base indices
-          avail <- pruned_base_indices
-          cat(sprintf("[PERMUTATION] Updated avail to %d base features\n", length(avail)))
-        }
+        avail <- pruned_base_indices
+        cat(sprintf("[PERMUTATION] Updated avail to %d pruned base features\n", length(avail)))
       } else {
-        cat("[PERMUTATION] No pruning performed. Using all features.\n")
-        MESMA_PARAMS <- MESMA_PARAMS_INITIAL
-        MESMA_PARAMS$weights <- apply_pruning_rules(MESMA_PARAMS$weights, MESMA_PARAMS$indices, TEMPORAL_BUDGET,
-                                                    indices_to_prune_stage1_full, repr_prune_full, pentads_to_prune)
+        cat("[PERMUTATION] No feature-level pruning performed.\n")
       }
+
+      # Always re-train PCA-LDA after permutation analysis so that weights
+      # reflect the actual active feature set (including pentad-level and
+      # representation-block pruning applied below).
+      cat(sprintf("\n[PERMUTATION] Re-training PCA-LDA with %d base features...\n", length(avail)))
+      MESMA_PARAMS <- train_feature_pipeline(multi_class_data, "target_class", avail)
+      if (is.null(MESMA_PARAMS)) {
+        stop("[PERMUTATION] FATAL: PCA-LDA re-training failed after permutation analysis. Cannot continue.")
+      }
+      cat("[PERMUTATION] Re-training complete. New feature weights computed.\n")
+      MESMA_PARAMS$weights <- apply_pruning_rules(MESMA_PARAMS$weights, MESMA_PARAMS$indices, TEMPORAL_BUDGET,
+                                                  indices_to_prune_stage1_full, repr_prune_full, pentads_to_prune)
     }
 
   } else {
-    cat("[PERMUTATION] No OOB data available, using initial weights without permutation testing\n")
-    MESMA_PARAMS <- MESMA_PARAMS_INITIAL
-    pruned_indices <- avail
+    stop("[PERMUTATION] FATAL: No OOB data available. OOB holdout is required for permutation testing and cluster optimization.")
   }
 
   if (!is.null(MESMA_PARAMS) && !is.null(MESMA_PARAMS$weights)) {
@@ -7244,7 +7271,6 @@ fit_one_task_spline <- function(task_data, spline_lib, indices, params, loc, yr)
       base_indices_cm <- if (!is.null(MESMA_PARAMS$base_indices)) MESMA_PARAMS$base_indices else avail
       indices_cm <- MESMA_PARAMS$indices
       n_base_idx_cm <- length(base_indices_cm)
-      dual_mode_cm <- isTRUE(MESMA_PARAMS$dual_mode)
       l2_normalize_cm <- isTRUE(MESMA_PARAMS$l2_normalize)
 
       class_endmembers <- list()
@@ -7265,10 +7291,7 @@ fit_one_task_spline <- function(task_data, spline_lib, indices, params, loc, yr)
             vec_raw <- as.numeric(mat)
 
             # Build feature vector based on representation mode
-            if (dual_mode_cm) {
-              vec_l2 <- l2_normalize_perindex(vec_raw, n_base_idx_cm, TEMPORAL_BUDGET)
-              vec <- c(vec_raw, vec_l2)
-            } else if (l2_normalize_cm) {
+            if (l2_normalize_cm) {
               vec <- l2_normalize_perindex(vec_raw, n_base_idx_cm, TEMPORAL_BUDGET)
             } else {
               vec <- vec_raw
@@ -7322,10 +7345,7 @@ fit_one_task_spline <- function(task_data, spline_lib, indices, params, loc, yr)
             vec_raw <- as.numeric(mat)
 
             # Build feature vector based on representation mode
-            if (dual_mode_cm) {
-              vec_l2 <- l2_normalize_perindex(vec_raw, n_base_idx_cm, TEMPORAL_BUDGET)
-              vec <- c(vec_raw, vec_l2)
-            } else if (l2_normalize_cm) {
+            if (l2_normalize_cm) {
               vec <- l2_normalize_perindex(vec_raw, n_base_idx_cm, TEMPORAL_BUDGET)
             } else {
               vec <- vec_raw
@@ -7434,6 +7454,16 @@ fit_one_task_spline <- function(task_data, spline_lib, indices, params, loc, yr)
     }, error = function(e) {
       cat(sprintf("[CONFUSION MATRIX] Error computing confusion matrix: %s\n", e$message))
     })
+  }
+
+  # === STEP 4b: Re-optimize cluster counts after PCA-LDA retraining ===
+  # Cluster counts from Step 2 were optimized with the initial (pre-pruning) weights.
+  # PCA-LDA was retrained after permutation analysis, so the distance metric used for
+  # clustering has changed. Clear precomputed counts to trigger re-optimization.
+  if (exists("OPTIMAL_CLUSTER_COUNTS", envir = globalenv())) {
+    cat("\n=== STEP 4b: Re-optimizing Cluster Counts with Final PCA-LDA Weights ===\n")
+    cat("[CLUSTER] PCA-LDA was retrained after permutation analysis - clearing precomputed cluster counts.\n")
+    rm("OPTIMAL_CLUSTER_COUNTS", envir = globalenv())
   }
 
   # MESMA UNMIXING: All endmembers (barren + veg types) treated equally
@@ -8121,25 +8151,15 @@ simple_residual_bootstrap <- function(residuals) {
       indices <- PARAMS$indices
       base_indices <- if (!is.null(PARAMS$base_indices)) PARAMS$base_indices else indices
       n_base_idx <- length(base_indices)
-      dual_mode <- isTRUE(PARAMS$dual_mode)
       l2_normalize <- isTRUE(PARAMS$l2_normalize)
 
       # Build feature vector based on representation mode
-      # Also update valid_mask to match the new feature vector length
-      if (dual_mode) {
-        # DUAL MODE: concatenate raw and L2-normalized
-        y_l2 <- l2_normalize_perindex(y_raw, n_base_idx, n_bins)
-        y_work <- c(y_raw, y_l2)
-        # Extend valid_mask: a position is valid if the corresponding raw position is valid
-        valid_mask <- c(valid_mask, valid_mask)
-      } else if (l2_normalize) {
+      if (l2_normalize) {
         # L2 ONLY MODE
         y_work <- l2_normalize_perindex(y_raw, n_base_idx, n_bins)
-        # valid_mask stays the same (same length as y_raw)
       } else {
         # RAW ONLY MODE
         y_work <- y_raw
-        # valid_mask stays the same
       }
 
       # Z-score values
