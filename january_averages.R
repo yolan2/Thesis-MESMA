@@ -10,7 +10,11 @@ library(MASS)
 # Ensure PPI helpers are loaded early so functions like calculate_solar_zenith are available
 if (!exists("calculate_solar_zenith") && file.exists("ppi_helpers.R")) source("ppi_helpers.R")
 # Optional visualization helpers (provide shading for excluded years)
-if (file.exists("mesma_helpers.R")) source("mesma_helpers.R")
+if (file.exists("mesma_helpers.R")) {
+  source("mesma_helpers.R")
+  # Ensure reproducible sampling when running this script standalone
+  set_mesma_seed()
+}
 
 # Provide a safe fallback logger so this script can run standalone
 if (!exists("write_debug", mode = "function")) {
@@ -86,6 +90,7 @@ OUTLIER_MAD_THRESHOLD <- 3.5
 # Remove large outliers robustly per (location_id, pheno_year) where possible, otherwise per-location.
 # Uses spline-based outlier detection for groups with sufficient data, otherwise falls back to MAD.
 remove_large_outliers <- function(df, candidates = NULL, mad_thresh = OUTLIER_MAD_THRESHOLD) {
+  if (!exists("OUTLIER_SPLINE_MAX_DF", inherits = TRUE)) OUTLIER_SPLINE_MAX_DF <- 10L
   if (!isTRUE(ENABLE_OUTLIER_REMOVAL)) return(df)
   if (is.null(candidates)) {
     # Use indices we know are meaningful: INDICES_OF_INTEREST + RAW_BANDS, if present
@@ -134,7 +139,7 @@ remove_large_outliers <- function(df, candidates = NULL, mad_thresh = OUTLIER_MA
           x <- sub$doy[finite_idx]
           y <- colv[finite_idx]
           n_unique <- length(unique(x))
-          fit1 <- stats::smooth.spline(x, y, df = min(5, length(x)/2, n_unique - 1))
+          fit1 <- stats::smooth.spline(x, y, df = min(OUTLIER_SPLINE_MAX_DF, length(x)/2, n_unique - 1))
           pred1 <- predict(fit1, x)$y
           res1 <- y - pred1
           mad1 <- stats::mad(res1, na.rm = TRUE)
@@ -142,7 +147,7 @@ remove_large_outliers <- function(df, candidates = NULL, mad_thresh = OUTLIER_MA
           keep_mask <- abs(res1 - stats::median(res1, na.rm = TRUE)) <= (mad_thresh * 1.5 * mad1)
           if (sum(keep_mask) >= 5) {
             n_unique2 <- length(unique(x[keep_mask]))
-            fit2 <- stats::smooth.spline(x[keep_mask], y[keep_mask], df = min(5, sum(keep_mask)/2, n_unique2 - 1))
+            fit2 <- stats::smooth.spline(x[keep_mask], y[keep_mask], df = min(OUTLIER_SPLINE_MAX_DF, sum(keep_mask)/2, n_unique2 - 1))
             pred_final <- predict(fit2, x)$y
           } else {
             pred_final <- pred1
@@ -240,24 +245,22 @@ assign_pheno_year <- function(d) {
   ifelse(is.na(d), NA_integer_, ifelse(lubridate::month(d) >= 3, lubridate::year(d), lubridate::year(d) - 1))
 }
 
-# Early Snow/Dust filtering (NDSI / NDDI) to remove contaminated observations before processing
-# MOVED UP to ensure PPI and Detrending happen on clean data
+# Early dust filtering (NDDI) to remove contaminated observations before processing
+# NOTE: snow-index (previously NDSI) removed; pipeline uses dust-only filtering (NDDI).
 eps <- 1e-9
-if (all(c('green','swir1') %in% names(df_raw))) df_raw$NDSI <- (as.numeric(df_raw$green) - as.numeric(df_raw$swir1)) / (as.numeric(df_raw$green) + as.numeric(df_raw$swir1) + eps)
 if (all(c('red','nir') %in% names(df_raw))) df_raw$NDDI <- (as.numeric(df_raw$red) - as.numeric(df_raw$nir)) / (as.numeric(df_raw$red) + as.numeric(df_raw$nir) + eps)
 
-if ("NDSI" %in% names(df_raw) && "NDDI" %in% names(df_raw)) {
-  snow_count <- sum(df_raw$NDSI > 0.4, na.rm = TRUE)
-  dust_count <- sum(df_raw$NDDI > 0.18, na.rm = TRUE)
+if ("NDDI" %in% names(df_raw)) {
+  dust_count <- sum(df_raw$NDDI > NDDI_DUST_THRESHOLD, na.rm = TRUE)
   total_before <- nrow(df_raw)
-  df_raw <- df_raw[!(df_raw$NDSI > 0.4 | df_raw$NDDI > 0.18), , drop = FALSE]
-  cat(sprintf("[FILTERING] Filtered out %d observations with snow/dust contamination\n", total_before - nrow(df_raw)))
+  df_raw <- df_raw[!(df_raw$NDDI > NDDI_DUST_THRESHOLD), , drop = FALSE]
+  cat(sprintf("[FILTERING] Filtered out %d observations with dust contamination (NDDI > %s)\n", total_before - nrow(df_raw), .nddi_thresh_fmt()))
 
   # Also remove large outliers early using the spectral outlier helper
   df_raw <- remove_large_outliers(df_raw)
 
   # Recalculate DVI soil baseline from the *filtered* training data so PPI computations use a post-filter baseline
-  # This ensures that seasonal baselines and PPI soil references are not biased by snow/dust or gross outliers.
+  # This ensures that seasonal baselines and PPI soil references are not biased by dust or gross outliers.
   tryCatch({
     compute_soil_line_slope(df_raw, assign_global_dvi = TRUE)
   }, error = function(e) {
@@ -1220,7 +1223,7 @@ tryCatch({
 cat("\n=== BUILDING VEG-TYPE-SPECIFIC FVC CALIBRATION MODELS ===\n")
 
 # Treat agri/agriculture as the same vegtype (aliases)
-AGRI_ALIASES <- c("agri", "agriculture", "agricultural")
+AGRI_ALIASES <- c("agri", "agric", "agriculture", "agricultural")
 # Veg types to build per-type models for (agri ignores no_soil flag; others require no_soil==1)
 NEW_VEG_TYPES <- c("agri", "tamarix", "populus", "herbs")
 # Per-veg color mapping (named vector)
@@ -1910,17 +1913,16 @@ if ("location_id" %in% names(df)) {
   }
 }
 
-# Early Snow/Dust filtering (NDSI / NDDI) on the raw input CSV to drop contaminated rows early
+# Early dust filtering (NDDI) on the raw input CSV to drop contaminated rows early
 eps <- 1e-9
-if (all(c('green','swir1') %in% names(df))) df$NDSI <- (as.numeric(df$green) - as.numeric(df$swir1)) / (as.numeric(df$green) + as.numeric(df$swir1) + eps)
+# compute dust-only index (NDSI removed)
 if (all(c('red','nir') %in% names(df))) df$NDDI <- (as.numeric(df$red) - as.numeric(df$nir)) / (as.numeric(df$red) + as.numeric(df$nir) + eps)
 
-if ("NDSI" %in% names(df) && "NDDI" %in% names(df)) {
-  snow_count <- sum(df$NDSI > 0.4, na.rm = TRUE)
-  dust_count <- sum(df$NDDI > 0.18, na.rm = TRUE)
+if ("NDDI" %in% names(df)) {
+  dust_count <- sum(df$NDDI > NDDI_DUST_THRESHOLD, na.rm = TRUE)
   total_before <- nrow(df)
-  df <- df[!(df$NDSI > 0.4 | df$NDDI > 0.18), , drop = FALSE]
-  cat(sprintf("[FILTERING] Filtered out %d observations with snow/dust contamination\n", total_before - nrow(df)))
+  df <- df[!(df$NDDI > NDDI_DUST_THRESHOLD), , drop = FALSE]
+  cat(sprintf("[FILTERING] Filtered out %d observations with dust contamination (NDDI > %s)\n", total_before - nrow(df), .nddi_thresh_fmt()))
 
   # Remove large spectral outliers early
   df <- remove_large_outliers(df)
@@ -2048,16 +2050,14 @@ if (file.exists(TRAINING_CSV)) {
   
   if (!"location_id" %in% names(training_df) && all(c("lon","lat") %in% names(training_df))) training_df$location_id <- make_location_id(training_df$lon, training_df$lat)
 
-  # Apply Snow/Dust and MAD filtering to training data
-  if (all(c('green','swir1') %in% names(training_df))) training_df$NDSI <- (as.numeric(training_df$green) - as.numeric(training_df$swir1)) / (as.numeric(training_df$green) + as.numeric(training_df$swir1) + eps)
+  # Apply dust (NDDI) and MAD filtering to training data
   if (all(c('red','nir') %in% names(training_df))) training_df$NDDI <- (as.numeric(training_df$red) - as.numeric(training_df$nir)) / (as.numeric(training_df$red) + as.numeric(training_df$nir) + eps)
 
-  if ("NDSI" %in% names(training_df) && "NDDI" %in% names(training_df)) {
-    snow_count <- sum(training_df$NDSI > 0.4, na.rm = TRUE)
-    dust_count <- sum(training_df$NDDI > 0.18, na.rm = TRUE)
+  if ("NDDI" %in% names(training_df)) {
+    dust_count <- sum(training_df$NDDI > NDDI_DUST_THRESHOLD, na.rm = TRUE)
     total_before <- nrow(training_df)
-    training_df <- training_df[!(training_df$NDSI > 0.4 | training_df$NDDI > 0.18), , drop = FALSE]
-    cat(sprintf("[TRAINING FILTERING] Filtered out %d observations with snow/dust contamination\n", total_before - nrow(training_df)))
+    training_df <- training_df[!(training_df$NDDI > NDDI_DUST_THRESHOLD), , drop = FALSE]
+    cat(sprintf("[TRAINING FILTERING] Filtered out %d observations with dust contamination (NDDI > %s)\n", total_before - nrow(training_df), .nddi_thresh_fmt()))
     
     # Outlier removal already applied earlier to the raw CSV; skipping duplicate removal here
   }
@@ -2451,7 +2451,7 @@ mean_of_means <- function(vals, ids) {
 }
 
 # Add bootstrapping for uncertainty
-set.seed(123)
+set.seed(get_mesma_seed(123))
 B <- 1000  # Number of bootstrap replicates
 
 # Helper to process global averages
@@ -2686,7 +2686,7 @@ for (idx in indices_to_snr) {
 
   # Hierarchical bootstrap over locations to get CI (mean and RMSE vs zero)
   B <- 1000
-  set.seed(123)
+  set.seed(get_mesma_seed(123))
   boot_bias <- numeric(B)
   boot_rmse <- numeric(B)
   locs <- jan_loc$location_id

@@ -88,76 +88,10 @@ analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor,
 
   cat(sprintf("[DIAGNOSTIC] Collected %d variant vectors for similarity analysis.\n", length(all_vecs)))
 
-  # Apply barren similarity filter to vegetation variants (exclude barren-like vegetation)
-  barren_threshold_exists <- exists("BARREN_SIM_THRESHOLD", envir = globalenv())
-  cat(sprintf("[DEBUG] BARREN_SIM_THRESHOLD exists: %s\n", barren_threshold_exists))
-  
-  if (length(all_vecs) > 0 && barren_threshold_exists) {
-    barren_threshold <- get("BARREN_SIM_THRESHOLD", envir = globalenv())
-    cat(sprintf("[DEBUG] BARREN_SIM_THRESHOLD value: %.2f\n", barren_threshold))
-    
-    barren_indices <- which(tolower(all_vegs) == "barren")
-    cat(sprintf("[DEBUG] Found %d barren variants at indices: %s\n", 
-                length(barren_indices), paste(barren_indices, collapse=", ")))
-    
-    if (length(barren_indices) > 0) {
-      # Normalize all vectors
-      vec_mat_all <- do.call(rbind, all_vecs)
-      vec_mat_all[!is.finite(vec_mat_all)] <- 0
-      row_norms_all <- sqrt(rowSums(vec_mat_all^2))
-      row_norms_all[row_norms_all == 0] <- 1
-      vec_mat_norm_all <- vec_mat_all / row_norms_all
-      
-      # Get barren references
-      barren_refs <- vec_mat_norm_all[barren_indices, , drop = FALSE]
-      
-      # Calculate cosine similarity for non-barren vegetation variants
-      veg_indices <- which(tolower(all_vegs) != "barren")
-      cat(sprintf("[DEBUG] Found %d vegetation variants to check\n", length(veg_indices)))
-      
-      if (length(veg_indices) > 0) {
-        veg_vecs_norm <- vec_mat_norm_all[veg_indices, , drop = FALSE]
-        sim_to_barren <- veg_vecs_norm %*% t(barren_refs)
-        max_sim_to_barren <- apply(sim_to_barren, 1, function(x) suppressWarnings(max(x, na.rm = TRUE)))
-        
-        cat(sprintf("[DEBUG] Max similarities to barren: min=%.3f, max=%.3f, mean=%.3f\n",
-                    min(max_sim_to_barren, na.rm=TRUE), 
-                    max(max_sim_to_barren, na.rm=TRUE),
-                    mean(max_sim_to_barren, na.rm=TRUE)))
-        
-        # Filter out vegetation variants too similar to barren
-        keep_veg_mask <- max_sim_to_barren <= barren_threshold
-        filtered_veg_indices <- veg_indices[keep_veg_mask]
-        n_removed <- sum(!keep_veg_mask)
-        
-        if (n_removed > 0) {
-          cat(sprintf("[BARREN FILTER] Removed %d vegetation variant(s) with cosine similarity > %.2f to barren\n", 
-                      n_removed, barren_threshold))
-          # Show which variants were removed
-          removed_ids <- all_ids[veg_indices[!keep_veg_mask]]
-          removed_sims <- max_sim_to_barren[!keep_veg_mask]
-          for (j in seq_along(removed_ids)) {
-            cat(sprintf("  - %s (similarity: %.3f)\n", removed_ids[j], removed_sims[j]))
-          }
-        } else {
-          cat(sprintf("[BARREN FILTER] No vegetation variants exceeded similarity threshold of %.2f\n", barren_threshold))
-        }
-        
-        # Keep all barren variants + filtered vegetation variants
-        keep_indices <- c(barren_indices, filtered_veg_indices)
-        all_vecs <- all_vecs[keep_indices]
-        all_ids <- all_ids[keep_indices]
-        all_vegs <- all_vegs[keep_indices]
-        all_nsamples <- all_nsamples[keep_indices]
-        
-        cat(sprintf("[BARREN FILTER] Retained %d variants for heatmap after barren filtering\n", length(all_vecs)))
-      }
-    }
-  } else if (length(all_vecs) > 0 && !barren_threshold_exists) {
-    cat("[WARNING] BARREN_SIM_THRESHOLD not found in global environment - skipping barren filtering\n")
-  }
+  # Barren similarity filtering is applied at the observation level (before endmember building)
+  # so it is not repeated here. See [BARREN PRE-FILTER] in fit_veg_mixture_mesma.R.
 
-  # Print variant counts per vegetation type (after barren filtering)
+  # Print variant counts per vegetation type
   if (length(all_vecs) > 0) {
     veg_counts <- table(all_vegs)
     cat("[INFO] Variants per vegetation type (after filtering):\n")
@@ -442,3 +376,70 @@ ensure_variant_similarity_heatmap <- function(force = FALSE) {
   })
   invisible(TRUE)
 }
+
+
+# --- Reproducible RNG helpers -------------------------------------------------
+# Provide a single, overridable MESMA seed so all scripts and functions can be
+# made comparable by setting the MESMA_SEED environment variable (or calling
+# set_mesma_seed()). Defaults to 42 for backward-compatibility.
+#
+# Usage:
+#  - call set_mesma_seed() early in a top-level script
+#  - use get_mesma_seed(offset) when a deterministic distinct seed is needed
+#  - existing code that uses `seed` or option("mesma.seed") will continue to work
+set_mesma_seed <- function(base = NULL, announce = TRUE, set_env_vars = TRUE) {
+  # Resolve base seed: explicit arg -> MESMA_SEED env var -> default 42
+  if (is.null(base) || !is.finite(base)) {
+    ev <- Sys.getenv("MESMA_SEED", unset = NA_character_)
+    if (!is.na(ev) && nzchar(ev)) {
+      base <- suppressWarnings(as.integer(ev))
+      if (is.na(base)) base <- 42L
+    } else {
+      base <- 42L
+    }
+  }
+  base <- as.integer(base)
+
+  # Use L'Ecuyer for better parallel reproducibility and future::future.seed support
+  try({ RNGkind("L'Ecuyer-CMRG") }, silent = TRUE)
+  set.seed(base)
+
+  options(mesma.seed = base)
+  # keep legacy code working: many places check for a global 'seed'
+  assign("seed", base, envir = globalenv())
+
+  # Ensure common env vars used by scripts are seeded (if not explicitly provided)
+  if (isTRUE(set_env_vars)) {
+    if (nzchar(Sys.getenv("FVC_SAMPLING_SEED", "")) == FALSE) Sys.setenv(FVC_SAMPLING_SEED = as.character(base))
+    if (nzchar(Sys.getenv("UNCERTAINTY_PARAM_EST_SEED", "")) == FALSE) Sys.setenv(UNCERTAINTY_PARAM_EST_SEED = as.character(base + 123L))
+  }
+
+  if (isTRUE(announce)) message(sprintf("[MESMA] RNG initialized with MESMA_SEED=%d (override with MESMA_SEED env var)" , base))
+  invisible(base)
+}
+
+# Return a deterministic seed derived from the master seed (useful for offsets)
+get_mesma_seed <- function(offset = 0L) {
+  base <- as.integer(getOption("mesma.seed", Sys.getenv("MESMA_SEED", unset = "42")))
+  if (!is.finite(base) || length(base) == 0) base <- 42L
+  offset <- as.integer(offset)
+  # keep result in integer range
+  as.integer((base + offset) %% .Machine$integer.max)
+}
+
+
+# --- NDDI (dust) threshold configuration ------------------------------------
+# Make the NDDI dust-contamination threshold tunable via environment variable
+# `MESMA_NDDI_THRESHOLD` or the global `NDDI_DUST_THRESHOLD` variable.
+# Default is 0.28 (updated per user request).
+get_nddi_threshold <- function() {
+  v <- as.numeric(Sys.getenv("MESMA_NDDI_THRESHOLD", unset = "0.28"))
+  if (!is.finite(v)) v <- 0.28
+  v
+}
+# Cached default value so scripts can reference `NDDI_DUST_THRESHOLD` directly
+NDDI_DUST_THRESHOLD <- get_nddi_threshold()
+
+# Helper to format threshold for messages
+.nddi_thresh_fmt <- function() sprintf("%.3f", as.numeric(get_nddi_threshold()))
+

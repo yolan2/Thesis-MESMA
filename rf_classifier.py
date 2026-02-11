@@ -471,7 +471,10 @@ def main():
     barren_groups = [grp for grp in np.unique(groups) if any(y[i] == 'barren' for i in np.where(groups == grp)[0])]
     if barren_groups:
         print(f"Barren groups found: {len(barren_groups)}. Splitting in half for pure/impure.")
-        np.random.seed(42)
+        seed = int(os.environ.get("MESMA_SEED", "42"))
+        np.random.seed(seed)
+        import random as _py_random
+        _py_random.seed(seed)
         np.random.shuffle(barren_groups)
         half = len(barren_groups) // 2
         pure_barren = barren_groups[:half]

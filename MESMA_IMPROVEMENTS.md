@@ -22,3 +22,18 @@ Based on an analysis of `fit_veg_mixture_mesma.R`, here are three key areas wher
 **Improvement:** Implement a dedicated FCLS solver using `quadprog` or `osqp`.
 *   **Method:** Formulate the unmixing as a QP problem: minimize $\frac{1}{2}x^T Q x + c^T x$ subject to $Ax = b$ (sum-to-one) and $x \ge 0$.
 *   **Benefit:** faster execution for the millions of unmixing operations required in the bootstrap/inference loops, with potentially better precision for the sum-to-one constraint.
+
+---
+
+## Reproducible runs via MESMA_SEED ✅
+A single master RNG seed now controls most sources of randomness across the codebase.
+
+- How to use: set the environment variable `MESMA_SEED` (integer) before running scripts, e.g. `MESMA_SEED=123 Rscript fit_veg_mixture_mesma.R` or on Windows `set MESMA_SEED=123 && Rscript fit_veg_mixture_mesma.R`.
+- Default: `MESMA_SEED=42` when not provided.
+- In R: call `set_mesma_seed()` (available from `mesma_helpers.R`) to initialise RNG consistently; use `get_mesma_seed(offset)` for deterministic derived seeds.
+
+### Tunable dust filter (NDDI)
+You can now control the dust-contamination cutoff via the environment variable `MESMA_NDDI_THRESHOLD` (default 0.28) or the global `NDDI_DUST_THRESHOLD` variable. NDSI-based snow filtering has been removed from the pipeline to simplify preprocessing. This makes it easy to run dust-sensitivity checks without editing code.
+
+Why this change: makes independent runs comparable and enables controlled, repeatable experiments. If you need per-run variability, vary `MESMA_SEED` and rerun. (The code keeps backwards-compatible defaults.)
+

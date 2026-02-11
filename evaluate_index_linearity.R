@@ -127,11 +127,11 @@ print(soil_spec)
 # Extract TRUE pure vegetation endmember (use only Veg == 'agri' or 'agriculture')
 cat("\nExtracting TRUE pure vegetation endmember from data (Veg in {agri, agriculture})...\n")
 pure_veg_data <- df_raw |> 
-  dplyr::filter(!is.na(Veg) & tolower(trimws(Veg)) %in% c('agri', 'agriculture')) |> 
+  dplyr::filter(!is.na(Veg) & tolower(trimws(Veg)) %in% c('agri', 'agric', 'agriculture', 'agricultural')) |> 
   dplyr::filter(across(c(blue, green, red, nir, swir1, swir2), is.finite))
 
 if (nrow(pure_veg_data) == 0) {
-  stop("No pure vegetation data found in Veg in {agri, agriculture}! Cannot extract true vegetation endmember.")
+  stop("No pure vegetation data found in Veg in {agri, agric, agriculture}! Cannot extract true vegetation endmember.")
 }
 
 cat(sprintf("Found %d pure vegetation observations (agri/agriculture)\n", nrow(pure_veg_data)))

@@ -13,9 +13,12 @@ library(e1071)  # SVM
 library(MASS)    # lda
 library(lubridate)
 library(ggplot2) # plotting (prototype plots)
-
+# Respect MESMA_SEED for reproducibility (default 42)
+MESMA_SEED <- as.integer(Sys.getenv("MESMA_SEED", unset = "42"))
+if (!is.finite(MESMA_SEED)) MESMA_SEED <- 42L
+set.seed(MESMA_SEED)
 # --- CONFIG ---
-INPUT_CSV <- "C:\Users\yolan\Downloads\LS_S2_Harmonized_Timeseries_training.csv"
+INPUT_CSV <- "C:/Users/yolan/Downloads/LS_S2_Harmonized_Timeseries_training.csv"
 INFERENCE_CSV <- "C:/Users/yolan/OneDrive/Documenten/UGENT/Master/masterproef/GIS/landsat_lower_inference.csv"
 OUTPUT_DIR <- "C:/MAP/svm_results"
 if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
@@ -176,7 +179,7 @@ train_feature_pipeline <- function(df, class_col, feature_cols, use_lda = TRUE) 
   if (length(X_raw) < 10) return(NULL)
   X_mat <- do.call(rbind, X_raw)
   if (isTRUE(ENABLE_LDA_L2_NORMALIZATION)) {
-    cat("  L2-normalizing training samples for shape-based LDA...\n")
+    cat("  L2-normalizing training samples (per-observation) for LDA...\n")
     X_mat <- t(apply(X_mat, 1, function(r) { r_clean <- r; r_clean[is.na(r_clean)] <- 0; nrm <- sqrt(sum(r_clean^2)); if (!is.finite(nrm) || nrm < 1e-9) return(r); r / nrm }))
   } else { cat("  L2-normalization for LDA skipped (using raw values)...\n") }
   n_bins <- TEMPORAL_BUDGET
@@ -465,7 +468,7 @@ compute_indices_from_bands <- function(df) {
   if (all(c('nir','swir1') %in% names(df))) df$NDMI <- (as.numeric(df$nir) - as.numeric(df$swir1)) / (as.numeric(df$nir) + as.numeric(df$swir1) + eps)
   if (all(c('nir','red','blue') %in% names(df))) df$EVI <- 2.5 * ((as.numeric(df$nir) - as.numeric(df$red)) / (as.numeric(df$nir) + 6 * as.numeric(df$red) - 7.5 * as.numeric(df$blue) + 1 + eps))
   if (all(c('swir1','swir2') %in% names(df))) df$NDTI <- (as.numeric(df$swir1) - as.numeric(df$swir2)) / (as.numeric(df$swir1) + as.numeric(df$swir2) + eps)
-  if (all(c('green','swir1') %in% names(df))) df$NDSI <- (as.numeric(df$green) - as.numeric(df$swir1)) / (as.numeric(df$green) + as.numeric(df$swir1) + eps)
+  # snow-index (NDSI) removed; pipeline uses NDDI (dust) only
   if (all(c('red','nir') %in% names(df))) df$NDDI <- (as.numeric(df$red) - as.numeric(df$nir)) / (as.numeric(df$red) + as.numeric(df$nir) + eps)
   if (all(c('swir1','red','swir2') %in% names(df))) df$SATVI <- ((as.numeric(df$swir1) - as.numeric(df$red)) / (as.numeric(df$swir1) + as.numeric(df$red) + 0.5 + eps)) * 1.5 - (as.numeric(df$swir2) / 2)
   if (all(c('nir','green') %in% names(df))) df$CIG <- (as.numeric(df$nir) / (as.numeric(df$green) + eps)) - 1
@@ -512,7 +515,7 @@ if (!is.null(TRAIN_YEARS) && length(TRAIN_YEARS) > 0) {
 } else df_train <- df
 
 # Stratified OOB split by location/Veg
-set.seed(42)
+set.seed(MESMA_SEED)
 loc_veg_summary <- df_train %>% group_by(location_id, Veg) %>% summarise(n = n(), .groups = "drop") %>% arrange(location_id, desc(n)) %>% group_by(location_id) %>% slice(1) %>% ungroup()
 unique_vegs <- unique(loc_veg_summary$Veg)
 oob_locs_list <- vector("list", length(unique_vegs))
@@ -647,7 +650,7 @@ tryCatch({
     if (nloc == 0) stop("No locations found in OOB traces for bootstrap")
 
     BOOTSTRAP_B <- ifelse(exists("BOOTSTRAP_B"), BOOTSTRAP_B, 1000)
-    set.seed(42)
+    set.seed(MESMA_SEED)
     bs_mat <- matrix(0, nrow = length(all_classes), ncol = BOOTSTRAP_B)
     rownames(bs_mat) <- all_classes
     for (b in seq_len(BOOTSTRAP_B)) {
