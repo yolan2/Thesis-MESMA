@@ -575,8 +575,6 @@ compute_indices_from_bands <- function(df,
 
 
 # L2-normalize a feature vector per observation (whole-vector)
-# NOTE: We previously L2-normalized per-index (blockwise). That was incorrect for
-# this project: we want per-observation brightness/scale invariance.
 #
 # Input: vec with n_indices * n_bins values.
 # Output: vec / ||vec||_2 (with NA treated as 0 for the norm).
@@ -1176,12 +1174,7 @@ if ("location_id" %in% names(df) && "location_id" %in% names(gpts_map)) {
   if (!"Veg" %in% names(df)) df$Veg <- NA_character_
   pre_non_na <- sum(!is.na(df$Veg) & df$Veg != "")
 
-  joined <- dplyr::left_join(df, gpts_map, by = "location_id", suffix = c("", ".geo"))
-  if ("Veg.geo" %in% names(joined)) {
-    joined$Veg <- ifelse(is.na(joined$Veg) | joined$Veg == "", joined$Veg.geo, joined$Veg)
-    joined$Veg.geo <- NULL
-  }
-
+  joined <- join_and_fill_veg(df, gpts_map)
 
   post_non_na <- sum(!is.na(joined$Veg) & joined$Veg != "")
 
@@ -1190,11 +1183,7 @@ if ("location_id" %in% names(df) && "location_id" %in% names(gpts_map)) {
     match_count <- length(intersect(df_ids, unique(na.omit(as.character(gpts_map$location_row)))))
     if (match_count > 0) {
       cat(sprintf("[NOTICE] No matches by 'location_id' — attempting join by row-number mapping (matched ids=%d)\n", match_count))
-      joined2 <- dplyr::left_join(df, gpts_map, by = c("location_id" = "location_row"), suffix = c("", ".geo"))
-      if ("Veg.geo" %in% names(joined2)) {
-        joined2$Veg <- ifelse(is.na(joined2$Veg) | joined2$Veg == "", joined2$Veg.geo, joined2$Veg)
-        joined2$Veg.geo <- NULL
-      }
+      joined2 <- join_and_fill_veg(df, gpts_map, join_by = c("location_id" = "location_row"))
 
       if (sum(!is.na(joined2$Veg) & joined2$Veg != "") > post_non_na) {
         joined <- joined2
@@ -1442,16 +1431,8 @@ if (nrow(df_train) > 0) {
               100 * (1 - VALIDATION_FRACTION), 100 * VALIDATION_FRACTION))
   set.seed(get_mesma_seed(123))
 
-  # Get unique location-Veg pairs.
-  # Note: A location typically has one dominant veg type, but might vary.
-  # We'll assign each location to its most frequent Veg type for stratification.
-  loc_veg_summary <- df_train %>%
-    dplyr::group_by(location_id, Veg) %>%
-    dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
-    dplyr::arrange(location_id, dplyr::desc(n)) %>%
-    dplyr::group_by(location_id) %>%
-    dplyr::slice(1) %>%
-    dplyr::ungroup()
+  # Get dominant veg type per location for stratified splitting
+  loc_veg_summary <- get_dominant_veg_per_location(df_train)
 
   # Stratified validation split: hold out VALIDATION_FRACTION of locations per Veg class
   val_locs_list <- vector("list", length(unique(loc_veg_summary$Veg)))
@@ -1490,13 +1471,7 @@ if (nrow(df_train) > 0) {
   cat("\n[OOB SPLIT] Creating OOB holdout from training data for threshold/cluster tuning...\n")
   set.seed(get_mesma_seed(43))
 
-  train_loc_veg <- df_train %>%
-    dplyr::group_by(location_id, Veg) %>%
-    dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
-    dplyr::arrange(location_id, dplyr::desc(n)) %>%
-    dplyr::group_by(location_id) %>%
-    dplyr::slice(1) %>%
-    dplyr::ungroup()
+  train_loc_veg <- get_dominant_veg_per_location(df_train)
 
   oob_locs_list <- vector("list", length(unique(train_loc_veg$Veg)))
   unique_train_vegs <- unique(train_loc_veg$Veg)
@@ -1892,7 +1867,7 @@ build_pentad_matrix <- function(dly_year, avail_idx, interpolate = TRUE) {
 
  
 
-# apply_pca_lda_transform removed (was a NO-OP returning y unchanged).
+
 # PCA-LDA weights are applied only in the solver via feature_weights.
 
 
@@ -1963,11 +1938,7 @@ if (length(lon_candidates) > 0 && length(lat_candidates) > 0) {
 df <- canonicalize_veg_labels(df)
 
 df_train$location_id <- as.character(df_train$location_id)
-df_train <- dplyr::left_join(df_train, gpts_map, by = "location_id", suffix = c("", ".geo"))
-if ("Veg.geo" %in% names(df_train)) {
-  df_train$Veg <- ifelse(is.na(df_train$Veg) | df_train$Veg == "", df_train$Veg.geo, df_train$Veg)
-  df_train$Veg.geo <- NULL
-}
+df_train <- join_and_fill_veg(df_train, gpts_map)
 
 df_train <- canonicalize_veg_labels(df_train)
 
@@ -2283,9 +2254,7 @@ collect_location_coords <- function(locations, df_tasks = NULL, all_coefs = NULL
     cand <- cand[!is.na(cand$location_id) & cand$location_id != "", , drop = FALSE]
 
     # Choose first non-missing coord per location (prefer finite lat/lon)
-    okc <- is.finite(cand$lat) & is.finite(cand$lon)
-    cand <- cand[order(cand$location_id, -as.integer(okc)), , drop = FALSE]
-    cand <- cand[!duplicated(cand$location_id), , drop = FALSE]
+    cand <- deduplicate_coords(cand)
   }
 
   # Fall back to global gpts_map if available
@@ -2297,9 +2266,7 @@ collect_location_coords <- function(locations, df_tasks = NULL, all_coefs = NULL
       gm2$lat <- suppressWarnings(as.numeric(gm2$lat))
       gm2$lon <- suppressWarnings(as.numeric(gm2$lon))
       gm2 <- gm2[!is.na(gm2$location_id) & gm2$location_id != "", , drop = FALSE]
-      okg <- is.finite(gm2$lat) & is.finite(gm2$lon)
-      gm2 <- gm2[order(gm2$location_id, -as.integer(okg)), , drop = FALSE]
-      gm2 <- gm2[!duplicated(gm2$location_id), , drop = FALSE]
+      gm2 <- deduplicate_coords(gm2)
       cand <- gm2
     }
   }
@@ -2360,21 +2327,8 @@ estimate_autocorrelation_range <- function(coords_df, values, fallback_km = 30.0
   if (sum(valid_bins) < 2) return(fallback_km)
 
   # Try NLS fit of exponential variogram
-  range_est <- tryCatch({
-    nls_fit <- nls(g ~ s * (1 - exp(-d / r)),
-                   data = data.frame(d = bin_mid[valid_bins], g = bin_gamma[valid_bins]),
-                   start = list(s = total_var, r = median(dists)),
-                   lower = list(s = total_var * 0.1, r = max(dists) * 0.01),
-                   upper = list(s = total_var * 3, r = max(dists) * 2),
-                   algorithm = "port",
-                   control = list(maxiter = 50, warnOnly = TRUE))
-    coef(nls_fit)["r"]
-  }, error = function(e) {
-    # Fallback: distance at which semivariance first exceeds 0.5 * sill
-    thresh_idx <- which(bin_gamma[valid_bins] >= 0.5 * total_var)
-    if (length(thresh_idx) > 0) bin_mid[valid_bins][thresh_idx[1]]
-    else max(dists)  # All correlated -> conservative
-  })
+  range_est <- fit_exponential_variogram(bin_mid, bin_gamma, total_var, dists)
+  if (is.null(range_est)) return(fallback_km)
 
   range_est <- as.numeric(range_est)
   if (!is.finite(range_est) || range_est <= 0) return(fallback_km)
@@ -2931,42 +2885,17 @@ location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123)
               # Simple robust estimate: fit exponential variogram gamma(d) = sill * (1 - exp(-d/range))
               # Use median-based bins for robustness
               n_bins <- min(10, max(3, length(dists) %/% 5))
-              bin_breaks <- quantile(dists, probs = seq(0, 1, length.out = n_bins + 1))
-              bin_breaks <- unique(bin_breaks)
+              bin_breaks <- unique(quantile(dists, probs = seq(0, 1, length.out = n_bins + 1)))
               if (length(bin_breaks) >= 3) {
                 bin_mid <- (bin_breaks[-length(bin_breaks)] + bin_breaks[-1]) / 2
                 bin_gamma <- numeric(length(bin_mid))
                 for (bb in seq_along(bin_mid)) {
                   in_bin <- dists >= bin_breaks[bb] & dists < bin_breaks[bb + 1]
-                  if (sum(in_bin) > 0) bin_gamma[bb] <- median(gamma_vals[in_bin])
-                  else bin_gamma[bb] <- NA
+                  bin_gamma[bb] <- if (sum(in_bin) > 0) median(gamma_vals[in_bin]) else NA
                 }
-                valid_bins <- !is.na(bin_gamma)
-                if (sum(valid_bins) >= 2) {
-                  # Fit exponential variogram: gamma(d) = sill * (1 - exp(-d/range))
-                  # Using NLS with reasonable starting values
-                  fit_ok <- tryCatch({
-                    nls_fit <- nls(g ~ s * (1 - exp(-d / r)),
-                                   data = data.frame(d = bin_mid[valid_bins], g = bin_gamma[valid_bins]),
-                                   start = list(s = total_var, r = median(dists)),
-                                   lower = list(s = total_var * 0.1, r = max(dists) * 0.01),
-                                   upper = list(s = total_var * 3, r = max(dists) * 2),
-                                   algorithm = "port",
-                                   control = list(maxiter = 50, warnOnly = TRUE))
-                    range_est <- coef(nls_fit)["r"]
-                    TRUE
-                  }, error = function(e) FALSE)
 
-                  if (!fit_ok) {
-                    # Fallback: use distance at which semivariance first exceeds 0.5 * total_var
-                    thresh_idx <- which(bin_gamma[valid_bins] >= 0.5 * total_var)
-                    if (length(thresh_idx) > 0) {
-                      range_est <- bin_mid[valid_bins][thresh_idx[1]]
-                    } else {
-                      range_est <- max(dists)  # All correlated -> conservative
-                    }
-                  }
-
+                range_est <- fit_exponential_variogram(bin_mid, bin_gamma, total_var, dists)
+                if (!is.null(range_est)) {
                   # Compute mean pairwise correlation: C(d) = exp(-d / range)
                   # Effective n = n / (1 + (n-1) * mean_corr)  [Kish formula]
                   mean_corr <- mean(exp(-dists / range_est))
@@ -4494,8 +4423,6 @@ load_and_prepare_inference_data <- function() {
     }
 
     # -------------------------------------------------------------------------
-    # Post-construction filtering REMOVED - all filtering now happens pre-construction
-    # -------------------------------------------------------------------------
     # (Barren-similar observations removed during early data pre-filtering)
 
     # Optional: Generate prototype plots (one plot per index/band) showing endmember centers across pentads
@@ -5452,19 +5379,11 @@ print_weights_summary <- function(stage_name, params) {
 
   
 
-# ========================================================================== 
-# TRAINING DISABLED
-# This repository/script no longer performs model *training*. Training is expected
-# to be performed offline and any required artifacts (normalization params,
-# libraries, models) should be provided on disk. The script will continue to
-# perform inference and validation where possible.
 # ==========================================================================
-
+# Training is performed externally — this script focuses on inference & validation.
 # validation_location_ids already set during stratified train/validation split
-
-# NOTE: do NOT create or populate `df_tasks` here — inference code will build
-# task tables from the inference input. Training/task-generation code was
-# removed; keep this script focused on inference + validation only.
+# NOTE: do NOT create or populate `df_tasks` here — inference code will build task tables from the inference input.
+# ==========================================================================
 
 if (isTRUE(TESTING_MODE)) cat("[DEBUG] Reached line 6377 - about to define fit_one_task function\n")
 
@@ -5935,9 +5854,7 @@ simple_residual_bootstrap <- function(residuals) {
     valid_mask <- is.finite(y_raw)
     n_valid <- sum(valid_mask)
 
-    # Previously we required a minimum fraction of valid observations and would skip tasks
-    # with low coverage. Remove that strict filter: proceed whenever there is at least one
-    # valid observation, but emit a warning in TESTING_MODE when coverage is very low.
+    # Require at least one valid observation; warn in TESTING_MODE when coverage is very low
     if (n_valid == 0) {
       if (exists("TESTING_MODE") && isTRUE(TESTING_MODE)) {
         cat(sprintf("[SKIP] loc=%s pheno_year=%d: no valid observations (n_valid=0) - skipping\n", loc, yr))
@@ -7125,9 +7042,7 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
     p
   }
 
-# Executing main processing steps directly (function removed). This section previously defined
-# `main_processing_block <- function() { ... }`. To avoid large function compile stalls, the body
-# is now executed at top-level during script run. The original nested helper functions remain in scope.
+# Main processing executes at top-level; helper functions remain in scope.
 
     # Assign df_tasks for the main processing loop (inference data, not training data)
     if (exists("df_tasks_inference") && !is.null(df_tasks_inference) && nrow(df_tasks_inference) > 0) {
@@ -7217,11 +7132,9 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
   ))
   } # End of n_locs_to_process > 0 conditional
 
-  # Debug log output removed (strict mode)
-
   # ==========================================================================
   # VALIDATION PROCESSING: unmix held-out validation locations
-  # ==========================================================================
+  # ========================================================================== 
   cat("\n=== STARTING VALIDATION PROCESSING ===\n")
 
   if (exists("df_validation") && !is.null(df_validation) && nrow(df_validation) > 0) {
@@ -7666,7 +7579,7 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
     }
   }
 
-  # Training results CSV saving is disabled by default (user requested removal of training outputs)
+  # Training results CSV saving is disabled by default (disabled by config)
   if (!is.null(all_coefs) && nrow(all_coefs) > 0) {
     cat("[INFO] Training results CSV saving skipped (training outputs removed by config)\n")
   }
