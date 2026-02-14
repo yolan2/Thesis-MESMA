@@ -33,8 +33,42 @@ library(future)
 library(future.apply)
 library(MASS) # For lda
 
-# Debug logging has been removed. Keep a no-op stub so legacy call sites don't affect execution.
-write_debug <- function(...) { invisible(NULL) }
+# write_debug is defined in mesma_config.R (no-op stub)
+
+# Compute a per-location DVI soil baseline for PPI.
+# Baseline is defined as the median of the lowest `quantile_p` fraction of DVI
+# observations within each location. This is deterministic, per-location, and
+# avoids any constant/default soil baseline.
+compute_dvi_soil_per_location <- function(df, quantile_p = 0.10, min_samples = 5L) {
+  if (is.null(df) || nrow(df) == 0) stop("[PPI] compute_dvi_soil_per_location: empty df")
+  if (!"location_id" %in% names(df)) stop("[PPI] compute_dvi_soil_per_location: missing location_id")
+  if (!"DVI" %in% names(df) && all(c("nir", "red") %in% names(df))) df$DVI <- as.numeric(df$nir) - as.numeric(df$red)
+  if (!"DVI" %in% names(df)) stop("[PPI] compute_dvi_soil_per_location: missing DVI (and nir/red not available)")
+
+  locs <- unique(as.character(df$location_id))
+  dvi_soil_vec <- rep(NA_real_, nrow(df))
+  for (loc in locs) {
+    idx <- which(as.character(df$location_id) == loc)
+    vals <- df$DVI[idx]
+    vals <- vals[is.finite(vals)]
+    if (length(vals) < as.integer(min_samples)) next
+    q <- suppressWarnings(as.numeric(stats::quantile(vals, probs = quantile_p, na.rm = TRUE, names = FALSE, type = 7)))
+    if (!is.finite(q)) next
+    low_vals <- vals[vals <= q]
+    if (length(low_vals) < 2L) next
+    soil <- suppressWarnings(as.numeric(stats::median(low_vals, na.rm = TRUE)))
+    if (!is.finite(soil)) next
+    dvi_soil_vec[idx] <- soil
+  }
+
+  need_idx <- is.finite(df$DVI) & !is.finite(dvi_soil_vec)
+  if (any(need_idx)) {
+    bad_locs <- unique(as.character(df$location_id[need_idx]))
+    stop(sprintf("[PPI] Cannot compute per-location dvi_soil for %d rows across %d locations (example locs: %s)",
+                 sum(need_idx), length(bad_locs), paste(head(bad_locs, 10), collapse = ", ")))
+  }
+  dvi_soil_vec
+}
 
 mesma_prepare_feature_columns <- function(df, required_cols, optional_cols = NULL, context = "data") {
   if (is.null(df)) stop(sprintf("[%s] df is NULL", context))
@@ -64,254 +98,17 @@ mesma_prepare_feature_columns <- function(df, required_cols, optional_cols = NUL
   df
 }
 
-setup_parallel_backend <- function(workers = NULL) {
-  # Capture current plan to allow restoration
-  old_plan <- future::plan()
-
-  # Determine the number of workers: respect MESMA_PARALLEL env var; otherwise use detectCores()-1
-  if (is.null(workers)) {
-    env <- Sys.getenv("MESMA_PARALLEL", "")
-    if (nzchar(env)) {
-      w <- suppressWarnings(as.integer(env))
-      if (is.na(w) || w <= 0) w <- max(1L, parallel::detectCores() - 1L)
-      workers <- w
-    } else {
-      workers <- max(1L, parallel::detectCores() - 1L)
-    }
-  }
-
-  if (is.null(workers) || workers <= 1L) {
-    cat("[PARALLEL] Parallel disabled (workers <= 1). Running sequentially.\n")
-    return(function() { invisible(future::plan(old_plan)) })
-  }
-
-  future::plan(future::multisession, workers = workers)
-  cat(sprintf("[PARALLEL] Set up 'future' multisession with %d workers\n", workers))
-
-  cleanup <- function() {
-    future::plan(old_plan)
-    cat("[PARALLEL] Restored previous plan\n")
-    invisible(NULL)
-  }
-  cleanup
+# --- Source shared config and helpers ---
+# All tunable parameters are defined in mesma_config.R (single source of truth).
+# Override any parameter AFTER the source() call below if needed for this run.
+if (file.exists("mesma_config.R")) {
+  source("mesma_config.R")
+} else {
+  stop("Required file 'mesma_config.R' not found in project root.")
 }
 
-INPUT_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_train (2).csv"
-                                 # Path to the input CSV used for training. Replace with your own file path.
-INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_mid (1).csv"
-                                 # Path for spatial inference input (set to NA to disable inference steps).
-
-
-# Training year selection
-# If you only want to build variants using the most recent data, set TRAIN_YEARS to a single year (e.g., 2024) or a vector of years.
-TRAIN_YEARS <- 2024  # Years to use for training (inclusive)
-# Quiet mode suppresses verbose informational/debug printing when TRUE
-# Set to TRUE to reduce console noise (useful for CI or large runs)
-QUIET_MODE <- TRUE
-
-
-PARALLEL_ENABLE <- TRUE
-
-PARALLEL_WORKERS <- 4            # # workers to spawn when PARALLEL_ENABLE=TRUE for general tasks (keep small for memory reasons)
-PERMUTATION_PARALLEL_WORKERS <- 30  # # workers to use specifically for permutation testing (can be larger than PARALLEL_WORKERS)
-# Stage-2 (pentad-level) significance threshold - less strict than index-level
-
-# Note: the permutation worker count will be capped to available cores at runtime.
-COMBO_PARALLEL_WORKERS <- max(1L, floor(PARALLEL_WORKERS/2))
-
-# Variant generation
-MAX_VARIANTS_PER_VEG <- 7       # Max variants generated per vegetation type; increase to allow greater intra-class variability.
-
-MIN_ENDMEMBER_SAMPLES <- 5L      # Minimum raw samples required to form an endmember variant. Raise to be stricter.
-
-ALLOWED_VEG <- c("populus", "tamarix", "herbs")
-                                 # Restrict vegetation classes to these labels during training; edit to match your dataset.
-
-# Index defaults
-OPTIMAL_INDICES <- c(
-  "PSRI", "NDMI", "EVI",
-  "NDTI", "BSI", "TCW", "TCB",
-  # Complementary indices (measure different properties than the core set)
-  "MSI",   # moisture stress (SWIR1/NIR)
-  "SIPI"  # pigment ratio (structure-insensitive)
-)
-                                 # Suggested default indices to include in fitting; add or remove indices depending on sensor and quality.
-
-# Outlier removal
-ENABLE_OUTLIER_REMOVAL <- TRUE   # Remove strong outliers prior to prototype building (recommended TRUE for noisy sensors).
-OUTLIER_MAD_THRESHOLD <- 3.5     # How aggressively to trim outliers (higher -> fewer removals). ~3-4 is typical.
-OUTLIER_SPLINE_MAX_DF <- 10L     # Max degrees-of-freedom for spline trend in outlier detection (caps wiggliness)
-
-# Prototype plot options
-GENERATE_PROTO_PLOTS <- TRUE     # Turn on to save one plot per prototype (useful for inspection; can generate many files)
-GENERATE_PROTO_PLOTS_VARIANTS_ONLY <- TRUE  # Also save a variants-only version (no median overlays)
-
-# Run / testing flags
-SKIP_INFERENCE <- FALSE        # No longer supported (kept for backward compatibility; TRUE will error)
-# Training enabled by default (do not permanently disable training here)
-# Testing mode disabled for production runs: TESTING_MODE set to FALSE
-TESTING_MODE <- FALSE  # Do not set to TRUE in production; reserved for manual debugging only
-
-if (isTRUE(SKIP_INFERENCE)) stop("SKIP_INFERENCE is no longer supported; remove it and provide a proper INFERENCE_CSV")
-
-# Explicitly disable DEBUG to prevent accidental verbose debugging in production
-DEBUG <- FALSE
-
-
-# -----------------------------------------------------------------------------
-# USER-TUNABLE PARAMETERS (centralized)
-# Move any frequently-adjusted constants here for easy configuration
-# NOTE: each parameter below has a short tuning note explaining its purpose and how
-#       to change it safely. Prefer conservative changes and test on a small dataset.
-# -----------------------------------------------------------------------------
-
-# Combinatorics safeguards
-COMBO_SAFE_EXPAND_LIMIT <- 1e6    # Max number of total combinations to expand fully before switching to random sampling.
-                                  # Increase if you want exhaustive search and have time + memory; lower to reduce runtime.
-COMBO_ABORT_LIMIT <- 5e7          # Hard abort threshold: if combos exceed this, the grid search will stop to avoid OOM.
-                                  # Only raise with extreme caution on large-memory hosts.
-
-# Bootstrap / inference sizing
-BOOTSTRAP_B <- 200L              # Number of bootstrap iterations (location-level). Higher -> more stable CIs but slower. 100-500 typical.
-MAX_INFERENCE_LOCATIONS <- 2000L    # TEMP DEBUG: Reduce to e.g. 2 locations to reproduce/inspect issue quickly
-
-# Spatial dependence handling in bootstrap
-# NOTE: The default location bootstrap resamples locations i.i.d., which can
-#       underestimate long-distance spatial correlation and therefore understate
-#       uncertainty of spatial aggregates.
-#       When enabled, we resample *spatial blocks* of locations instead.
-#       Block size is determined from the data via empirical variogram fitting
-#       (estimate_autocorrelation_range). BOOTSTRAP_BLOCK_KM serves only as a
-#       fallback when the variogram cannot be estimated (too few locations, etc.).
-ENABLE_SPATIAL_BLOCK_BOOTSTRAP <- TRUE
-BOOTSTRAP_BLOCK_KM <- 30.0            # Fallback block width (km) used only when variogram estimation fails.
-BOOTSTRAP_BLOCK_MAX_MISSING_FRAC <- 0.20  # If > this fraction of locations lack coords, fall back to i.i.d. bootstrap.
-
-# Uncertainty handling
-ENABLE_UNCERTAINTY <- TRUE       # Turn off to skip expensive uncertainty estimation (bootstrap, MC propagation) for faster runs.
-ENABLE_MULTI_YEAR_BOOTSTRAP <- FALSE # If TRUE, run per-location multi-year bootstrap; set FALSE to skip for speed/stability.
-DEBUG_UNCERTAINTY <- TRUE        # Verbose diagnostics for uncertainty steps; set FALSE for quiet production runs.
-
-# Classification uncertainty propagation (Dirichlet perturbation)
-ENABLE_CLASSIFICATION_UNCERTAINTY <- TRUE  # If TRUE, apply Dirichlet perturbation based on confusion matrix during bootstrap.
-DIRICHLET_CONCENTRATION_SCALE <- 10.0      # Multiplier for validation sample size to set Dirichlet concentration (alpha).
-                                           # Higher values = tighter concentration = less classification noise.
-                                           # Lower values = more spread = larger classification uncertainty.
-
-# MC propagation
-ENABLE_MONTE_CARLO <- TRUE       # Propagate observation noise into coefficient uncertainty via repeated unmixing draws. Disable to save time.
-MC_N_DRAWS <- 50L                # Number of MC draws per location-year (>=10 recommended). Lower to speed up, increase to stabilize CI estimates.
-MC_NOISE_SCALE <- 1.0            # Multiplier applied to per-task residual RMSE to set MC noise SD. Increase to model larger noise.
-# Optional explicit MC noise SD can be set via MC_NOISE_SD (if present, it overrides MC_NOISE_SCALE * rmse).
-
-ENABLE_ENDMEMBER_BUNDLES <- TRUE # If TRUE, represent endmember variability as a mean+cov and sample endmembers during MC. Improves uncertainty realism at cost of CPU.
-
-# OOB fraction prediction uncertainty
-# Uses the OOB validation residuals (predicted - true fractions) to add systematic prediction bias/error to MC draws
-ENABLE_OOB_FRACTION_UNCERTAINTY <- TRUE  # If TRUE, add OOB-derived fraction errors to MC draws
-
-# Huber loss for FCLS (robust to outliers)
-USE_HUBER_LOSS <- TRUE         # If TRUE, use Huber loss instead of RMSE in FCLS solver (more robust to outliers)
-HUBER_DELTA <- 1.345             # Huber delta parameter (threshold for switching from L2 to L1).
-                                 # 1.345 * sigma gives 95% efficiency for Gaussian data.
-                                 # Lower values = more robust but less efficient. Higher = closer to RMSE.
-HUBER_MAX_ITER <- 20             # Max iterations for IRLS (iteratively reweighted least squares)
-HUBER_TOL <- 1e-4                # Convergence tolerance for IRLS
-
-# Feature selection / pruning
-ENABLE_FEATURE_PRUNING <- TRUE  # Automatically drop highly correlated features before training?
-FEATURE_PRUNING_THRESHOLD <- 0.95 # Correlation threshold above which a feature is considered redundant and dropped.
-
-
-
-# Small-N CI inflation (prevent tiny-sample overconfidence)
-UNCERTAINTY_N_REF <- 12L         # Reference observation count; above this, no inflation. Increase if your typical loc-year has more obs.
-UNCERTAINTY_N_POWER <- 1.0       # Strength of small-n inflation; reduced from 2.0 to avoid over-inflation (spatial autocorrelation now handled via n_eff).
-UNCERTAINTY_BASE_SD <- 0.12      # Fallback SD for locations with no empirical SD (before inflation). Reduced from 0.15.
-UNCERTAINTY_SD_MAX <- 0.40       # Cap to avoid absurdly large SD values from inflation. Reduced from 0.50.
-
-# Option A: estimate UNCERTAINTY params by subsampling experiment (auto-calibrate)
-ESTIMATE_UNCERTAINTY_PARAMS_OPTION_A <- TRUE
-UNCERTAINTY_PARAM_EST_HIGH_N <- 20L            # Only use location-years with >= this many obs as 'truth' in the subsampling experiment.
-UNCERTAINTY_PARAM_EST_MAX_GROUPS <- 25L        # Cap the number of loc-years used to limit runtime of the estimation.
-UNCERTAINTY_PARAM_EST_TARGET_NS <- 1:15        # Subsample sizes to evaluate during estimation (typical small-n range).
-UNCERTAINTY_PARAM_EST_REPS <- 20L              # Repeats per subsample size (increase for smoother estimates; slower).
-UNCERTAINTY_PARAM_EST_SEED <- as.integer(
-  if (nzchar(Sys.getenv("UNCERTAINTY_PARAM_EST_SEED", ""))) Sys.getenv("UNCERTAINTY_PARAM_EST_SEED") else Sys.getenv("MESMA_SEED", unset = "123")
-)              # RNG seed for reproducible estimation runs. (fallback before helpers are sourced)
-
-# Data quality thresholds (filtering / skipping)
-MIN_OBS_PER_LOC_YEAR <- 3L      # Minimum rows required per location-year for processing. Increase to be stricter on noisy cases.
-MIN_UNIQUE_DOY_DEFAULT <- 5L    # Minimum unique DOYs per loc-year during training to consider time-series adequate.
-MIN_UNIQUE_DOY_INFERENCE <- 3L  # Less strict for inference to allow sparse inputs.
-
-# Modeling/algorithmic caps and defaults
-ENABLE_LDA_L2_NORMALIZATION <- TRUE # L2-normalize training samples to focus on temporal shape rather than amplitude.
-                                     # Set TRUE to emphasize shape; FALSE to preserve brightness differences.
-ENABLE_ZSCORE_AFTER_L2 <- TRUE      # Z-score features after L2-normalization (equalizes variance across indices).
-                                     # Set FALSE to skip z-scoring and preserve natural post-L2 variance differences.
-                                     # Skipping can be beneficial if post-L2 variances are similar or you want LDA
-                                     # to handle scale natively without amplifying low-variance (flat) indices.
-
-GAM_K_MAX <- 10                  # Max basis dimension for GAM fits. Larger -> more flexible curves but risk overfitting.
-GAM_GAMMA <- 1.0                 # Regularization / smoothing strength for GAM (higher -> smoother).
-
-# Sample/cluster controls
-# Support multiple barren/soil prototypes extracted from training bare-soil observations
-RAW_BARREN_N_PROTOTYPES <- 2L  # Maximum number of barren endmembers to consider during optimization (like MAX_K_EAR for vegetation).
-                                # The optimizer will search k=1..RAW_BARREN_N_PROTOTYPES for barren class.
-                                # Tuning: set >1 if you expect distinct soil types/brightness regimes in the region
-                                # (e.g., sandy vs. clay surfaces). Increasing this improves representativeness but
-                                # will increase library size and runtime; typical values: 1-7.
-
-# Numerical tolerances
-EPS_SIGMA <- 1e-8                # Small epsilon used in numeric ops to avoid division by zero
-LOWER_BND <- 0                   # Lower bound used for non-negativity constraints
-
-# Batch processing
-BATCH_SIZE <- 6  # Default batch size for location-level processing. Lower for memory-constrained runs; higher for throughput.
-
-# Temporal (pentad) settings
-TEMPORAL_AGGREGATION_DAYS <- 10L  # Temporal aggregation window in days (~pentad length). Smaller -> finer but sparser.
-TEMPORAL_BUDGET <- ceiling(365 / TEMPORAL_AGGREGATION_DAYS)  # Number of temporal bins (pentads) used in modeling
-
-# Variant / clustering settings
-MIN_CLUSTER_SIZE <- 4L           # Minimum cluster size to accept a variant prototype
-INTERPOLATE_INFERENCE <- TRUE   # If TRUE, linearly interpolate missing pentads for inference/validation (default: FALSE — preserves validation integrity)
-PCA_VARIANCE_THRESHOLD <- 0.95    # PCA energy to retain when reducing endmember dimensionality prior to clustering
-
-# Whether to prune features with zero LDA weight from optimized libraries
-# Disabled for now - diagnostics only, no actual pruning applied
-PRUNE_ZERO_WEIGHT_FEATURES <- TRUE
-# If fraction of zeroed features exceeds this, skip pruning to avoid degenerate libraries
-PRUNE_ZERO_WEIGHT_MAX_FRAC <- 0.8
-# Minimum number of features to keep after pruning to avoid degenerate models
-PRUNE_ZERO_MIN_FEATURES <- 3
-
-# === PERMUTATION IMPORTANCE FEATURE PRUNING ===
-# Measures feature contribution by randomizing each feature and testing performance degradation.
-# Features whose permutation doesn't significantly degrade performance are pruned.
-OOB_TUNING_FRACTION <- 0.15         # Fraction held out from training data for cluster optimization evaluation
-VALIDATION_FRACTION <- 0.20         # Fraction held out for validation (stratified by location/Veg)
-PERMUTATION_N_ITER <- 400            # Number of permutations per feature for significance testing
-PERMUTATION_MIN_SAMPLES <- 20       # Minimum OOB samples required for testing
-
-# Endmember selection tuning
-MAX_K_EAR <- 7L                  # Maximum number of endmembers to consider per vegetation class in EAR selection (conservative increase to explore one more k).
-CLUSTER_COMPLEXITY_LAMBDA <- 0.005  # Complexity penalty per total endmember: S = min(R_oob, R_train) - λ * sum(k)
-BARREN_SIM_THRESHOLD <- 0.75     # Pre-filter: drop vegetation training observations whose cosine similarity to barren mean exceeds this threshold
-
-
-# === END GLOBAL CONFIG ===
-PROGRESS_LOG_TO_FILE <- FALSE
-LOG_FILE <- "mesma_progress.log"
-
-log_msg <- function(...) {
-  ts <- format(Sys.time(), "%H:%M:%S")
-  msg <- sprintf("[%s] %s\n", ts, sprintf(...))
-  cat(msg)
-  if (isTRUE(PROGRESS_LOG_TO_FILE)) try(cat(msg, file = LOG_FILE, append = TRUE), silent = TRUE)
-}
+# Override: inference CSV for this script (differs from mesma_config.R default)
+INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_kon (1).csv"
 
 if (file.exists("ppi_helpers.R")) {
   source("ppi_helpers.R")
@@ -321,15 +118,356 @@ if (file.exists("ppi_helpers.R")) {
 
 if (file.exists("mesma_helpers.R")) {
   source("mesma_helpers.R")
-  # Initialize a single, overridable RNG seed for the whole pipeline (see HELPERS)
   set_mesma_seed()
 } else {
   stop("Required file 'mesma_helpers.R' not found in project root.")
 }
 
+# --- Shared utility: suppress stdout/message during an expression ---
+# Replaces 5+ repeated tryCatch(file(...)) + sink() + finally patterns.
+suppress_output_safely <- function(expr, quiet_output = TRUE, quiet_message = TRUE) {
+  sink_file <- tempfile()
+  con_out <- if (quiet_output) tryCatch(file(sink_file, open = "wt"), error = function(e) NULL) else NULL
+  con_msg <- if (quiet_message) tryCatch(file(paste0(sink_file, ".msg"), open = "wt"), error = function(e) NULL) else NULL
+  tryCatch({
+    if (!is.null(con_out) && inherits(con_out, "connection") && isOpen(con_out)) sink(con_out, type = "output")
+    if (!is.null(con_msg) && inherits(con_msg, "connection") && isOpen(con_msg)) sink(con_msg, type = "message")
+    force(expr)
+  }, finally = {
+    if (quiet_message) try(sink(type = "message"), silent = TRUE)
+    if (quiet_output) try(sink(type = "output"), silent = TRUE)
+    if (!is.null(con_out)) try(close(con_out), silent = TRUE)
+    if (!is.null(con_msg)) try(close(con_msg), silent = TRUE)
+    try(unlink(sink_file), silent = TRUE)
+    try(unlink(paste0(sink_file, ".msg")), silent = TRUE)
+  })
+}
 
-RAW_BANDS <- c("blue", "green", "red", "nir", "swir1", "swir2")
+# --- Shared utility: filter valid vegetation rows (excludes NA/empty/barren) ---
+filter_valid_vegetation <- function(coefs, exclude_barren = TRUE) {
+  veg_char <- as.character(coefs$Veg)
+  mask <- !is.na(veg_char) & nchar(trimws(veg_char)) > 0 & trimws(veg_char) != "NA"
+  if (exclude_barren) mask <- mask & !normalize_veg_name(veg_char) %in% c("barren")
+  coefs[mask, ]
+}
 
+# --- Shared utility: aggregate batch results into a results list ---
+aggregate_batch_results <- function(batch_results, results_list, save_csv_dir = NULL) {
+  for (k in names(batch_results)) {
+    loc_result <- batch_results[[k]]
+    if (is.null(loc_result)) next
+    if (!is.null(save_csv_dir)) {
+      loc_data <- do.call(rbind, lapply(loc_result, function(yr_res) yr_res$coef_df))
+      if (!is.null(loc_data) && nrow(loc_data) > 0) {
+        out_fname <- file.path(save_csv_dir, paste0("result_", make.names(k), ".csv"))
+        readr::write_csv(loc_data, out_fname)
+      }
+    }
+    for (yr_char in names(loc_result)) {
+      r <- loc_result[[yr_char]]
+      if (is.null(r)) next
+      if (!is.null(save_csv_dir) && (is.null(r$coef_df) || nrow(r$coef_df) == 0)) next
+      res_key <- if (!is.null(r$coef_df) && "pheno_year" %in% names(r$coef_df)) {
+        paste(k, r$coef_df$pheno_year[1], sep = "_")
+      } else {
+        paste(k, yr_char, sep = "_")
+      }
+      results_list[[res_key]] <- list(
+        coef_df = r$coef_df,
+        diagnostics = r$diagnostics,
+        uncertainty = r$uncertainty
+      )
+    }
+  }
+  results_list
+}
+
+# --- Shared plot constants ---
+HERBS_WOODY_COLORS <- c("Herbs" = "#2E8B57", "Woody" = "#8B4513")
+SPECIES_COLORS <- c("Herbs" = "#2E8B57", "Populus" = "#228B22", "Tamarix" = "#CD853F", "Woody Unknown" = "#808080")
+WOODY_TYPES_COLORS <- c("Tamarix" = "#CD853F", "Populus" = "#228B22", "Woody Unknown" = "#808080")
+
+# --- Shared utility: normalize vegetation names (lowercase + trim) ---
+normalize_veg_name <- function(x) tolower(trimws(as.character(x)))
+
+# --- Shared utility: compute pairwise Haversine distance matrix (km) ---
+compute_haversine_distance_matrix <- function(coords) {
+  rad <- pi / 180
+  n_v <- nrow(coords)
+  dist_mat <- matrix(0, n_v, n_v)
+  for (ii in 1:(n_v - 1)) {
+    for (jj in (ii + 1):n_v) {
+      dlat <- (coords[jj, 2] - coords[ii, 2]) * rad
+      dlon <- (coords[jj, 1] - coords[ii, 1]) * rad
+      a <- sin(dlat / 2)^2 + cos(coords[ii, 2] * rad) * cos(coords[jj, 2] * rad) * sin(dlon / 2)^2
+      dist_mat[ii, jj] <- 2 * 6371 * asin(sqrt(a))
+      dist_mat[jj, ii] <- dist_mat[ii, jj]
+    }
+  }
+  dist_mat
+}
+
+# --- Shared utility: fit exponential variogram via NLS with fallback ---
+fit_exponential_variogram <- function(bin_mid, bin_gamma, total_var, dists) {
+  valid_bins <- !is.na(bin_gamma)
+  if (sum(valid_bins) < 2) return(NULL)
+  tryCatch({
+    nls_fit <- nls(g ~ s * (1 - exp(-d / r)),
+                   data = data.frame(d = bin_mid[valid_bins], g = bin_gamma[valid_bins]),
+                   start = list(s = total_var, r = median(dists)),
+                   lower = list(s = total_var * 0.1, r = max(dists) * 0.01),
+                   upper = list(s = total_var * 3, r = max(dists) * 2),
+                   algorithm = "port",
+                   control = list(maxiter = 50, warnOnly = TRUE))
+    as.numeric(coef(nls_fit)["r"])
+  }, error = function(e) {
+    thresh_idx <- which(bin_gamma[valid_bins] >= 0.5 * total_var)
+    if (length(thresh_idx) > 0) bin_mid[valid_bins][thresh_idx[1]]
+    else max(dists)
+  })
+}
+
+# --- Shared utility: get dominant veg type per location ---
+get_dominant_veg_per_location <- function(df) {
+  df %>%
+    dplyr::group_by(location_id, Veg) %>%
+    dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+    dplyr::arrange(location_id, dplyr::desc(n)) %>%
+    dplyr::group_by(location_id) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup()
+}
+
+# --- Shared utility: deduplicate coordinates preferring finite lat/lon ---
+deduplicate_coords <- function(df) {
+  ok <- is.finite(df$lat) & is.finite(df$lon)
+  df <- df[order(df$location_id, -as.integer(ok)), , drop = FALSE]
+  df[!duplicated(df$location_id), , drop = FALSE]
+}
+
+# --- Shared utility: left_join and fill missing Veg from geo source ---
+join_and_fill_veg <- function(df, geo_map, join_by = "location_id") {
+  joined <- dplyr::left_join(df, geo_map, by = join_by, suffix = c("", ".geo"))
+  if ("Veg.geo" %in% names(joined)) {
+    joined$Veg <- ifelse(is.na(joined$Veg) | joined$Veg == "", joined$Veg.geo, joined$Veg)
+    joined$Veg.geo <- NULL
+  }
+  joined
+}
+
+# --- Shared utility: plot all inference results for a given method ---
+# Replaces 4 nearly identical PPI/MSAVI/NDVI/NoIndex inference plot blocks (~400 lines).
+plot_inference_method_results <- function(full_data, method, file_prefix,
+                                          use_excluded_years_shade = TRUE,
+                                          include_species_plots = TRUE,
+                                          include_woody_types_plot = FALSE) {
+  if (is.null(full_data) || nrow(full_data) == 0) return(invisible(NULL))
+
+  veg_norm <- normalize_veg_name(full_data$Veg)
+  inf_veg <- full_data[!veg_norm %in% c("barren"), ]
+  inf_barren <- full_data[veg_norm %in% c("barren"), ]
+
+  # Helper: base layers for time series plots
+  .ts_layers <- function() {
+    layers <- list()
+    if (use_excluded_years_shade) layers <- c(layers, list(add_excluded_years_shade(is_date = FALSE)))
+    layers <- c(layers, list(add_year_lines(is_date = FALSE)))
+    layers
+  }
+
+  # 1. Vegetation time series
+  if (!is.null(inf_veg) && nrow(inf_veg) > 0) {
+    p_ts <- ggplot(inf_veg, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
+      .ts_layers() +
+      geom_line(linewidth = 1) +
+      geom_point(show.legend = FALSE) +
+      geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
+      labs(title = paste0(method, "-Normalized Vegetation Fractions"),
+           x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
+      theme_minimal()
+    ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_normalized_timeseries.png")), p_ts, width = 8, height = 6)
+    readr::write_csv(inf_veg, file.path(OUT_DIR, paste0("inference_", file_prefix, "_normalized_timeseries.csv")))
+    cat(sprintf("Saved inference %s-normalized time series plot to: %s\n", method, file.path(OUT_DIR, paste0("inference_", file_prefix, "_normalized_timeseries.png"))))
+  }
+
+  if (is.null(inf_barren) || nrow(inf_barren) == 0) {
+    cat(sprintf("[INFERENCE] No barren rows found in %s inference aggregation results.\n", method))
+    return(invisible(NULL))
+  }
+
+  # 2. Barren cover
+  p_barren <- ggplot(inf_barren, aes(x = year, y = global_coef)) +
+    .ts_layers() +
+    geom_line(color = "saddlebrown", linewidth = 1) +
+    geom_point(color = "saddlebrown") +
+    geom_ribbon(aes(ymin = coef_025, ymax = coef_975), alpha = 0.15, fill = "saddlebrown", color = NA) +
+    labs(title = paste0(method, "-Based Barren Fraction"), x = "Year", y = "Barren Fraction") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
+    theme_minimal()
+  ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_barren_cover.png")), p_barren, width = 8, height = 6)
+  readr::write_csv(inf_barren, file.path(OUT_DIR, paste0("inference_", file_prefix, "_barren_cover.csv")))
+  cat(sprintf("Saved inference %s-based barren cover plot to: %s\n", method, file.path(OUT_DIR, paste0("inference_", file_prefix, "_barren_cover.png"))))
+
+  # 3. Herbs vs Woody
+  herbs_woody <- full_data[veg_norm %in% c("herbs", "woody"), ]
+  if (nrow(herbs_woody) == 0) {
+    cat(sprintf("No herbs/woody data available for inference %s herbs vs woody plot.\n", method))
+    return(invisible(NULL))
+  }
+  herbs_woody$Veg <- ifelse(tolower(herbs_woody$Veg) == "herbs", "Herbs", "Woody")
+  p_hw <- ggplot(herbs_woody, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
+    .ts_layers() +
+    geom_line(linewidth = 1) +
+    geom_point(show.legend = FALSE) +
+    geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
+    scale_color_manual(values = HERBS_WOODY_COLORS) +
+    scale_fill_manual(values = HERBS_WOODY_COLORS) +
+    labs(title = paste0("Inference ", method, ": Herbs vs Woody Vegetation"),
+         x = "Year", y = "Total Normalized Fraction", color = "Type", fill = "Type") +
+    theme_minimal()
+  ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_herbs_vs_woody.png")), p_hw, width = 8, height = 6)
+  readr::write_csv(herbs_woody, file.path(OUT_DIR, paste0("inference_", file_prefix, "_herbs_vs_woody.csv")))
+  cat(sprintf("Saved inference %s herbs vs woody plot to: %s\n", method, file.path(OUT_DIR, paste0("inference_", file_prefix, "_herbs_vs_woody.png"))))
+
+  # 4. Species-level plots (no "Woody" aggregation)
+  if (include_species_plots) {
+    species_data <- full_data[veg_norm %in% c("herbs","populus","tamarix","woody_unknown"), ]
+    if (nrow(species_data) > 0) {
+      species_data$Veg <- dplyr::case_when(
+        tolower(species_data$Veg) == "herbs" ~ "Herbs",
+        tolower(species_data$Veg) == "populus" ~ "Populus",
+        tolower(species_data$Veg) == "tamarix" ~ "Tamarix",
+        tolower(species_data$Veg) == "woody_unknown" ~ "Woody Unknown",
+        TRUE ~ species_data$Veg
+      )
+
+      p_sp_ts <- ggplot(species_data, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
+        .ts_layers() +
+        geom_line(linewidth = 1) +
+        geom_point(show.legend = FALSE) +
+        geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.12, color = NA) +
+        scale_color_manual(values = SPECIES_COLORS) +
+        scale_fill_manual(values = SPECIES_COLORS) +
+        labs(title = paste0("Inference ", method, ": Species (no Woody aggregation)"),
+             x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
+        theme_minimal()
+      ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_separate.png")), p_sp_ts, width = 8, height = 6)
+      readr::write_csv(species_data, file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_separate.csv")))
+      cat(sprintf("Saved inference %s species (no woody aggregation) plot to: %s\n", method, file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_separate.png"))))
+
+      # Species stacked proportion
+      df_wide_sp <- tryCatch({ tidyr::pivot_wider(species_data |> dplyr::select(year, Veg, global_coef), names_from = Veg, values_from = global_coef) }, error = function(e) NULL)
+      if (!is.null(df_wide_sp)) {
+        sp_cols <- intersect(c("Herbs","Populus","Tamarix","Woody Unknown"), names(df_wide_sp))
+        if (length(sp_cols) >= 2) {
+          for (col in sp_cols) {
+            df_wide_sp[[col]] <- as.numeric(df_wide_sp[[col]])
+            df_wide_sp[[col]][is.na(df_wide_sp[[col]])] <- 0
+          }
+          df_wide_sp$total <- rowSums(df_wide_sp[, sp_cols, drop = FALSE], na.rm = TRUE)
+          df_prop_sp <- df_wide_sp |> dplyr::filter(is.finite(total) & total > 0) |>
+            dplyr::mutate(across(all_of(sp_cols), ~ . / total)) |>
+            tidyr::pivot_longer(cols = all_of(sp_cols), names_to = "Veg", values_to = "prop")
+
+          p_sp_stacked <- ggplot(df_prop_sp, aes(x = year, y = prop, fill = Veg)) +
+            geom_area() +
+            scale_fill_manual(values = SPECIES_COLORS) +
+            labs(title = paste0("Inference ", method, ": Species (Proportion, stacked)"),
+                 x = "Year", y = "Proportion", fill = "Veg") +
+            theme_minimal()
+          ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_stacked.png")), p_sp_stacked, width = 8, height = 6)
+          readr::write_csv(df_prop_sp, file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_stacked.csv")))
+          cat(sprintf("Saved inference %s species stacked plot to: %s\n", method, file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_stacked.png"))))
+        }
+      }
+    }
+  }
+
+  # 5. Stacked area (Proportion) and Woody/Herbs ratio
+  df_wide <- tryCatch({
+    tidyr::pivot_wider(herbs_woody |> dplyr::select(year, Veg, global_coef), names_from = Veg, values_from = global_coef)
+  }, error = function(e) NULL)
+  if (!is.null(df_wide) && all(c("Herbs","Woody") %in% names(df_wide))) {
+    df_wide$Herbs <- as.numeric(df_wide$Herbs)
+    df_wide$Woody <- as.numeric(df_wide$Woody)
+    df_wide$total <- rowSums(df_wide[, c("Herbs","Woody")], na.rm = TRUE)
+
+    df_prop <- df_wide |> dplyr::filter(is.finite(total) & total > 0) |>
+      dplyr::mutate(Herbs = Herbs/total, Woody = Woody/total) |>
+      tidyr::pivot_longer(cols = c("Herbs","Woody"), names_to = "Veg", values_to = "prop")
+    p_stacked <- ggplot(df_prop, aes(x = year, y = prop, fill = Veg)) +
+      geom_area() +
+      scale_fill_manual(values = HERBS_WOODY_COLORS) +
+      labs(title = paste0("Inference ", method, ": Herbs vs Woody (Proportion, stacked)"),
+           x = "Year", y = "Proportion", fill = "Type") +
+      theme_minimal()
+    ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_herbs_vs_woody_stacked.png")), p_stacked, width = 8, height = 6)
+    readr::write_csv(df_prop, file.path(OUT_DIR, paste0("inference_", file_prefix, "_herbs_vs_woody_stacked.csv")))
+    cat(sprintf("Saved inference %s herbs vs woody stacked plot to: %s\n", method, file.path(OUT_DIR, paste0("inference_", file_prefix, "_herbs_vs_woody_stacked.png"))))
+
+    df_ratio <- df_wide |> dplyr::mutate(ratio = ifelse(is.finite(Herbs) & Herbs > 0, Woody / Herbs, NA_real_))
+    p_ratio <- ggplot(df_ratio, aes(x = year, y = ratio)) +
+      geom_line(color = "#8B4513", linewidth = 1) +
+      geom_point() +
+      labs(title = paste0("Inference ", method, ": Woody / Herbs Ratio"),
+           x = "Year", y = "Woody / Herbs") +
+      theme_minimal()
+    ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_woody_over_herbs.png")), p_ratio, width = 8, height = 6)
+    readr::write_csv(df_ratio, file.path(OUT_DIR, paste0("inference_", file_prefix, "_woody_over_herbs.csv")))
+    cat(sprintf("Saved inference %s woody/herbs ratio plot to: %s\n", method, file.path(OUT_DIR, paste0("inference_", file_prefix, "_woody_over_herbs.png"))))
+  } else {
+    cat(sprintf("Cannot create inference %s stacked/ratio plot: missing Herbs/Woody rows.\n", method))
+  }
+
+  # 6. Tamarix vs Populus vs Woody_unknown stacked plot (PPI only)
+  if (include_woody_types_plot) {
+    woody_types <- full_data[veg_norm %in% c("tamarix", "populus", "woody_unknown"), ]
+    if (nrow(woody_types) > 0) {
+      woody_types$Veg <- dplyr::case_when(
+        tolower(woody_types$Veg) == "tamarix" ~ "Tamarix",
+        tolower(woody_types$Veg) == "populus" ~ "Populus",
+        tolower(woody_types$Veg) == "woody_unknown" ~ "Woody Unknown",
+        TRUE ~ woody_types$Veg
+      )
+      df_wide_woody <- tryCatch({
+        tidyr::pivot_wider(woody_types |> dplyr::select(year, Veg, global_coef), names_from = Veg, values_from = global_coef)
+      }, error = function(e) NULL)
+      if (!is.null(df_wide_woody)) {
+        woody_cols <- intersect(c("Tamarix", "Populus", "Woody Unknown"), names(df_wide_woody))
+        if (length(woody_cols) >= 2) {
+          for (col in woody_cols) {
+            df_wide_woody[[col]] <- as.numeric(df_wide_woody[[col]])
+            df_wide_woody[[col]][is.na(df_wide_woody[[col]])] <- 0
+          }
+          df_wide_woody$total <- rowSums(df_wide_woody[, woody_cols, drop = FALSE], na.rm = TRUE)
+          df_prop_woody <- df_wide_woody |>
+            dplyr::filter(is.finite(total) & total > 0) |>
+            dplyr::mutate(across(all_of(woody_cols), ~ . / total)) |>
+            tidyr::pivot_longer(cols = all_of(woody_cols), names_to = "Veg", values_to = "prop")
+          p_woody_stacked <- ggplot(df_prop_woody, aes(x = year, y = prop, fill = Veg)) +
+            geom_area() +
+            scale_fill_manual(values = WOODY_TYPES_COLORS) +
+            labs(title = paste0("Inference ", method, ": Tamarix vs Populus vs Woody Unknown (Proportion, stacked)"),
+                 x = "Year", y = "Proportion", fill = "Type") +
+            theme_minimal()
+          ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_tamarix_populus_woody_unknown_stacked.png")), p_woody_stacked, width = 8, height = 6)
+          readr::write_csv(df_prop_woody, file.path(OUT_DIR, paste0("inference_", file_prefix, "_tamarix_populus_woody_unknown_stacked.csv")))
+          cat(sprintf("Saved inference %s Tamarix vs Populus vs Woody Unknown stacked plot to: %s\n", method, file.path(OUT_DIR, paste0("inference_", file_prefix, "_tamarix_populus_woody_unknown_stacked.png"))))
+        } else {
+          cat(sprintf("Cannot create inference %s Tamarix/Populus/Woody_unknown stacked plot: need at least 2 of these veg types.\n", method))
+        }
+      } else {
+        cat(sprintf("Cannot create inference %s Tamarix/Populus/Woody_unknown stacked plot: pivot failed.\n", method))
+      }
+    } else {
+      cat(sprintf("No Tamarix/Populus/Woody_unknown data available for inference %s woody types stacked plot.\n", method))
+    }
+  }
+
+  invisible(NULL)
+}
+
+# RAW_BANDS defined in mesma_config.R
 # NOTE: Keep default args literal (not RAW_BANDS) so this remains worker-safe in parallel futures.
 normalize_band_names <- function(df, bands = c("blue", "green", "red", "nir", "swir1", "swir2")) {
   if (is.null(df)) stop("normalize_band_names: df is NULL")
@@ -368,102 +506,71 @@ compute_indices_from_bands <- function(df,
     soil_slope <- suppressWarnings(as.numeric(get("SOIL_LINE_SLOPE", inherits = TRUE)))
   }
 
-  if (all(c('nir','red') %in% names(df))) df$DVI <- as.numeric(df$nir) - as.numeric(df$red)
-  if (all(c('nir','red') %in% names(df)) && is.finite(soil_slope)) df$WDVI <- as.numeric(df$nir) - soil_slope * as.numeric(df$red)
-  if (all(c('nir','red') %in% names(df))) df$OSAVI <- (as.numeric(df$nir) - as.numeric(df$red)) / (as.numeric(df$nir) + as.numeric(df$red) + 0.16)
-  if (all(c('red','green','blue') %in% names(df))) df$MCARI <- ((as.numeric(df$red) - as.numeric(df$green)) - 0.2*(as.numeric(df$red) - as.numeric(df$blue))) * (as.numeric(df$red) / (as.numeric(df$green) + eps))
-  if (all(c('green','red') %in% names(df))) df$PRI <- (as.numeric(df$green) - as.numeric(df$red)) / (as.numeric(df$green) + as.numeric(df$red) + eps)
-    if (all(c('nir','red') %in% names(df))) df$NIRv <- as.numeric(df$nir) * ((as.numeric(df$nir) - as.numeric(df$red)) / (as.numeric(df$nir) + as.numeric(df$red) + eps))
-  if (all(c('red','blue','nir') %in% names(df))) df$PSRI <- (as.numeric(df$red) - as.numeric(df$blue)) / (as.numeric(df$nir) + eps)
-  if (all(c('nir','swir2') %in% names(df))) df$NBR <- (as.numeric(df$nir) - as.numeric(df$swir2)) / (as.numeric(df$nir) + as.numeric(df$swir2) + eps)
+  # Convert bands to numeric once (avoids 50+ repeated as.numeric() calls)
+  b <- list()
+  for (bn in has_bands) b[[bn]] <- as.numeric(df[[bn]])
+
+  has <- function(...) all(c(...) %in% names(b))
+
+  if (has('nir','red')) {
+    df$DVI  <- b$nir - b$red
+    df$OSAVI <- (b$nir - b$red) / (b$nir + b$red + 0.16)
+    df$NIRv <- b$nir * ((b$nir - b$red) / (b$nir + b$red + eps))
+    df$NDDI <- (b$red - b$nir) / (b$red + b$nir + eps)
+    df$MSAVI <- (2 * b$nir + 1 - sqrt(pmax(0, (2 * b$nir + 1)^2 - 8 * (b$nir - b$red)))) / 2
+    if (is.finite(soil_slope)) df$WDVI <- b$nir - soil_slope * b$red
+  }
+  if (has('green','red'))       df$PRI  <- (b$green - b$red) / (b$green + b$red + eps)
+  if (has('red','blue','nir'))  df$PSRI <- (b$red - b$blue) / (b$nir + eps)
+  if (has('nir','swir2'))       df$NBR  <- (b$nir - b$swir2) / (b$nir + b$swir2 + eps)
+  if (has('nir','swir1'))       df$NDMI <- (b$nir - b$swir1) / (b$nir + b$swir1 + eps)
+  if (has('swir1','swir2'))     df$NDTI <- (b$swir1 - b$swir2) / (b$swir1 + b$swir2 + eps)
+  if (has('nir','green'))       df$CIG  <- (b$nir / (b$green + eps)) - 1
+  if (has('nir','green'))       df$GNDVI <- (b$nir - b$green) / (b$nir + b$green + eps)
+  if (has('green','nir'))       df$NDWI <- (b$green - b$nir) / (b$green + b$nir + eps)
+  if (has('swir1','nir')) {
+    df$NDBI <- (b$swir1 - b$nir) / (b$swir1 + b$nir + eps)
+    df$MSI  <- b$swir1 / (b$nir + eps)
+  }
+
+  if (has('red','green','blue'))
+    df$MCARI <- ((b$red - b$green) - 0.2*(b$red - b$blue)) * (b$red / (b$green + eps))
 
   # Tasseled Cap indices (Landsat 8 OLI coefficients - Baig et al. 2014)
-  if (all(c('green','red','nir','swir1','swir2','blue') %in% names(df))) {
-    df$TCB <- 0.3029 * as.numeric(df$blue) + 0.2786 * as.numeric(df$green) + 0.4733 * as.numeric(df$red) + 0.5599 * as.numeric(df$nir) + 0.508 * as.numeric(df$swir1) + 0.1872 * as.numeric(df$swir2)
-    df$TCG <- -0.2941 * as.numeric(df$blue) - 0.243 * as.numeric(df$green) - 0.5424 * as.numeric(df$red) + 0.7276 * as.numeric(df$nir) + 0.0713 * as.numeric(df$swir1) - 0.1608 * as.numeric(df$swir2)
-    df$TCW <- 0.1511 * as.numeric(df$blue) + 0.1973 * as.numeric(df$green) + 0.3283 * as.numeric(df$red) + 0.3407 * as.numeric(df$nir) - 0.7117 * as.numeric(df$swir1) - 0.4559 * as.numeric(df$swir2)
+  if (has('blue','green','red','nir','swir1','swir2')) {
+    df$TCB <- 0.3029*b$blue + 0.2786*b$green + 0.4733*b$red + 0.5599*b$nir + 0.508*b$swir1 + 0.1872*b$swir2
+    df$TCG <- -0.2941*b$blue - 0.243*b$green - 0.5424*b$red + 0.7276*b$nir + 0.0713*b$swir1 - 0.1608*b$swir2
+    df$TCW <- 0.1511*b$blue + 0.1973*b$green + 0.3283*b$red + 0.3407*b$nir - 0.7117*b$swir1 - 0.4559*b$swir2
     df$GVI <- df$TCG
-
   }
 
   # NDVI intentionally omitted from computed indices to avoid using it in MESMA fitting
-  if (all(c('nir','red') %in% names(df))) {
-    df$MSAVI <- (2 * as.numeric(df$nir) + 1 - sqrt(pmax(0, (2 * as.numeric(df$nir) + 1)^2 - 8 * (as.numeric(df$nir) - as.numeric(df$red))))) / 2
-  }
-  if (all(c('nir','swir1') %in% names(df))) df$NDMI <- (as.numeric(df$nir) - as.numeric(df$swir1)) / (as.numeric(df$nir) + as.numeric(df$swir1) + eps)
 
-  # Enhanced Vegetation Index (EVI)
-  if (all(c('nir','red','blue') %in% names(df))) {
-    df$EVI <- 2.5 * ((as.numeric(df$nir) - as.numeric(df$red)) / (as.numeric(df$nir) + 6 * as.numeric(df$red) - 7.5 * as.numeric(df$blue) + 1 + eps))
-  }
+  if (has('nir','red','blue'))
+    df$EVI <- 2.5 * ((b$nir - b$red) / (b$nir + 6*b$red - 7.5*b$blue + 1 + eps))
 
-  # NDTI - Normalized Difference Tillage Index (Van Deventer et al. 1997)
-  if (all(c('swir1','swir2') %in% names(df))) df$NDTI <- (as.numeric(df$swir1) - as.numeric(df$swir2)) / (as.numeric(df$swir1) + as.numeric(df$swir2) + eps)
+  if (has('swir1','red','swir2'))
+    df$SATVI <- ((b$swir1 - b$red) / (b$swir1 + b$red + 0.5 + eps)) * 1.5 - (b$swir2 / 2)
 
-  # NDDI - Normalized Difference Dust Index
-  if (all(c('red','nir') %in% names(df))) df$NDDI <- (as.numeric(df$red) - as.numeric(df$nir)) / (as.numeric(df$red) + as.numeric(df$nir) + eps)
-
-  # SATVI - Soil Adjusted Total Vegetation Index (Marsett et al. 2006)
-  if (all(c('swir1','red','swir2') %in% names(df))) df$SATVI <- ((as.numeric(df$swir1) - as.numeric(df$red)) / (as.numeric(df$swir1) + as.numeric(df$red) + 0.5 + eps)) * 1.5 - (as.numeric(df$swir2) / 2)
-
-  # CIG - Chlorophyll Index Green (Gitelson et al. 2005)
-  if (all(c('nir','green') %in% names(df))) df$CIG <- (as.numeric(df$nir) / (as.numeric(df$green) + eps)) - 1
-
-  # BSI - Bare Soil Index (Rikimaru et al. 2002)
-  if (all(c('swir1','red','nir','blue') %in% names(df))) {
-    term1 <- as.numeric(df$swir1) + as.numeric(df$red)
-    term2 <- as.numeric(df$nir) + as.numeric(df$blue)
+  if (has('swir1','red','nir','blue')) {
+    term1 <- b$swir1 + b$red; term2 <- b$nir + b$blue
     df$BSI <- (term1 - term2) / (term1 + term2 + eps)
   }
 
-  # --- Additional complementary indices ---
-  # NDWI (McFeeters 1996): open water / surface wetness (green vs nir)
-  if (all(c('green','nir') %in% names(df))) {
-    df$NDWI <- (as.numeric(df$green) - as.numeric(df$nir)) / (as.numeric(df$green) + as.numeric(df$nir) + eps)
-  }
+  if (has('green','red','blue'))
+    df$VARI <- (b$green - b$red) / (b$green + b$red - b$blue + eps)
 
-  # NDBI (Zha et al. 2003): built-up / bare soil proxy (swir1 vs nir)
-  if (all(c('swir1','nir') %in% names(df))) {
-    df$NDBI <- (as.numeric(df$swir1) - as.numeric(df$nir)) / (as.numeric(df$swir1) + as.numeric(df$nir) + eps)
-  }
+  if (has('nir','blue','red'))
+    df$SIPI <- (b$nir - b$blue) / (b$nir - b$red + eps)
 
-  # MSI: moisture stress index (SWIR1/NIR)
-  if (all(c('swir1','nir') %in% names(df))) {
-    df$MSI <- as.numeric(df$swir1) / (as.numeric(df$nir) + eps)
-  }
-
-  # VARI: visible atmospherically resistant index (green-red / green+red-blue)
-  if (all(c('green','red','blue') %in% names(df))) {
-    df$VARI <- (as.numeric(df$green) - as.numeric(df$red)) / (as.numeric(df$green) + as.numeric(df$red) - as.numeric(df$blue) + eps)
-  }
-
-  # SIPI: structure insensitive pigment index (nir-blue)/(nir-red)
-  if (all(c('nir','blue','red') %in% names(df))) {
-    df$SIPI <- (as.numeric(df$nir) - as.numeric(df$blue)) / (as.numeric(df$nir) - as.numeric(df$red) + eps)
-  }
-
-  # ARVI: atmospherically resistant vegetation index
-  if (all(c('nir','red','blue') %in% names(df))) {
-    rb <- (2 * as.numeric(df$red) - as.numeric(df$blue))
-    df$ARVI <- (as.numeric(df$nir) - rb) / (as.numeric(df$nir) + rb + eps)
-  }
-
-  # GNDVI: green NDVI (chlorophyll proxy)
-  if (all(c('nir','green') %in% names(df))) {
-    df$GNDVI <- (as.numeric(df$nir) - as.numeric(df$green)) / (as.numeric(df$nir) + as.numeric(df$green) + eps)
+  if (has('nir','red','blue')) {
+    rb <- 2*b$red - b$blue
+    df$ARVI <- (b$nir - rb) / (b$nir + rb + eps)
   }
 
   if ('NIRv' %in% names(df)) df$NIRv <- df$NIRv * 1.3
 
   df
-}
-
-compute_mad2 <- function(x, min_samples = 3) {
-  x <- x[is.finite(x)]
-  if (length(x) < min_samples) return(NA_real_)
-  m <- mad(x, na.rm = TRUE, constant = 1.4826)
-  if (!is.finite(m)) return(NA_real_)
-  m^2
 }
 
 
@@ -626,8 +733,7 @@ safe_col_weighted_avg <- function(mat, wts) {
   as.numeric(colSums(mat * wts, na.rm = TRUE))
 }
 
-OUTPUT_DIR <- "C:/MAP/phenology_results"
-OUT_DIR <- file.path(OUTPUT_DIR, "veg_mixture_fit")
+# OUTPUT_DIR and OUT_DIR defined in mesma_config.R
 
 if (!file.exists(INPUT_CSV)) {
   stop(paste0("Required input CSV not found: ", INPUT_CSV))
@@ -645,16 +751,8 @@ if (!"location_id" %in% names(raw_df) || (!"prediction_date" %in% names(raw_df) 
 
 date_col <- if ("prediction_date" %in% names(raw_df)) "prediction_date" else "date"
 
-# Treat certain classes as herbs
-veg_col <- if ("Veg" %in% names(raw_df)) "Veg" else if ("vegetation" %in% names(raw_df)) "vegetation" else NULL
-if (!is.null(veg_col)) {
-  # Fix typos first
-  raw_df[[veg_col]] <- ifelse(raw_df[[veg_col]] == "tamairx", "tamarix", raw_df[[veg_col]])
-  # Then map certain classes to herbs
-  raw_df[[veg_col]] <- ifelse(raw_df[[veg_col]] %in% c("herbs", "alhagi", "salicornia", "halocnemum", "phragmites"), "herbs", raw_df[[veg_col]])
-} else {
-  cat("[WARNING] Neither 'Veg' nor 'vegetation' column found in raw_df. Skipping Veg treatment for training data.\n")
-}
+# Canonicalize vegetation labels (typos, herbs grouping, agriculture aliases)
+raw_df <- canonicalize_veg_labels(raw_df)
 
 # === GEE INPUT MAPPING BLOCK ===
 # Map common GEE-exported column names to the names expected by this script
@@ -857,20 +955,6 @@ if ("NDDI" %in% names(df)) {
 }
 # ========================================================================================================
 
-normalize_indices_after_linearization <- function(df, cols = OPTIMAL_INDICES) {
-  present <- intersect(cols, names(df))
-  idx_scales <- list()
-  for (i in present) {
-    colv <- df[[i]]
-    if (!is.numeric(colv) || all(is.na(colv))) { idx_scales[[i]] <- 1; next }
-    scale_val <- as.numeric(stats::quantile(abs(colv), probs = 0.99, na.rm = TRUE))
-    if (!is.finite(scale_val) || scale_val <= 0) scale_val <- 1
-    df[[i]] <- df[[i]] / scale_val
-    idx_scales[[i]] <- scale_val
-  }
-  attr(df, 'INDEX_SCALES') <- idx_scales
-  df
-}
 
 # Robustly prune collinear features based on correlation matrix
 prune_collinear_features <- function(df, features, threshold = 0.95) {
@@ -969,13 +1053,10 @@ apply_stored_normalization <- function(df, norm_params, cols = unique(c(OPTIMAL_
     if (all(c("nir", "red") %in% names(df)) && !"DVI" %in% names(df)) {
       df$DVI <- as.numeric(df$nir) - as.numeric(df$red)
     }
-    if (exists("auto_add_ppi_columns")) {
-      ppi_try <- tryCatch({ auto_add_ppi_columns(df) }, error = function(e) e)
-      if (inherits(ppi_try, "error") || is.null(ppi_try) || !isTRUE(ppi_try$added)) {
-        stop("[PPI] Missing/non-finite PPI and auto_add_ppi_columns failed")
-      }
-      df <- ppi_try$df
-      cat("[PPI] Auto-added PPI to data before applying stored normalization.\n")
+    if (exists("add_ppi_columns")) {
+      dvi_soil_vec <- compute_dvi_soil_per_location(df)
+      df <- add_ppi_columns(df, dvi_soil = dvi_soil_vec)
+      cat("[PPI] Added PPI to data before applying stored normalization (per-location dvi_soil + per-location M).\n")
     }
   }
   if (!"PPI" %in% names(df) || all(!is.finite(df$PPI))) {
@@ -1059,23 +1140,10 @@ if (all(c("lon", "lat") %in% names(df))) {
 
 
 
-cat("\n=== GPTS_MAP LOADING DEBUG ===\n")
-if (exists("gpts_map")) {
-  cat(sprintf("Total locations in gpts_map: %d\n", nrow(gpts_map)))
-  cat(sprintf("Veg class distribution:\n"))
-  print(table(gpts_map$Veg, useNA = "ifany"))
-  cat(sprintf("Sample location_ids (first 5): %s\n", paste(head(gpts_map$location_id, 5), collapse=", ")))
-  barren_gpts_check <- gpts_map[tolower(gpts_map$Veg) == "barren", ]
-  cat(sprintf("Barren locations: %d\n", nrow(barren_gpts_check)))
-  if (nrow(barren_gpts_check) > 0) {
-    cat(sprintf("  Barren location_ids: %s\n", paste(head(barren_gpts_check$location_id, 10), collapse=", ")))
-  }
-} else {
+if (!exists("gpts_map")) {
   cat("[NOTICE] gpts_map object not found; continuing without location mapping.\n")
-  # Create a safe empty placeholder so later code can run existence checks
   gpts_map <- data.frame(location_id = character(0), location_row = character(0), Veg = character(0), stringsAsFactors = FALSE)
 }
-cat("==============================\n\n")
 
 if (nrow(gpts_map) == 0) {
   cat("[NOTICE] No location mapping points found; continuing without derived soil baselines.\n")
@@ -1109,24 +1177,6 @@ if ("location_id" %in% names(df) && "location_id" %in% names(gpts_map)) {
   pre_non_na <- sum(!is.na(df$Veg) & df$Veg != "")
 
   joined <- dplyr::left_join(df, gpts_map, by = "location_id", suffix = c("", ".geo"))
-  cat("\n=== BARREN JOIN DEBUG ===\n")
-  barren_gpts <- gpts_map[tolower(gpts_map$Veg) == "barren", ]
-  cat(sprintf("Barren locations in gpts_map: %d\n", length(unique(barren_gpts$location_id))))
-  if (nrow(barren_gpts) > 0) {
-    sample_barren_ids <- head(unique(barren_gpts$location_id), 5)
-    cat(sprintf("  Sample barren location_ids: %s\n", paste(sample_barren_ids, collapse=", ")))
-    for (bid in sample_barren_ids) {
-      matched_rows <- joined[joined$location_id == bid, ]
-      cat(sprintf("  Location %s: %d rows in joined, Veg values: %s\n", 
-                  bid, nrow(matched_rows), 
-                  paste(unique(matched_rows$Veg), collapse=",")))
-      if ("Veg.geo" %in% names(matched_rows)) {
-        cat(sprintf("    Veg.geo values: %s\n", paste(unique(matched_rows$Veg.geo), collapse=",")))
-      }
-    }
-  }
-  cat("=========================\n\n")
-  
   if ("Veg.geo" %in% names(joined)) {
     joined$Veg <- ifelse(is.na(joined$Veg) | joined$Veg == "", joined$Veg.geo, joined$Veg)
     joined$Veg.geo <- NULL
@@ -1221,22 +1271,19 @@ compute_soil_line_slope(df)
 df <- compute_indices_from_bands(df)
 
 # STEP 2: Calculate PPI on raw data, now that Veg column is available
-if (!"pheno_year" %in% names(df) && "date" %in% names(df)) df$pheno_year <- assign_pheno_year(as.Date(df$date))
 cat("[NOTICE] Retaining all years for PPI baseline calculation and trend analysis. Training subset will be filtered later.\n")
-if (exists("auto_add_ppi_columns")) {
+if (exists("add_ppi_columns")) {
   if (!"PPI" %in% names(df) || all(!is.finite(df$PPI))) {
-    ppi_pre_res <- tryCatch({ auto_add_ppi_columns(df) }, error = function(e) { cat(sprintf("[PPI] auto_add_ppi_columns error: %s\n", e$message)); NULL })
-    if (!is.null(ppi_pre_res)) {
-      df <- ppi_pre_res$df
-      if (isTRUE(ppi_pre_res$added)) {
-        cat(sprintf("[PPI] Auto-added PPI to dataset before normalization (reason: %s)\n", ppi_pre_res$reason))
-      }
-    }
+    dvi_soil_vec <- compute_dvi_soil_per_location(df)
+    df <- add_ppi_columns(df, dvi_soil = dvi_soil_vec)
+    cat("[PPI] Added PPI to dataset before normalization (per-location dvi_soil + per-location M).\n")
   }
+} else {
+  stop("[PPI] add_ppi_columns not available; cannot compute PPI")
 }
 
 if (!"PPI" %in% names(df) || all(!is.finite(df$PPI))) {
-  stop("[PPI] Training data is missing PPI or all PPI values are non-finite after auto_add_ppi_columns")
+  stop("[PPI] Training data is missing PPI or all PPI values are non-finite after PPI computation")
 }
 n_ppi_na <- sum(!is.finite(df$PPI))
 if (n_ppi_na > 0) {
@@ -1252,20 +1299,9 @@ if (exists("ENABLE_FEATURE_PRUNING") && isTRUE(ENABLE_FEATURE_PRUNING)) {
    OPTIMAL_INDICES <- prune_collinear_features(df, OPTIMAL_INDICES, threshold = thresh)
 }
 
-# Backup raw PPI for visualization weighting
-
-
-if ("PPI" %in% names(df)) {
-  df$PPI_raw <- df$PPI
-  cat("[NOTICE] Backed up raw PPI values to 'PPI_raw' before normalization.\n")
-}
-
-# Backup raw MSAVI and key bands for cover estimation.
-# NOTE: normalize_mesma_data() z-scores indices/bands; MSAVI-based FVC must use raw units.
-if ("MSAVI" %in% names(df)) {
-  df$MSAVI_raw <- df$MSAVI
-  cat("[NOTICE] Backed up raw MSAVI values to 'MSAVI_raw' before normalization.\n")
-}
+# Backup raw values before normalization (z-scoring)
+if ("PPI" %in% names(df) && !"PPI_raw" %in% names(df)) df$PPI_raw <- df$PPI
+if ("MSAVI" %in% names(df)) { df$MSAVI_raw <- df$MSAVI; cat("[NOTICE] Backed up raw MSAVI values to 'MSAVI_raw' before normalization.\n") }
 if ("nir" %in% names(df)) df$nir_raw <- df$nir
 if ("red" %in% names(df)) df$red_raw <- df$red
 
@@ -1273,20 +1309,8 @@ norm_result <- normalize_mesma_data(df, cols = unique(c(OPTIMAL_INDICES, RAW_BAN
 df <- norm_result$df
 INDEX_SCALES <- norm_result$INDEX_SCALES
 
-# Ensure a clamped per-observation PPI normalization fraction is present for downstream use
 ppi_max <- if (exists("PPI_FULL_VEG_COVER")) get("PPI_FULL_VEG_COVER") else 0.4
-if (!"ppi_norm" %in% names(df)) df$ppi_norm <- NA_real_
-# Prefer backed-up raw values if available; otherwise fall back to 'PPI' with a warning
-if ("PPI_raw" %in% names(df) && any(is.finite(df$PPI_raw))) {
-  df$ppi_norm <- pmin(pmax(df$PPI_raw / ppi_max, 0), 1)
-  cat(sprintf("[PPI NORM] Created 'ppi_norm' from 'PPI_raw' and clamped to [0,1] using PPI_FULL_VEG_COVER=%.3f\n", ppi_max))
-} else if ("PPI" %in% names(df) && any(is.finite(df$PPI))) {
-  df$ppi_norm <- pmin(pmax(df$PPI / ppi_max, 0), 1)
-  warning("'PPI_raw' not found - computed 'ppi_norm' from 'PPI' (may be z-scored); values were clamped to [0,1]. Consider backing up raw PPI before normalization.")
-} else {
-  df$ppi_norm <- NA_real_
-  cat("[PPI NORM] No PPI or PPI_raw available to compute 'ppi_norm' (all NA)\n")
-}
+df <- backup_and_normalize_ppi(df, ppi_max)
 
 # Filter to only include selected vegetation types
 selected_vegs <- c("herbs", "populus", "tamarix", "barren")
@@ -1372,8 +1396,6 @@ if (isTRUE(ENABLE_LDA_L2_NORMALIZATION)) {
 } else {
   cat("Feature representation: Raw only\n")
 }
-
-if (!"pheno_year" %in% names(df)) df$pheno_year <- assign_pheno_year(df$date)
 
 if (exists("TRAIN_YEARS") && !is.null(TRAIN_YEARS) && length(TRAIN_YEARS) > 0) {
   cat(sprintf("Filtering training data to phenological years (March-February): %s\n", paste(TRAIN_YEARS, collapse = ", ")))
@@ -1559,17 +1581,6 @@ if (isTRUE(PARALLEL_ENABLE)) {
 }
 on.exit(cleanup_parallel(), add = TRUE)
 
-
-chunked_rbind <- function(lst, chunk_size = 50L) {
-  if (is.null(lst) || length(lst) == 0) return(data.frame())
-  if (length(lst) == 1) return(lst[[1]])
-  
-  if (requireNamespace("dplyr", quietly = TRUE)) {
-    return(as.data.frame(dplyr::bind_rows(lst)))
-  }
-  
-  return(do.call(rbind, lst))
-}
 
 safe_lda_call <- function(X_pca, y, min_n_pcs = 2) {
   if (is.null(X_pca) || ncol(X_pca) < min_n_pcs) {
@@ -1881,12 +1892,8 @@ build_pentad_matrix <- function(dly_year, avail_idx, interpolate = TRUE) {
 
  
 
-apply_pca_lda_transform <- function(y, pca_lda_result) {
-  # NO-OP: PCA-LDA weights are applied ONLY in the solver (via feature_weights)
-  # This function now just returns the z-scored observation unchanged
-  # The solver will apply weights directly to both endmembers and observations
-  return(y)
-}
+# apply_pca_lda_transform removed (was a NO-OP returning y unchanged).
+# PCA-LDA weights are applied only in the solver via feature_weights.
 
 
 .run_map <- function(X, FUN, show_pb = TRUE) {
@@ -1953,13 +1960,7 @@ if (length(lon_candidates) > 0 && length(lat_candidates) > 0) {
   }
 }
 
-df$Veg <- tolower(df$Veg)
-
-# Merge vegetation categories: map 'agri' to 'agriculture'
-df$Veg <- dplyr::case_when(
-  tolower(trimws(df$Veg)) %in% c("agri", "agric", "agriculture", "agricultural") ~ "agriculture",
-  TRUE ~ df$Veg
-)
+df <- canonicalize_veg_labels(df)
 
 df_train$location_id <- as.character(df_train$location_id)
 df_train <- dplyr::left_join(df_train, gpts_map, by = "location_id", suffix = c("", ".geo"))
@@ -1968,57 +1969,17 @@ if ("Veg.geo" %in% names(df_train)) {
   df_train$Veg.geo <- NULL
 }
 
-df_train$Veg <- tolower(df_train$Veg)
-
-# Merge vegetation categories: map common agricultural aliases -> canonical 'agriculture'
-# Accept 'agri', 'agric', 'agricultural', and 'agriculture' (case-insensitive)
-df_train$Veg <- dplyr::case_when(
-  tolower(trimws(df_train$Veg)) %in% c("agri", "agric", "agriculture", "agricultural") ~ "agriculture",
-  TRUE ~ df_train$Veg
-)
+df_train <- canonicalize_veg_labels(df_train)
 
 if (!"date" %in% names(df)) stop("Input CSV must contain a 'date' column")
 df$date <- as.Date(df$date)
 if (!"location_id" %in% names(df)) stop("Input CSV must contain a 'location_id' column")
 
-if ("Veg" %in% names(df)) df$Veg <- tolower(as.character(df$Veg))
-
-# Merge vegetation categories: map common agricultural aliases -> canonical 'agriculture'
-# Accept 'agri', 'agric', 'agricultural', and 'agriculture' (case-insensitive)
-if ("Veg" %in% names(df)) {
-  df$Veg <- dplyr::case_when(
-    tolower(trimws(df$Veg)) %in% c("agri", "agric", "agriculture", "agricultural") ~ "agriculture",
-    TRUE ~ df$Veg
-  )
-}
+df <- canonicalize_veg_labels(df)
 
 df$doy <- pheno_doy(df$date)  # Use phenological DOY (March 1 = day 1)
 df$doy[df$doy < 1 | df$doy > 366] <- NA_integer_
 if (any(is.na(df$doy))) stop("[DOY] Missing/invalid DOY values after pheno_doy(); refusing to continue")
-
-cat("\n=== BARREN LOADING DEBUG ===\n")
-if (exists("gpts_map") && nrow(gpts_map) > 0) {
-  barren_in_gpts <- gpts_map[tolower(gpts_map$Veg) == "barren", ]
-  if (nrow(barren_in_gpts) > 0) {
-    cat(sprintf("  Sample location_ids: %s\n", paste(head(unique(barren_in_gpts$location_id), 5), collapse=", ")))
-  }
-  
-  barren_locs <- unique(barren_in_gpts$location_id)
-  barren_in_df <- df[df$location_id %in% barren_locs, ]
-  cat(sprintf("Barren locations found in phenology df: %d rows from %d locations\n", 
-              nrow(barren_in_df), length(unique(barren_in_df$location_id))))
-  
-  barren_veg_df <- df[tolower(df$Veg) == "barren", ]
-  cat(sprintf("Rows with Veg='barren' in df: %d\n", nrow(barren_veg_df)))
-  
-  if (nrow(barren_in_df) > 0 && nrow(barren_veg_df) == 0) {
-    cat("[WARNING] Barren locations exist in phenology data but Veg column not set to 'barren'!\n")
-    cat("  This indicates a join issue. Checking Veg values for barren locations:\n")
-    cat(sprintf("  Unique Veg values: %s\n", paste(unique(barren_in_df$Veg), collapse=", ")))
-  }
-}
-cat("=============================\n\n")
-
 
 veg_counts <- sort(table(na.omit(df$Veg)), decreasing = TRUE)
 cat("Vegetation class counts after loading:\n")
@@ -2072,8 +2033,8 @@ if (!"PPI" %in% names(df) || all(!is.finite(df$PPI))) {
   # If location_id is present, it will compute per-location baselines; otherwise, it will use a single baseline
   if (sum(is.finite(df$DVI)) > 0) {
     cat("[PPI] Auto-adding PPI: computing per-location baselines from median of lowest 10% of ALL DVI values across all years\n")
-    # Let add_ppi_columns compute per-location baselines automatically
-    df <- add_ppi_columns(df)
+    dvi_soil_vec <- compute_dvi_soil_per_location(df, quantile_p = 0.10)
+    df <- add_ppi_columns(df, dvi_soil = dvi_soil_vec)
   } else {
     stop("[PPI] Cannot compute PPI: no valid DVI values found")
   }
@@ -2173,13 +2134,11 @@ if (nrow(loc_years) == 0) {
 }
 
 cat("Constructing lib from TRAINING dataset...\n")
-if (FALSE) cat("[DEBUG] Defining functions...\n")
 lib <- list()
 
 
 
 
-if (FALSE) cat("[DEBUG] Functions defined successfully.\n")
 cat("===============================================\n\n")
 
 lib_df <- df
@@ -2378,18 +2337,7 @@ estimate_autocorrelation_range <- function(coords_df, values, fallback_km = 30.0
   if (var(vals, na.rm = TRUE) == 0) return(fallback_km)
 
   # Pairwise great-circle distances (km) via Haversine
-  n_v <- length(valid)
-  rad <- pi / 180
-  dist_mat <- matrix(0, n_v, n_v)
-  for (ii in 1:(n_v - 1)) {
-    for (jj in (ii + 1):n_v) {
-      dlat <- (coords[jj, 2] - coords[ii, 2]) * rad
-      dlon <- (coords[jj, 1] - coords[ii, 1]) * rad
-      a <- sin(dlat / 2)^2 + cos(coords[ii, 2] * rad) * cos(coords[jj, 2] * rad) * sin(dlon / 2)^2
-      dist_mat[ii, jj] <- 2 * 6371 * asin(sqrt(a))
-      dist_mat[jj, ii] <- dist_mat[ii, jj]
-    }
-  }
+  dist_mat <- compute_haversine_distance_matrix(coords)
 
   dists <- dist_mat[upper.tri(dist_mat)]
   coef_diffs_sq <- outer(vals, vals, function(a, b) (a - b)^2)
@@ -2510,376 +2458,83 @@ spatial_block_sample_locations <- function(locations, coords_df, n_draw,
   sample(pool, n_draw, replace = FALSE)
 }
 
+# PPI bootstrap: thin wrapper around the generic location_bootstrap_index
 location_bootstrap_ppi <- function(all_coefs, df_tasks, B = BOOTSTRAP_B, seed = 123) {
-  set.seed(seed)
-  if (!requireNamespace("dplyr", quietly = TRUE)) {
-    warning("dplyr required for PPI bootstrap")
-    return(NULL)
-  }
-
-  # PPI Normalization Constant (default to 0.4 if not global)
   ppi_max <- if (exists("PPI_FULL_VEG_COVER")) get("PPI_FULL_VEG_COVER") else 0.4
   if (ppi_max <= 0) ppi_max <- 0.4
-
-  # Identify PPI column (prefer raw if available)
-  ppi_col <- "PPI"
-  if ("PPI_raw" %in% names(df_tasks) && any(!is.na(df_tasks$PPI_raw))) {
-    ppi_col <- "PPI_raw"
-    cat("[PPI BOOTSTRAP] Using raw PPI values (PPI_raw) for weighting.\n")
-  } else if ("PPI" %in% names(df_tasks)) {
-    cat("[PPI BOOTSTRAP] Using standard PPI column (warning: likely normalized if Z-scores applied).\n")
-  } else {
-    warning("PPI column missing from df_tasks")
-    return(NULL)
-  }
-
-  # Defensive: ensure ppi_detrended column exists to avoid data.table warnings when referenced
-  if (!"ppi_detrended" %in% names(df_tasks)) df_tasks$ppi_detrended <- NA_real_
-
-  # Ensure temporal columns exist
-  if (!"month" %in% names(df_tasks)) {
-    if ("date" %in% names(df_tasks)) {
-      df_tasks$month <- as.integer(format(as.Date(df_tasks$date), "%m"))
-    } else {
-      df_tasks$month <- 1L 
-    }
-  }
-  if (!"doy" %in% names(df_tasks)) {
-    if ("date" %in% names(df_tasks)) {
-      df_tasks$doy <- as.numeric(format(as.Date(df_tasks$date), "%j"))
-    } else {
-      df_tasks$doy <- 150
-    }
-  }
-
-  # --- STEP 1: Pre-calculate Detrended Summer PPI (Vectorized) ---
-  summer_df <- df_tasks |> 
-    dplyr::filter(month %in% 6:9, get(ppi_col) > 0)
-  
-  if (nrow(summer_df) > 50) {
-    tryCatch({
-      f <- as.formula(paste(ppi_col, "~ poly(doy, 3)"))
-      seasonal_model <- lm(f, data = summer_df)
-      summer_df$seasonal_trend <- predict(seasonal_model, newdata = summer_df)
-      global_seasonal_mean <- mean(summer_df$seasonal_trend, na.rm = TRUE)
-      summer_df$ppi_detrended <- summer_df[[ppi_col]] - (summer_df$seasonal_trend - global_seasonal_mean)
-      # Ensure numeric and finite handling
-      summer_df$ppi_detrended <- as.numeric(summer_df$ppi_detrended)
-      cat(sprintf("[PPI BOOTSTRAP] Computed detrended summer PPI (N=%d).\n", nrow(summer_df)))
-    }, error = function(e) {
-      cat(sprintf("[PPI BOOTSTRAP] Detrending failed: %s. Using raw PPI.\n", e$message))
-      summer_df$ppi_detrended <- as.numeric(summer_df[[ppi_col]])
-    })
-  } else {
-    summer_df$ppi_detrended <- as.numeric(summer_df[[ppi_col]])
-    cat("[PPI BOOTSTRAP] Insufficient summer data for detrending; using raw values.\n")
-  }
-
-  # --- STEP 2: Generate Bootstrap Replicates per Location-Year (SUMMER ONLY) ---
-  # We need a matrix: Rows = Location-Year ID, Cols = B replicates
-  # Strategy:
-  # 1. Summarize summer_df to get list of B replicates.
-  # 2. STRICTLY use summer data. No annual fallback.
-
-  # Summer Bootstrap
-  boot_combined <- summer_df |>
-    dplyr::group_by(location_id, pheno_year) |>
-    dplyr::summarize(
-      ppi_boot_list = list(boot_median_vec(ppi_detrended, B)),
-      .groups = "drop"
-    )
-
-  # Expand list-columns into a matrix (or just lookup)
-  # We'll create a key -> index map and a large matrix
-  boot_combined$key <- paste(boot_combined$location_id, boot_combined$pheno_year, sep = "_")
-  
-  # Construct the matrix of PPI replicates
-  n_rows <- nrow(boot_combined)
-  ppi_boot_mat <- matrix(NA_real_, nrow = n_rows, ncol = B)
-  
-  for (i in 1:n_rows) {
-    s_vec <- boot_combined$ppi_boot_list[[i]]
-    if (!is.null(s_vec) && !all(is.na(s_vec))) {
-      ppi_boot_mat[i, ] <- s_vec
-    }
-  }
-  
-  # Map (loc, yr) -> row index
-  # We attach the row index to the coefficient data
-  key_map <- setNames(seq_len(n_rows), boot_combined$key)
-  
-  # Prepare Coefficient Data
-  # Remove pre-existing Barren rows and NA/empty Veg values to avoid confusion
-  veg_char <- as.character(all_coefs$Veg)
-  valid_veg_mask <- !is.na(veg_char) &
-                    nchar(trimws(veg_char)) > 0 &
-                    trimws(veg_char) != "NA" &
-                    !tolower(trimws(veg_char)) %in% c("barren")
-  merged_veg <- all_coefs[valid_veg_mask, ]
-
-  # Debug: show veg types before filtering
-  veg_before <- unique(merged_veg$Veg)
-  cat(sprintf("[PPI BOOTSTRAP DEBUG] Veg types before PPI join: %s (n=%d rows)\n", paste(veg_before, collapse=", "), nrow(merged_veg)))
-
-  # Create key for joining
-  merged_veg$key <- paste(merged_veg$location_id, merged_veg$pheno_year, sep = "_")
-  merged_veg$ppi_row_idx <- key_map[merged_veg$key]
-
-  # Debug: show how many rows match PPI data
-  n_matched <- sum(!is.na(merged_veg$ppi_row_idx))
-  n_total <- nrow(merged_veg)
-  cat(sprintf("[PPI BOOTSTRAP DEBUG] PPI key match: %d/%d rows (%.1f%%)\n", n_matched, n_total, 100*n_matched/max(1,n_total)))
-
-  # Filter out rows with no PPI data
-  merged_veg <- merged_veg[!is.na(merged_veg$ppi_row_idx), ]
-
-  # Debug: show veg types after filtering
-  veg_after <- unique(merged_veg$Veg)
-  cat(sprintf("[PPI BOOTSTRAP DEBUG] Veg types after PPI join: %s\n", paste(veg_after, collapse=", ")))
-  
-  # Calculate relative coefficients (fractions of vegetation)
-  # IMPORTANT: Skip normalization for 100% barren cases to preserve relative proportions
-  merged_veg <- merged_veg |>
-    dplyr::group_by(location_id, pheno_year) |>
-    dplyr::mutate(
-      sum_veg_coef = sum(coef[tolower(Veg) != "barren"], na.rm = TRUE),
-      # Only normalize if there's actual vegetation (sum > threshold)
-      # If 100% barren (sum_veg_coef ~ 0), keep original coefficients as rel_coef (preserves relative proportions)
-      rel_coef = ifelse(sum_veg_coef > 1e-6, coef / sum_veg_coef, coef)
-    ) |>
-    dplyr::ungroup() |>
-    # Renormalize to sum-to-one ONLY if the sum deviates from 1 AND there's actual vegetation
-    # This preserves relative proportions - we scale all values by the same factor
-    dplyr::group_by(location_id, pheno_year) |>
-    dplyr::mutate(
-      total_rel = sum(rel_coef, na.rm = TRUE),
-      # Only renormalize if: (1) sum is not already ~1, (2) sum is > threshold (not 100% barren)
-      rel_coef = ifelse(total_rel > 1e-6 & abs(total_rel - 1) > 1e-9,
-                        rel_coef / total_rel,
-                        rel_coef)
-    ) |>
-    dplyr::select(-total_rel) |>
-    dplyr::ungroup()
-
-  # Diagnostic: report any location-years that required correction
-  rels_check <- merged_veg |>
-    dplyr::group_by(location_id, pheno_year) |>
-    dplyr::summarize(total_rel = sum(rel_coef, na.rm = TRUE), .groups = "drop")
-  bad_rel <- sum(abs(rels_check$total_rel - 1) > 1e-6 & rels_check$total_rel > 1e-6, na.rm = TRUE)
-  if (bad_rel > 0) cat(sprintf("[NORMALIZE COEF] Corrected rel_coef for %d location-year(s) to sum-to-one\n", bad_rel))
-
-  # Report 100% barren cases that were skipped
-  barren_100_count <- sum(rels_check$total_rel < 1e-6, na.rm = TRUE)
-  if (barren_100_count > 0) cat(sprintf("[PPI BOOTSTRAP] Skipped normalization for %d location-year(s) with 100%% barren\n", barren_100_count))
-
-  veg_types <- unique(merged_veg$Veg[tolower(merged_veg$Veg) != "barren"])
-  veg_types <- veg_types[!is.na(veg_types) & nchar(trimws(veg_types)) > 0]  # Remove NA and empty strings
-  years <- sort(unique(merged_veg$pheno_year[!is.na(merged_veg$pheno_year)]))
-  locations <- unique(merged_veg$location_id)
-  n_locs <- length(locations)
-
-  # Precompute per-location coordinates for optional spatial block bootstrap
-  .loc_coords <- collect_location_coords(locations = locations, df_tasks = df_tasks, all_coefs = all_coefs)
-
-  # Estimate block size from spatial autocorrelation range (data-driven)
-  loc_means <- tapply(merged_veg$coef, merged_veg$location_id, mean, na.rm = TRUE)
-  loc_ids_for_range <- names(loc_means)
-  coords_for_range <- .loc_coords[match(loc_ids_for_range, .loc_coords$location_id), , drop = FALSE]
-  .block_km <- estimate_autocorrelation_range(coords_for_range, as.numeric(loc_means))
-  cat(sprintf("[PPI BOOTSTRAP] Data-driven block size: %.1f km\n", .block_km))
-
-  # Guard against empty data
-  if (length(years) == 0 || n_locs == 0 || nrow(merged_veg) == 0) {
-    warning("[PPI BOOTSTRAP] No valid data after filtering - skipping bootstrap")
-    return(all_coefs)
-  }
-
-  # Additional guard: ensure B is positive
-  if (!is.numeric(B) || length(B) != 1 || B < 1) {
-    warning("[PPI BOOTSTRAP] Invalid B parameter - skipping bootstrap")
-    return(all_coefs)
-  }
-  B <- as.integer(B)
-
-  # Pre-calculate unique loc-year list for Barren calculation
-  # Each unique loc-year needs a row index into ppi_boot_mat
-  unique_loc_years <- merged_veg |>
-    dplyr::distinct(location_id, pheno_year, ppi_row_idx)
-
-  cat(sprintf("[PPI BOOTSTRAP] Running %d bootstrap iterations with per-location PPI uncertainty...\n", B))
-
-  # We need to accumulate results. Instead of matrix of means, we can just run the loop B times
-  # and store the global mean for that iteration.
-
-  # Initialize storage for global aggregates per veg/year
-  # veg_boot_res[[veg]][[year]] -> vector of B means
-  n_years <- length(years)
-  cat(sprintf("[PPI BOOTSTRAP DEBUG] n_years=%d, B=%d, n_veg_types=%d\n", n_years, B, length(veg_types)))
-
-  if (n_years == 0) {
-    warning("[PPI BOOTSTRAP] No years found after filtering - cannot create result matrices")
-    return(all_coefs)
-  }
-
-  veg_boot_res <- list()
-  all_veg_plus_barren <- c(veg_types, "Barren")
-  for (v in all_veg_plus_barren) {
-    # Create matrix and explicitly ensure it's 2D
-    mat <- matrix(NA_real_, nrow = as.integer(B), ncol = as.integer(n_years))
-    if (is.matrix(mat) && ncol(mat) > 0) {
-      colnames(mat) <- as.character(years)
-    }
-    veg_boot_res[[v]] <- mat
-  }
-
-  for (b in seq_len(B)) {
-    # 1. Sample Locations (Spatial Bootstrap)
-    boot_locs <- spatial_block_sample_locations(locations, .loc_coords, n_draw = n_locs, block_km = .block_km)
-    
-    # 2. Get the PPI realization for this bootstrap iteration 'b'
-    # ppi_realization is a vector indexed by ppi_row_idx
-    # We take the b-th column of the pre-computed matrix
-    # And CLAMP it to [0, 1] after normalizing by ppi_max
-    raw_ppi_vals <- ppi_boot_mat[, b]
-    norm_ppi_vals <- pmin(pmax(raw_ppi_vals / ppi_max, 0), 1)
-    
-    # --- PROCESS VEGETATION ---
-    # Filter data to selected locations (expanding if sampled multiple times)
-    # Efficient join:
-    # count how many times each loc was sampled
-    loc_counts <- table(boot_locs)
-    sampled_locs <- names(loc_counts)
-    
-    # Subset data to relevant locations
-    sub_veg <- merged_veg[merged_veg$location_id %in% sampled_locs, ]
-    
-    if (nrow(sub_veg) > 0) {
-      # Attach the specific PPI value for this iteration
-      # Using the row index we mapped earlier
-      sub_veg$current_ppi_norm <- norm_ppi_vals[sub_veg$ppi_row_idx]
-      
-      # Calculate absolute cover = relative_fraction * ppi_cover
-      sub_veg$abs_cover <- sub_veg$rel_coef * sub_veg$current_ppi_norm
-      
-      # Aggregate by Year and Veg
-      # We need to weight by the number of times the location was sampled (loc_counts)
-      # Or simply replicate the rows. Replicating rows is cleaner for logic but slower.
-      # Weighted aggregation:
-      sub_veg$weight <- as.integer(loc_counts[sub_veg$location_id])
-      
-      # Global Mean per Year/Veg = Sum(abs_cover * weight) / Total_Locations
-      # Total_Locations = n_locs (since we sampled n_locs with replace)
-      
-      agg_veg <- sub_veg |>
-        dplyr::group_by(pheno_year, Veg) |>
-        dplyr::summarize(
-          total_cover = sum(abs_cover * weight, na.rm = TRUE),
-          .groups = "drop"
-        )
-      
-      # Fill results matrix
-      for (i in 1:nrow(agg_veg)) {
-        v <- agg_veg$Veg[i]
-        y <- as.character(agg_veg$pheno_year[i])
-        if (v %in% veg_types && y %in% colnames(veg_boot_res[[v]])) {
-          veg_boot_res[[v]][b, y] <- agg_veg$total_cover[i] / n_locs
-        }
-      }
-    }
-    
-    # --- PROCESS BARREN ---
-    # Barren Fraction = 1 - current_ppi_norm
-    # Use unique_loc_years
-    sub_barren <- unique_loc_years[unique_loc_years$location_id %in% sampled_locs, ]
-    
-    if (nrow(sub_barren) > 0) {
-      sub_barren$current_ppi_norm <- norm_ppi_vals[sub_barren$ppi_row_idx]
-      sub_barren$barren_frac <- 1.0 - sub_barren$current_ppi_norm
-      sub_barren$weight <- as.integer(loc_counts[sub_barren$location_id])
-      
-      agg_barren <- sub_barren |>
-        dplyr::group_by(pheno_year) |>
-        dplyr::summarize(
-          total_barren = sum(barren_frac * weight, na.rm = TRUE),
-          # Use sum of weights for denominator in case some years are missing in some locations
-          n_obs_year = sum(weight, na.rm = TRUE),
-          .groups = "drop"
-        )
-        
-      for (i in 1:nrow(agg_barren)) {
-        y <- as.character(agg_barren$pheno_year[i])
-        if (y %in% colnames(veg_boot_res[["Barren"]])) {
-          # Use n_obs_year as denominator (average of available observations)
-          # consistent with previous logic
-          veg_boot_res[["Barren"]][b, y] <- agg_barren$total_barren[i] / agg_barren$n_obs_year[i]
-        }
-      }
-    }
-  } # End Bootstrap Loop
-  # Skip if matrix is empty
-
-  # --- Compute "woody" (populus + tamarix + woody_unknown) aggregation with proper CI propagation ---
-  # Since most uncertainty is between populus and tamarix, summing their bootstrap
-  # replicates BEFORE computing quantiles will reduce CI width appropriately.
-  # woody_unknown is included as it represents indistinguishable populus/tamarix variants
-  woody_types <- c("populus", "tamarix", "woody_unknown")
-  woody_mats <- veg_boot_res[tolower(names(veg_boot_res)) %in% woody_types]
-  if (length(woody_mats) >= 1) {
-    # Sum the bootstrap matrices element-wise
-    woody_mat <- Reduce(`+`, lapply(woody_mats, function(m) {
-      m[is.na(m)] <- 0  # Treat NA as 0 for summing
-      m
-    }))
-    # Restore NAs where ALL constituent types were NA
-    all_na_mask <- Reduce(`&`, lapply(woody_mats, is.na))
-    woody_mat[all_na_mask] <- NA_real_
-    colnames(woody_mat) <- colnames(woody_mats[[1]])
-    veg_boot_res[["woody"]] <- woody_mat
-    cat("[PPI BOOTSTRAP] Added 'woody' category (populus + tamarix + woody_unknown) with combined bootstrap CIs\n")
-  }
-
-  # Compile Final Results
-  final_results <- list()
-  for (v in names(veg_boot_res)) {
-    mat <- veg_boot_res[[v]]
-    if (is.null(mat) || ncol(mat) == 0 || is.null(colnames(mat)) || length(colnames(mat)) == 0) next
-
-    df_res <- data.frame(
-      year = as.integer(colnames(mat)),
-      Veg = v,
-      global_coef = apply(mat, 2, mean, na.rm = TRUE),
-      se = apply(mat, 2, sd, na.rm = TRUE),
-      coef_025 = apply(mat, 2, quantile, 0.025, na.rm = TRUE),
-      coef_975 = apply(mat, 2, quantile, 0.975, na.rm = TRUE),
-      method = "location_bootstrap_ppi_uncertainty"
-    )
-
-    # Add n_locations count (approximate based on original data)
-    n_locs_per_year <- sapply(years, function(y) sum(unique_loc_years$pheno_year == y))
-    df_res$n_locations <- n_locs_per_year[match(df_res$year, years)]
-
-    final_results[[v]] <- df_res
-  }
-
-  result <- dplyr::bind_rows(final_results)
-  # Replace "phragmites" with "herbs" in results
+  result <- location_bootstrap_index(all_coefs, df_tasks, index_name = "PPI",
+                                     B = B, seed = seed, index_max = ppi_max)
   if (!is.null(result) && "Veg" %in% names(result)) {
-    result$Veg <- ifelse(tolower(trimws(result$Veg)) == "phragmites", "herbs", result$Veg)
+    result$Veg <- ifelse(normalize_veg_name(result$Veg) == "phragmites", "herbs", result$Veg)
   }
   result
 }
 
-# Shared helper for NDVI/MSAVI-style location bootstrap (summer detrended medians)
-location_bootstrap_index <- function(all_coefs, df_tasks, index_name,
+# Shared helper for index-based location bootstrap (summer detrended medians).
+# When noindex=TRUE, uses raw coefficients as absolute cover (no index scaling).
+location_bootstrap_index <- function(all_coefs, df_tasks = NULL, index_name = "NOINDEX",
                                      B = BOOTSTRAP_B, seed = 123,
                                      index_max = 0.6,
                                      summer_months = 6:9,
                                      detrend_poly_degree = 3,
-                                     min_detrend_n = 50) {
+                                     min_detrend_n = 50,
+                                     noindex = FALSE) {
   set.seed(seed)
   if (!requireNamespace("dplyr", quietly = TRUE)) {
     warning(sprintf("dplyr required for %s bootstrap", index_name))
     return(NULL)
+  }
+
+  # --- NOINDEX mode: uses raw coefficients as absolute cover ---
+  if (isTRUE(noindex)) {
+    merged_veg <- filter_valid_vegetation(all_coefs, exclude_barren = TRUE)
+    merged_veg$rel_coef <- merged_veg$coef
+
+    veg_types <- unique(merged_veg$Veg[!tolower(merged_veg$Veg) %in% c("barren")])
+    years <- sort(unique(merged_veg$pheno_year[!is.na(merged_veg$pheno_year)]))
+    locations <- unique(merged_veg$location_id)
+    n_locs <- length(locations)
+    if (length(years) == 0 || n_locs == 0 || nrow(merged_veg) == 0) { warning("[NOINDEX BOOTSTRAP] No valid data after filtering - skipping bootstrap"); return(all_coefs) }
+    if (!is.numeric(B) || length(B) != 1 || B < 1) { warning("[NOINDEX BOOTSTRAP] Invalid B parameter - skipping bootstrap"); return(all_coefs) }
+    B <- as.integer(B)
+
+    .loc_coords <- collect_location_coords(locations = locations, df_tasks = df_tasks, all_coefs = all_coefs)
+    loc_means <- tapply(merged_veg$coef, merged_veg$location_id, mean, na.rm = TRUE)
+    coords_for_range <- .loc_coords[match(names(loc_means), .loc_coords$location_id), , drop = FALSE]
+    .block_km <- estimate_autocorrelation_range(coords_for_range, as.numeric(loc_means))
+    cat(sprintf("[NOINDEX BOOTSTRAP] Data-driven block size: %.1f km\n", .block_km))
+
+    unique_loc_years <- merged_veg |> dplyr::distinct(location_id, pheno_year)
+    veg_boot_res <- list()
+    for (v in c(veg_types, "barren")) {
+      mat <- matrix(NA_real_, nrow = B, ncol = length(years))
+      if (ncol(mat) > 0) colnames(mat) <- as.character(years)
+      veg_boot_res[[v]] <- mat
+    }
+
+    for (b in seq_len(B)) {
+      boot_locs <- spatial_block_sample_locations(locations, .loc_coords, n_draw = n_locs, block_km = .block_km)
+      loc_counts <- table(boot_locs)
+      sub_veg <- merged_veg[merged_veg$location_id %in% names(loc_counts), ]
+      if (nrow(sub_veg) > 0) {
+        sub_veg$weight <- as.integer(loc_counts[sub_veg$location_id])
+        agg_veg <- sub_veg |> dplyr::group_by(pheno_year, Veg) |> dplyr::summarize(total_cover = sum(rel_coef * weight, na.rm = TRUE), .groups = "drop")
+        for (i in 1:nrow(agg_veg)) {
+          v <- agg_veg$Veg[i]; y <- as.character(agg_veg$pheno_year[i])
+          if (v %in% veg_types && y %in% colnames(veg_boot_res[[v]])) veg_boot_res[[v]][b, y] <- agg_veg$total_cover[i] / n_locs
+        }
+        loc_year_sums <- sub_veg |> dplyr::group_by(location_id, pheno_year) |> dplyr::summarize(total_veg = sum(rel_coef, na.rm = TRUE), .groups = "drop")
+        loc_year_sums$weight <- as.integer(loc_counts[as.character(loc_year_sums$location_id)])
+        loc_year_sums$barren <- pmax(0, pmin(1, 1.0 - loc_year_sums$total_veg))
+        barren_by_year <- loc_year_sums |> dplyr::group_by(pheno_year) |> dplyr::summarize(mean_barren = sum(barren * weight, na.rm = TRUE) / sum(weight, na.rm = TRUE), .groups = "drop")
+        for (i in 1:nrow(barren_by_year)) {
+          y <- as.character(barren_by_year$pheno_year[i])
+          if (y %in% colnames(veg_boot_res[["barren"]])) veg_boot_res[["barren"]][b, y] <- barren_by_year$mean_barren[i]
+        }
+      }
+    }
+    veg_boot_res <- aggregate_woody_bootstrap(veg_boot_res, label = "NOINDEX BOOTSTRAP")
+    return(compile_bootstrap_results(veg_boot_res, years, unique_loc_years, method_name = "location_bootstrap_noindex"))
   }
 
   index_name <- as.character(index_name)
@@ -2949,9 +2604,7 @@ location_bootstrap_index <- function(all_coefs, df_tasks, index_name,
   key_map <- setNames(seq_len(n_rows), boot_combined$key)
 
   # Prepare coefficient data (exclude barren rows)
-  veg_char <- as.character(all_coefs$Veg)
-  valid_veg_mask <- !is.na(veg_char) & nchar(trimws(veg_char)) > 0 & trimws(veg_char) != "NA" & !tolower(trimws(veg_char)) %in% c("barren")
-  merged_veg <- all_coefs[valid_veg_mask, ]
+  merged_veg <- filter_valid_vegetation(all_coefs, exclude_barren = TRUE)
   merged_veg$key <- paste(merged_veg$location_id, merged_veg$pheno_year, sep = "_")
   merged_veg$row_idx <- key_map[merged_veg$key]
   merged_veg <- merged_veg[!is.na(merged_veg$row_idx), ]
@@ -3055,245 +2708,129 @@ location_bootstrap_index <- function(all_coefs, df_tasks, index_name,
     }
   }
 
-  # Woody aggregation (populus + tamarix + woody_unknown)
-  woody_types <- c("populus", "tamarix", "woody_unknown")
-  woody_mats <- veg_boot_res[tolower(names(veg_boot_res)) %in% woody_types]
-  if (length(woody_mats) >= 1) {
-    woody_mat <- Reduce(`+`, lapply(woody_mats, function(m) {
-      m[is.na(m)] <- 0
-      m
-    }))
-    all_na_mask <- Reduce(`&`, lapply(woody_mats, is.na))
-    woody_mat[all_na_mask] <- NA_real_
-    colnames(woody_mat) <- colnames(woody_mats[[1]])
-    veg_boot_res[["woody"]] <- woody_mat
-    cat(sprintf("[%s BOOTSTRAP] Added 'woody' category with combined bootstrap CIs\n", index_name))
-  }
-
-  # Compile final results
-  final_results <- list()
-  for (v in names(veg_boot_res)) {
-    mat <- veg_boot_res[[v]]
-    if (is.null(mat) || ncol(mat) == 0 || is.null(colnames(mat)) || length(colnames(mat)) == 0) next
-    df_res <- data.frame(
-      year = as.integer(colnames(mat)),
-      Veg = v,
-      global_coef = apply(mat, 2, mean, na.rm = TRUE),
-      se = apply(mat, 2, sd, na.rm = TRUE),
-      coef_025 = apply(mat, 2, quantile, 0.025, na.rm = TRUE),
-      coef_975 = apply(mat, 2, quantile, 0.975, na.rm = TRUE),
-      method = paste0("location_bootstrap_", tolower(index_name))
-    )
-    n_locs_per_year <- sapply(years, function(y) sum(unique_loc_years$pheno_year == y))
-    df_res$n_locations <- n_locs_per_year[match(df_res$year, years)]
-    final_results[[v]] <- df_res
-  }
-  dplyr::bind_rows(final_results)
+  veg_boot_res <- aggregate_woody_bootstrap(veg_boot_res, label = paste0(index_name, " BOOTSTRAP"))
+  compile_bootstrap_results(veg_boot_res, years, unique_loc_years,
+                            method_name = paste0("location_bootstrap_", tolower(index_name)))
 }
 
-# --- NEW: NDVI-BASED LOCATION BOOTSTRAP (Analogous to PPI) ---
-# Uses per-location summer NDVI medians and bootstraps medians like PPI.
-location_bootstrap_ndvi <- function(all_coefs, df_tasks, B = BOOTSTRAP_B, seed = 123, ndvi_max = 0.6) {
+# Thin wrappers for backward compatibility (all delegate to location_bootstrap_index)
+location_bootstrap_ndvi <- function(all_coefs, df_tasks, B = BOOTSTRAP_B, seed = 123, ndvi_max = 0.6)
   location_bootstrap_index(all_coefs, df_tasks, index_name = "NDVI", B = B, seed = seed, index_max = ndvi_max)
-}
 
-# --- NEW: MSAVI-BASED LOCATION BOOTSTRAP (Analogous to PPI) ---
-# Uses per-location summer MSAVI medians and bootstraps medians like PPI.
-location_bootstrap_msavi <- function(all_coefs, df_tasks, B = BOOTSTRAP_B, seed = 123, msavi_max = 0.6) {
+location_bootstrap_msavi <- function(all_coefs, df_tasks, B = BOOTSTRAP_B, seed = 123, msavi_max = 0.6)
   location_bootstrap_index(all_coefs, df_tasks, index_name = "MSAVI", B = B, seed = seed, index_max = msavi_max)
-}
 
-# --- NEW: No-Index (unscaled) location bootstrap ---
-# Uses raw relative coefficients as absolute cover (no scaling by an index)
-location_bootstrap_noindex <- function(all_coefs, df_tasks = NULL, B = BOOTSTRAP_B, seed = 123) {
-  set.seed(seed)
-  if (!requireNamespace("dplyr", quietly = TRUE)) {
-    warning("dplyr required for NoIndex bootstrap")
-    return(NULL)
-  }
+location_bootstrap_noindex <- function(all_coefs, df_tasks = NULL, B = BOOTSTRAP_B, seed = 123)
+  location_bootstrap_index(all_coefs, df_tasks, index_name = "NOINDEX", B = B, seed = seed, noindex = TRUE)
 
-  veg_char <- as.character(all_coefs$Veg)
-  valid_veg_mask <- !is.na(veg_char) & nchar(trimws(veg_char)) > 0 & trimws(veg_char) != "NA" & !tolower(trimws(veg_char)) %in% c("barren")
-  merged_veg <- all_coefs[valid_veg_mask, ]
-  merged_veg$rel_coef <- merged_veg$coef
+# Precompute B Dirichlet draws for every location-year so that each bootstrap
+# replicate gets a fresh classification perturbation.
+# Returns list(draws = named list of [B x K] matrices, alpha_info = list of alpha metadata).
+precompute_dirichlet_draws <- function(all_coefs, B, conf_matrix, sample_sizes = NULL,
+                                       concentration_scale = DIRICHLET_CONCENTRATION_SCALE) {
+  loc_yr_keys <- unique(paste(all_coefs$location_id, all_coefs$pheno_year, sep = "___"))
+  row_names <- tolower(rownames(conf_matrix))
+  col_names <- colnames(conf_matrix)
+  K <- ncol(conf_matrix)
 
-  veg_types <- unique(merged_veg$Veg[!tolower(merged_veg$Veg) %in% c("barren")])
-  years <- sort(unique(merged_veg$pheno_year[!is.na(merged_veg$pheno_year)]))
-  locations <- unique(merged_veg$location_id)
-  n_locs <- length(locations)
-  if (length(years) == 0 || n_locs == 0 || nrow(merged_veg) == 0) { warning("[NOINDEX BOOTSTRAP] No valid data after filtering - skipping bootstrap"); return(all_coefs) }
-  if (!is.numeric(B) || length(B) != 1 || B < 1) { warning("[NOINDEX BOOTSTRAP] Invalid B parameter - skipping bootstrap"); return(all_coefs) }
-  B <- as.integer(B)
+  draws <- list()
 
-  # Precompute per-location coordinates and data-driven block size
-  .loc_coords <- collect_location_coords(locations = locations, df_tasks = df_tasks, all_coefs = all_coefs)
-  loc_means <- tapply(merged_veg$coef, merged_veg$location_id, mean, na.rm = TRUE)
-  loc_ids_for_range <- names(loc_means)
-  coords_for_range <- .loc_coords[match(loc_ids_for_range, .loc_coords$location_id), , drop = FALSE]
-  .block_km <- estimate_autocorrelation_range(coords_for_range, as.numeric(loc_means))
-  cat(sprintf("[NOINDEX BOOTSTRAP] Data-driven block size: %.1f km\n", .block_km))
+  for (key in loc_yr_keys) {
+    parts <- strsplit(key, "___")[[1]]
+    loc_id <- parts[1]
+    p_year <- as.numeric(parts[2])
 
-  unique_loc_years <- merged_veg |> dplyr::distinct(location_id, pheno_year)
+    mask <- all_coefs$location_id == loc_id & all_coefs$pheno_year == p_year
+    loc_yr_data <- all_coefs[mask, ]
+    if (nrow(loc_yr_data) == 0) next
 
-  veg_boot_res <- list()
-  all_veg_plus_barren <- c(veg_types, "barren")
-  for (v in all_veg_plus_barren) {
-    mat <- matrix(NA_real_, nrow = as.integer(B), ncol = as.integer(length(years)))
-    if (is.matrix(mat) && ncol(mat) > 0) colnames(mat) <- as.character(years)
-    veg_boot_res[[v]] <- mat
-  }
+    # Build fraction vector
+    fracs <- setNames(pmax(as.numeric(loc_yr_data$coef), 0),
+                      tolower(as.character(loc_yr_data$Veg)))
+    fracs[!is.finite(fracs)] <- 0
+    frac_sum <- sum(fracs)
+    if (frac_sum <= 0) next
+    fracs <- fracs / frac_sum
 
-  for (b in seq_len(B)) {
-    boot_locs <- spatial_block_sample_locations(locations, .loc_coords, n_draw = n_locs, block_km = .block_km)
-    loc_counts <- table(boot_locs)
-    sampled_locs <- names(loc_counts)
-    sub_veg <- merged_veg[merged_veg$location_id %in% sampled_locs, ]
-    if (nrow(sub_veg) > 0) {
-      sub_veg$abs_cover <- sub_veg$rel_coef
-      sub_veg$weight <- as.integer(loc_counts[sub_veg$location_id])
-      agg_veg <- sub_veg |> dplyr::group_by(pheno_year, Veg) |> dplyr::summarize(total_cover = sum(abs_cover * weight, na.rm = TRUE), .groups = "drop")
-      for (i in 1:nrow(agg_veg)) {
-        v <- agg_veg$Veg[i]; y <- as.character(agg_veg$pheno_year[i])
-        if (v %in% veg_types && y %in% colnames(veg_boot_res[[v]])) veg_boot_res[[v]][b, y] <- agg_veg$total_cover[i] / n_locs
-      }
+    # Map fraction names to confusion-matrix rows
+    mapped_row <- rep(NA_character_, length(fracs))
+    for (i in seq_along(fracs)) {
+      nm <- names(fracs)[i]
+      nm2 <- sub("^frac_", "", nm)
+      if (nm %in% row_names) mapped_row[i] <- nm
+      else if (nm2 %in% row_names) mapped_row[i] <- nm2
     }
 
-    # Barren = 1 - sum(veg fractions) per year, averaged across locations
-    # First compute total vegetation cover per location-year, then average across locations per year
-    if (nrow(sub_veg) > 0) {
-      # Sum vegetation coefficients per location-year
-      loc_year_sums <- sub_veg |>
-        dplyr::group_by(location_id, pheno_year) |>
-        dplyr::summarize(total_veg = sum(rel_coef, na.rm = TRUE), .groups = "drop")
-      loc_year_sums$weight <- as.integer(loc_counts[as.character(loc_year_sums$location_id)])
+    keep <- is.finite(fracs) & fracs > 0 & !is.na(mapped_row) & fracs >= 1e-6
+    if (!any(keep)) next
 
-      # Compute barren = 1 - total_veg, clamped to [0, 1]
-      loc_year_sums$barren <- pmax(0, pmin(1, 1.0 - loc_year_sums$total_veg))
+    w <- fracs[keep]; w <- w / sum(w)
+    rows <- mapped_row[keep]
+    row_idx <- match(rows, row_names)
 
-      # Average barren across locations per year (weighted by bootstrap counts)
-      barren_by_year <- loc_year_sums |>
-        dplyr::group_by(pheno_year) |>
-        dplyr::summarize(mean_barren = sum(barren * weight, na.rm = TRUE) / sum(weight, na.rm = TRUE), .groups = "drop")
-
-      for (i in 1:nrow(barren_by_year)) {
-        y <- as.character(barren_by_year$pheno_year[i])
-        if (y %in% colnames(veg_boot_res[["barren"]])) {
-          veg_boot_res[["barren"]][b, y] <- barren_by_year$mean_barren[i]
-        }
-      }
+    # Weighted mean confusion row
+    mu <- rep(0, K)
+    for (k in seq_along(row_idx)) {
+      mu <- mu + w[k] * as.numeric(conf_matrix[row_idx[k], ])
     }
+    mu[!is.finite(mu)] <- 0
+    mu[mu < 1e-6] <- 1e-6
+    mu <- mu / sum(mu)
+
+    # Concentration from validation support
+    n_eff_val <- 20
+    if (!is.null(sample_sizes) && length(sample_sizes) > 0) {
+      ss_names <- tolower(names(sample_sizes))
+      ss <- as.numeric(sample_sizes)
+      ss[!is.finite(ss) | ss < 0] <- 0
+      ss_match <- ss[match(rows, ss_names)]
+      ss_match[is.na(ss_match)] <- 0
+      if (sum(ss_match) > 0) n_eff_val <- sum(w * ss_match)
+    }
+
+    alpha <- max(concentration_scale * n_eff_val, 5)
+    alpha_vec <- alpha * mu
+
+    # Vectorized B Dirichlet draws via rgamma
+    gamma_mat <- matrix(rgamma(B * K, shape = rep(alpha_vec, each = B), rate = 1),
+                        nrow = B, ncol = K)
+    row_sums <- rowSums(gamma_mat)
+    zero_rows <- row_sums < 1e-10
+    if (any(zero_rows)) {
+      gamma_mat[zero_rows, ] <- matrix(rep(mu, sum(zero_rows)),
+                                       nrow = sum(zero_rows), byrow = TRUE)
+      row_sums[zero_rows] <- 1
+    }
+    dirichlet_mat <- gamma_mat / row_sums
+    colnames(dirichlet_mat) <- tolower(col_names)
+
+    draws[[key]] <- dirichlet_mat
   }
 
-  # --- Compute "woody" (populus + tamarix + woody_unknown) aggregation with proper CI propagation ---
-  woody_types <- c("populus", "tamarix", "woody_unknown")
-  woody_mats <- veg_boot_res[tolower(names(veg_boot_res)) %in% woody_types]
-  if (length(woody_mats) >= 1) {
-    woody_mat <- Reduce(`+`, lapply(woody_mats, function(m) { m[is.na(m)] <- 0; m }))
-    all_na_mask <- Reduce(`&`, lapply(woody_mats, is.na))
-    woody_mat[all_na_mask] <- NA_real_
-    colnames(woody_mat) <- colnames(woody_mats[[1]])
-    veg_boot_res[["woody"]] <- woody_mat
-    cat("[NOINDEX BOOTSTRAP] Added 'woody' category (populus + tamarix + woody_unknown) with combined bootstrap CIs\n")
-  }
-
-  final_results <- list()
-  for (v in names(veg_boot_res)) {
-    mat <- veg_boot_res[[v]]
-    if (is.null(mat) || ncol(mat) == 0 || is.null(colnames(mat)) || length(colnames(mat)) == 0) next
-    df_res <- data.frame(year = as.integer(colnames(mat)), Veg = v, global_coef = apply(mat, 2, mean, na.rm = TRUE), se = apply(mat, 2, sd, na.rm = TRUE), coef_025 = apply(mat, 2, quantile, 0.025, na.rm = TRUE), coef_975 = apply(mat, 2, quantile, 0.975, na.rm = TRUE), method = "location_bootstrap_noindex")
-    n_locs_per_year <- sapply(years, function(y) sum(unique_loc_years$pheno_year == y))
-    df_res$n_locations <- n_locs_per_year[match(df_res$year, years)]
-    final_results[[v]] <- df_res
-  }
-  dplyr::bind_rows(final_results)
+  draws
 }
 
 # Location-based bootstrap for global aggregation
 location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123) {
   set.seed(seed)
 
-  # Check if we have measurement uncertainty available
-  has_meas_uncertainty <- "coef_sd" %in% names(all_coefs) && !all(is.na(all_coefs$coef_sd))
-  if (has_meas_uncertainty) {
-     message("[BOOTSTRAP] Measurement uncertainty (coef_sd) detected; will use smooth bootstrap/error propagation.")
-  } else {
-     message("[BOOTSTRAP] No measurement uncertainty found; using standard spatial bootstrapping.")
-  }
-
   # =========================================================================
-  # CLASSIFICATION UNCERTAINTY: Apply Dirichlet perturbation if enabled
- # This perturbs the coefficient vectors based on the confusion matrix
-  # to propagate classification/misclassification uncertainty
+  # CLASSIFICATION UNCERTAINTY: Precompute B Dirichlet draws per location-year
+  # so each bootstrap replicate gets a fresh classification perturbation.
   # =========================================================================
-  has_classification_uncertainty <- isTRUE(ENABLE_CLASSIFICATION_UNCERTAINTY) &&
-                                    exists(".CONFUSION_MATRIX", envir = globalenv())
-
-  if (has_classification_uncertainty) {
+  dirichlet_draws <- NULL
+  if (isTRUE(ENABLE_CLASSIFICATION_UNCERTAINTY) &&
+      exists(".CONFUSION_MATRIX", envir = globalenv())) {
     conf_matrix <- get(".CONFUSION_MATRIX", envir = globalenv())
     sample_sizes <- if (exists(".VALIDATION_SAMPLE_SIZES", envir = globalenv())) {
       get(".VALIDATION_SAMPLE_SIZES", envir = globalenv())
     } else NULL
 
-    message("[BOOTSTRAP] Classification uncertainty enabled; applying Dirichlet perturbation.")
-
-    # Get vegetation classes from confusion matrix
-    conf_classes <- tolower(rownames(conf_matrix))
-
-    # For each unique location-year, perturb the coefficient vector
-    # We need to work with wide-format data (one row per location-year, columns for each veg)
-    loc_yr_keys <- unique(paste(all_coefs$location_id, all_coefs$pheno_year, sep = "___"))
-
-    perturbed_coefs <- all_coefs
-
-    for (key in loc_yr_keys) {
-      parts <- strsplit(key, "___")[[1]]
-      loc_id <- parts[1]
-      p_year <- as.numeric(parts[2])
-
-      # Get rows for this location-year
-      mask <- all_coefs$location_id == loc_id & all_coefs$pheno_year == p_year
-      loc_yr_data <- all_coefs[mask, ]
-
-      if (nrow(loc_yr_data) == 0) next
-
-      # Build the coefficient vector for this location-year
-      veg_classes <- as.character(loc_yr_data$Veg)
-      coef_vals <- loc_yr_data$coef
-
-      # Create named vector
-      frac_vec <- setNames(coef_vals, tolower(veg_classes))
-
-      # Find the dominant class (highest coefficient) as proxy for "true class"
-      # In practice, training locations have known true class, but for inference
-      # locations we use the dominant predicted class
-      dominant_class <- names(which.max(frac_vec))
-
-      # Check if dominant class is in confusion matrix
-      if (!is.null(dominant_class) && dominant_class %in% conf_classes) {
-        # Apply Dirichlet perturbation
-        perturbed <- apply_dirichlet_perturbation(
-          fractions = frac_vec,
-          true_class = dominant_class,
-          conf_matrix = conf_matrix,
-          sample_sizes = sample_sizes,
-          concentration_scale = DIRICHLET_CONCENTRATION_SCALE
-        )
-
-        # Map perturbed values back to original rows
-        for (i in seq_len(nrow(loc_yr_data))) {
-          veg_lower <- tolower(as.character(loc_yr_data$Veg[i]))
-          if (veg_lower %in% names(perturbed)) {
-            row_idx <- which(mask)[i]
-            perturbed_coefs$coef[row_idx] <- perturbed[veg_lower]
-          }
-        }
-      }
-    }
-
-    all_coefs <- perturbed_coefs
-    message(sprintf("[BOOTSTRAP] Dirichlet perturbation applied to %d location-years", length(loc_yr_keys)))
+    message("[BOOTSTRAP] Classification uncertainty enabled; precomputing B Dirichlet draws per location-year.")
+    dirichlet_draws <- precompute_dirichlet_draws(all_coefs, B, conf_matrix, sample_sizes)
+    message(sprintf("[BOOTSTRAP] Precomputed Dirichlet draws for %d location-years", length(dirichlet_draws)))
   } else if (isTRUE(ENABLE_CLASSIFICATION_UNCERTAINTY)) {
-    message("[BOOTSTRAP] Classification uncertainty enabled but no confusion matrix available; skipping Dirichlet perturbation.")
+    message("[BOOTSTRAP] Classification uncertainty enabled but no confusion matrix available; skipping.")
   }
 
   veg_types <- unique(all_coefs$Veg[!is.na(all_coefs$Veg)])
@@ -3379,18 +2916,7 @@ location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123)
             coefs_valid <- yr_data$coef[valid]
 
             # Distance matrix in km (Haversine approximation)
-            rad <- pi / 180
-            n_v <- length(valid)
-            dist_mat <- matrix(0, n_v, n_v)
-            for (ii in 1:(n_v - 1)) {
-              for (jj in (ii + 1):n_v) {
-                dlat <- (coords[jj, 2] - coords[ii, 2]) * rad
-                dlon <- (coords[jj, 1] - coords[ii, 1]) * rad
-                a <- sin(dlat / 2)^2 + cos(coords[ii, 2] * rad) * cos(coords[jj, 2] * rad) * sin(dlon / 2)^2
-                dist_mat[ii, jj] <- 2 * 6371 * asin(sqrt(a))
-                dist_mat[jj, ii] <- dist_mat[ii, jj]
-              }
-            }
+            dist_mat <- compute_haversine_distance_matrix(coords)
 
             # Estimate spatial correlation range via empirical variogram
             # Fit exponential model: C(d) = exp(-d / range)
@@ -3462,18 +2988,33 @@ location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123)
       n_eff_vec[i] <- n_eff_est
 
       if (n_obs > 0) {
+        # Build per-replicate Dirichlet-perturbed coefficients if available.
+        # perturbed_coef_mat is [B x n_obs]: each row b gives Dirichlet draw b
+        # for each location's coefficient of this veg type.
+        perturbed_coef_mat <- NULL
+        if (!is.null(dirichlet_draws) && n_obs > 0) {
+          loc_keys <- paste(yr_data$location_id, yr_data$pheno_year, sep = "___")
+          veg_lower <- tolower(as.character(veg))
+          perturbed_coef_mat <- matrix(NA_real_, nrow = B, ncol = n_obs)
+          for (j in seq_len(n_obs)) {
+            draw_mat <- dirichlet_draws[[loc_keys[j]]]
+            if (!is.null(draw_mat)) {
+              col_idx <- match(veg_lower, colnames(draw_mat))
+              if (!is.na(col_idx)) {
+                perturbed_coef_mat[, j] <- draw_mat[, col_idx]
+                next
+              }
+            }
+            perturbed_coef_mat[, j] <- yr_data$coef[j]
+          }
+        }
+
         # DECISION: Small Sample Size vs Large Sample Size
         if (n_obs < 15) {
              # --- SMALL SAMPLE: USE POOLED VARIANCE ---
-             # When N is small, standard bootstrap under-estimates variance (often 0 if N=1).
-             # We assume the spatial variability is 'pooled_sd' and the mean is the sample mean.
-             
              mu <- mean(yr_data$coef, na.rm = TRUE)
-             
-             # Use effective sample size (accounts for spatial autocorrelation)
              n_eff_i <- n_eff_vec[i]
 
-             # Use sample SD if available (n_obs >= 2), otherwise pooled SD
              if (n_obs >= 2) {
                sample_sd <- sd(yr_data$coef, na.rm = TRUE)
                if (is.na(sample_sd) || sample_sd == 0) sample_sd <- pooled_sd
@@ -3482,70 +3023,28 @@ location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123)
                se_mean <- pooled_sd / sqrt(n_eff_i)
              }
 
-             # If we have measurement uncertainty, we can add that too (in quadrature)
-             if (has_meas_uncertainty) {
-               # Average measurement error for this year
-               mean_meas_sd <- mean(yr_data$coef_sd, na.rm = TRUE)
-               if (is.na(mean_meas_sd)) mean_meas_sd <- 0
-               # Effective SE combines spatial uncertainty (SE_mean) and measurement uncertainty
-               se_meas_mean <- mean_meas_sd / sqrt(n_eff_i)
-               se_total <- sqrt(se_mean^2 + se_meas_mean^2)
+             if (!is.null(perturbed_coef_mat)) {
+               # Each replicate gets a Dirichlet-perturbed mean + parametric noise
+               for (b in 1:B) {
+                 perturbed_mu <- mean(perturbed_coef_mat[b, ], na.rm = TRUE)
+                 boot_means[b, i] <- rnorm(1, mean = perturbed_mu, sd = se_mean)
+               }
              } else {
-               se_total <- se_mean
+               boot_means[, i] <- rnorm(B, mean = mu, sd = se_mean)
              }
 
-             # Moderate inflation for very small effective N
-             ci_tmp <- small_n_inflated_ci(est = mu, sd_in = se_total, n_obs = n_eff_i)
-             se_total <- ci_tmp$coef_sd
-             
-             # Generate bootstrap distribution parametrically
-             # We clamp the mean distribution to physical [0,1] limits if needed, 
-             # but standard CI calculation usually prefers raw then clamp.
-             boot_vals <- rnorm(B, mean = mu, sd = se_total)
-             boot_means[, i] <- boot_vals
-             
         } else {
              # --- SUFFICIENT SAMPLE: USE RESAMPLING ---
-
-             if (has_meas_uncertainty) {
-                # Smooth Bootstrap: Resample locations, then add measurement noise
-                # This accounts for both spatial sampling variability AND measurement error
-                na_warning_logged <- FALSE  # Flag to log NA warning only once per year/veg
-                rnorm_na_warning_logged <- FALSE  # Flag for rnorm NA warning
-                for (b in 1:B) {
-                   # Resample indices (capture spatial variance)
-                   idx <- sample(seq_len(n_obs), n_obs, replace = TRUE)
-                   sel_coefs <- yr_data$coef[idx]
-                   sel_sds <- yr_data$coef_sd[idx]
-
-                   # Defensive cleaning: replace NA/Inf values with mean of finite values
-                   if (all(is.na(sel_coefs))) {
-                     next  # Skip this iteration instead of setting to 0
-                   }
-                   sel_coefs[is.na(sel_coefs) | !is.finite(sel_coefs)] <- mean(sel_coefs, na.rm = TRUE)
-
-                   sel_sds[is.na(sel_sds) | !is.finite(sel_sds) | sel_sds < 0] <- 0
-
-                   # Add measurement noise (capture measurement variance)
-                   sim_coefs <- rnorm(n_obs, mean = sel_coefs, sd = sel_sds)
-
-                   if (any(is.na(sim_coefs))) {
-                     if (!rnorm_na_warning_logged) {
-                       write_debug(sprintf("Year %d veg=%s: rnorm produced %d NAs (n_obs=%d); sel_coefs finite=%d sel_sds finite=%d (suppressing further warnings)", years[i], veg, sum(is.na(sim_coefs)), n_obs, sum(is.finite(sel_coefs)), sum(is.finite(sel_sds))))
-                       rnorm_na_warning_logged <- TRUE
-                     }
-                     # Replace NAs with mean to avoid propagating NA further
-                     sim_coefs[is.na(sim_coefs)] <- mean(sim_coefs, na.rm = TRUE)
-                   }
-
-                   boot_means[b, i] <- mean(sim_coefs, na.rm = TRUE)
-                }
+             if (!is.null(perturbed_coef_mat)) {
+               for (b in 1:B) {
+                 idx <- sample(seq_len(n_obs), n_obs, replace = TRUE)
+                 boot_means[b, i] <- mean(perturbed_coef_mat[b, idx], na.rm = TRUE)
+               }
              } else {
-                # Standard Non-Parametric Bootstrap
-                for (b in 1:B) {
-                   boot_sample <- sample(yr_data$coef, n_obs, replace = TRUE)
-                   boot_means[b, i] <- mean(boot_sample, na.rm = TRUE)
-                }
+               for (b in 1:B) {
+                 boot_sample <- sample(yr_data$coef, n_obs, replace = TRUE)
+                 boot_means[b, i] <- mean(boot_sample, na.rm = TRUE)
+               }
              }
         }
       }
@@ -3588,230 +3087,7 @@ location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123)
   dplyr::bind_rows(results_list)
 }
 
-# Compute a deliberately conservative CI that widens aggressively as n_obs decreases.
-# This is used as a fallback when bootstrapping is skipped due to too few observations.
-small_n_inflated_ci <- function(est, sd_in = NA_real_, n_obs = NA_integer_,
-                                z = 1.96,
-                                n_ref = UNCERTAINTY_N_REF,
-                                power = UNCERTAINTY_N_POWER,
-                                sd_base = UNCERTAINTY_BASE_SD,
-                                sd_max = UNCERTAINTY_SD_MAX) {
-  n_eff <- suppressWarnings(as.numeric(n_obs))
-  if (!is.finite(n_eff)) n_eff <- NA_real_
-  if (is.na(n_eff) || n_eff < 1) n_eff <- 1
 
-  est <- as.numeric(est)
-  if (!is.finite(est)) est <- NA_real_
-
-  sd0 <- as.numeric(sd_in)
-  if (!is.finite(sd0) || sd0 <= 0) sd0 <- sd_base
-
-  infl <- (as.numeric(n_ref) / n_eff) ^ as.numeric(power)
-  if (!is.finite(infl) || infl < 1) infl <- 1
-
-  sd_eff <- sd0 * infl
-  if (!is.finite(sd_eff) || sd_eff <= 0) sd_eff <- sd_base
-  sd_eff <- min(sd_eff, sd_max)
-
-  if (!is.finite(est)) {
-    # If estimate is missing, return fully wide interval.
-    return(list(
-      coef_025 = 0,
-      coef_975 = 1,
-      coef_sd = sd_eff,
-      interval = 1
-    ))
-  }
-
-  lo <- est - z * sd_eff
-  hi <- est + z * sd_eff
-  lo <- max(0, lo)
-  hi <- min(1, hi)
-
-  list(
-    coef_025 = lo,
-    coef_975 = hi,
-    coef_sd = sd_eff,
-    interval = hi - lo
-  )
-}
-
-# --- Option A calibration helpers ---
-extract_coef_vec_from_fit <- function(fit_res, veg_levels = NULL) {
-  if (is.null(fit_res) || is.null(fit_res$coef_df)) return(NULL)
-  df <- fit_res$coef_df
-  if (is.null(df) || nrow(df) == 0) return(NULL)
-  # Defensive: handle multiple variants per veg by summing
-  agg <- tapply(df$coef, df$Veg, function(x) sum(as.numeric(x), na.rm = TRUE))
-  if (is.null(agg)) return(NULL)
-  if (!is.null(veg_levels)) {
-    out <- setNames(rep(0, length(veg_levels)), veg_levels)
-    common <- intersect(names(agg), veg_levels)
-    out[common] <- as.numeric(agg[common])
-    return(out)
-  }
-  as.numeric(agg)
-}
-
-estimate_uncertainty_params_optionA <- function(df_tasks,
-                                                high_n = UNCERTAINTY_PARAM_EST_HIGH_N,
-                                                max_groups = UNCERTAINTY_PARAM_EST_MAX_GROUPS,
-                                                target_ns = UNCERTAINTY_PARAM_EST_TARGET_NS,
-                                                reps = UNCERTAINTY_PARAM_EST_REPS,
-                                                seed = UNCERTAINTY_PARAM_EST_SEED,
-                                                veg_levels = ALLOWED_VEG,
-                                                quiet = TRUE) {
-  if (is.null(df_tasks) || nrow(df_tasks) == 0) stop("df_tasks is empty; cannot calibrate")
-  if (!"location_id" %in% names(df_tasks)) stop("df_tasks must have location_id")
-  if (!"pheno_year" %in% names(df_tasks)) {
-    if ("date" %in% names(df_tasks)) {
-      df_tasks$pheno_year <- assign_pheno_year(df_tasks$date)
-    } else {
-      stop("df_tasks must have pheno_year or date")
-    }
-  }
-
-  set.seed(seed)
-
-  # Build group table
-  grp <- df_tasks |>
-    dplyr::group_by(location_id, pheno_year) |>
-    dplyr::summarise(n_obs = dplyr::n(), .groups = "drop") |>
-    dplyr::filter(is.finite(n_obs) & n_obs >= high_n)
-
-  if (nrow(grp) == 0) stop(sprintf("No location-years with n_obs >= %d", high_n))
-
-  # Sample groups (runtime control)
-  if (nrow(grp) > max_groups) grp <- grp[sample(seq_len(nrow(grp)), max_groups), , drop = FALSE]
-
-  # Pre-allocate collectors per target n
-  errors_by_n <- setNames(vector("list", length(target_ns)), as.character(target_ns))
-  for (n in target_ns) errors_by_n[[as.character(n)]] <- numeric(0)
-
-  # Suppress chatter during repeated fits
-  sink_file <- NULL
-  con_out <- con_msg <- NULL
-  if (isTRUE(quiet)) {
-    sink_file <- tempfile()
-    con_out <- tryCatch(file(sink_file, open = "wt"), error = function(e) NULL)
-    con_msg <- tryCatch(file(paste0(sink_file, ".msg"), open = "wt"), error = function(e) NULL)
-  }
-
-  # Monkey-patch close to be safe on NULL connections in case other code calls close(NULL)
-  if (!exists("_close_patched", envir = globalenv())) {
-    assign("_close_patched", TRUE, envir = globalenv())
-    assign("_orig_close", base::close, envir = globalenv())
-    close <- function(conn, ...) {
-      if (is.null(conn)) return(invisible(NULL))
-      try(.GlobalEnv$`_orig_close`(conn, ...), silent = TRUE)
-    }
-  }
-
-  on.exit({
-    if (isTRUE(quiet)) {
-      try(sink(type = "message"), silent = TRUE)
-      try(sink(type = "output"), silent = TRUE)
-      if (!is.null(con_out)) try(close(con_out), silent = TRUE)
-      if (!is.null(con_msg)) try(close(con_msg), silent = TRUE)
-      if (!is.null(sink_file)) {
-        try(unlink(sink_file), silent = TRUE)
-        try(unlink(paste0(sink_file, ".msg")), silent = TRUE)
-      }
-    }
-  }, add = TRUE)
-
-  if (isTRUE(quiet) && !is.null(con_out) && !is.null(con_msg)) {
-    tryCatch({
-      if (inherits(con_out, "connection") && isOpen(con_out)) {
-        sink(con_out, type = "output")
-      }
-      if (inherits(con_msg, "connection") && isOpen(con_msg)) {
-        sink(con_msg, type = "message")
-      }
-    }, error = function(e) {
-      warning(sprintf("Failed to redirect output: %s", e$message))
-    })
-  }
-
-  # Helper function for uncertainty calibration
-  fit_task_for_calib <- function(task_data) {
-    if (is.null(task_data) || nrow(task_data) == 0) return(NULL)
-    res <- fit_one_task(task_data)
-    return(res)
-  }
-
-  for (gi in seq_len(nrow(grp))) {
-    loc <- grp$location_id[gi]
-    yr <- grp$pheno_year[gi]
-    sub <- df_tasks[df_tasks$location_id == loc & df_tasks$pheno_year == yr, , drop = FALSE]
-    n_full <- nrow(sub)
-    if (!is.finite(n_full) || n_full < high_n) next
-
-    # Full fit as pseudo-truth
-    full_fit <- tryCatch(fit_task_for_calib(sub), error = function(e) NULL)
-    full_vec <- extract_coef_vec_from_fit(full_fit, veg_levels = veg_levels)
-    if (is.null(full_vec)) next
-
-    for (n in target_ns) {
-      if (n > n_full) next
-      for (r in seq_len(reps)) {
-        idx <- sample(seq_len(n_full), n, replace = FALSE)
-        sub_n <- sub[idx, , drop = FALSE]
-        fit_n <- tryCatch(fit_task_for_calib(sub_n), error = function(e) NULL)
-        vec_n <- extract_coef_vec_from_fit(fit_n, veg_levels = veg_levels)
-        if (is.null(vec_n)) next
-        # error pooled across veg components (L2 norm / sqrt(k)) for scale comparability
-        diff <- as.numeric(vec_n - full_vec)
-        err <- sqrt(mean(diff^2, na.rm = TRUE))
-        if (is.finite(err)) errors_by_n[[as.character(n)]] <- c(errors_by_n[[as.character(n)]], err)
-      }
-    }
-  }
-
-  # Summarize sd_emp(n)
-  summ <- data.frame(
-    n = as.integer(names(errors_by_n)),
-    n_samples = sapply(errors_by_n, function(x) length(x)),
-    sd_emp = sapply(errors_by_n, function(x) if (length(x) >= 3) stats::sd(x, na.rm = TRUE) else NA_real_),
-    stringsAsFactors = FALSE
-  )
-  summ <- summ[order(summ$n), , drop = FALSE]
-  summ <- summ[is.finite(summ$sd_emp) & summ$sd_emp > 0, , drop = FALSE]
-  if (nrow(summ) < 3) stop("Not enough valid subsampling results to estimate slope")
-
-  # Fit log(sd_emp) ~ log(n) => slope = -p
-  fit <- stats::lm(log(sd_emp) ~ log(n), data = summ)
-  p_hat <- -as.numeric(stats::coef(fit)[["log(n)"]])
-  if (!is.finite(p_hat) || p_hat < 0) p_hat <- NA_real_
-
-  # Pick N_REF as the first n where improvements become small (stability heuristic)
-  # We look for the earliest n such that the relative improvement over the next 3 steps is < 10%.
-  n_ref_hat <- NA_integer_
-  if (nrow(summ) >= 5) {
-    for (i in seq_len(nrow(summ) - 3)) {
-      s0 <- summ$sd_emp[i]
-      s_next <- summ$sd_emp[(i + 1):(i + 3)]
-      # improvement ratio: (s0 - s_next) / s0
-      rel_impr <- (s0 - s_next) / s0
-      if (all(is.finite(rel_impr)) && all(rel_impr < 0.10)) {
-        n_ref_hat <- as.integer(summ$n[i])
-        break
-      }
-    }
-  }
-  if (!is.finite(n_ref_hat)) n_ref_hat <- as.integer(stats::median(summ$n, na.rm = TRUE))
-
-  list(
-    summary = summ,
-    fit = fit,
-    N_POWER_hat = p_hat,
-    N_REF_hat = n_ref_hat,
-    used_high_n = high_n,
-    used_groups = nrow(grp),
-    target_ns = target_ns,
-    reps = reps
-  )
-}
 
 
 
@@ -3824,34 +3100,32 @@ estimate_uncertainty_params_optionA <- function(df_tasks,
 
 # Helper: load inference dataset and apply filtering only AFTER the variant similarity heatmap exists ✅
 load_and_prepare_inference_data <- function() {
+  # Ensure df_inf always exists (prevents 'object df_inf not found' when inference is disabled/missing)
+  df_inf <- NULL
+
+  # Clear any cached inference data; this function always reloads from CSV
+  if (exists("df_tasks_inference", inherits = TRUE)) {
+    df_tasks_inference <<- NULL
+  }
+
   # Always reload inference data from CSV (do not use cached version)
   if (exists("df_tasks_inference") && !is.null(df_tasks_inference) && nrow(df_tasks_inference) > 0) {
     cat("[INFO] Clearing cached inference data to force reload from CSV.\n")
   }
 
-  if (isTRUE(SKIP_INFERENCE)) {
-    stop("SKIP_INFERENCE is no longer supported")
-  }
-
   # Load and filter (copied logic)
-  df_inf <- NULL
   if (exists("INFERENCE_CSV")) {
+    if (isTRUE(is.na(INFERENCE_CSV)) || !nzchar(as.character(INFERENCE_CSV))) {
+      cat("[INFERENCE] INFERENCE_CSV is NA/empty; skipping inference loading.\n")
+      return(invisible(NULL))
+    }
     if (file.exists(INFERENCE_CSV)) {
       cat(sprintf("Loading inference data from %s...\n", INFERENCE_CSV))
       df_inf <- tryCatch(read.csv(INFERENCE_CSV), error = function(e) { cat(sprintf("[WARNING] Error reading inference CSV: %s\n", e$message)); NULL })
       if (!is.null(df_inf)) {
         cat(sprintf("Loaded %d rows from inference file.\n", nrow(df_inf)))
         
-        # Treat certain classes as herbs
-        veg_col_inf <- if ("Veg" %in% names(df_inf)) "Veg" else if ("vegetation" %in% names(df_inf)) "vegetation" else NULL
-        if (!is.null(veg_col_inf)) {
-          # Fix typos first
-          df_inf[[veg_col_inf]] <- ifelse(df_inf[[veg_col_inf]] == "tamairx", "tamarix", df_inf[[veg_col_inf]])
-          # Then map certain classes to herbs
-          df_inf[[veg_col_inf]] <- ifelse(df_inf[[veg_col_inf]] %in% c("herbs", "alhagi", "salicornia", "halocnemum", "phragmites"), "herbs", df_inf[[veg_col_inf]])
-        } else {
-          cat("[WARNING] Neither 'Veg' nor 'vegetation' column found in df_inf. Skipping Veg treatment for inference data.\n")
-        }
+        df_inf <- canonicalize_veg_labels(df_inf)
         
         # IMPORTANT: Reconstruct location_id from lat/lon coordinates
         # Do NOT use the existing location_id column (if present) as it may be incorrect
@@ -3926,10 +3200,10 @@ load_and_prepare_inference_data <- function() {
         }
       }
     } else {
-      cat(sprintf("Inference file not found at: %s\n", INFERENCE_CSV))
+      stop(sprintf("[INFERENCE] Inference file not found at: %s", INFERENCE_CSV))
     }
   } else {
-    cat("INFERENCE_CSV variable not defined.\n")
+    stop("[INFERENCE] INFERENCE_CSV variable not defined.")
   }
 
   if (!is.null(df_inf) && nrow(df_inf) > 0) {
@@ -4063,23 +3337,10 @@ load_and_prepare_inference_data <- function() {
       ppi_inf_res <- NULL
       
       # If PPI not in df_inf, try to add it
-      if (exists("auto_add_ppi_columns") && "PPI" %in% avail && !"PPI" %in% names(df_inf)) {
-        dvi_soil_arg <- NA_real_
-        ppi_inf_res <- tryCatch({
-          auto_add_ppi_columns(df_inf, dvi_soil = dvi_soil_arg)
-        }, error = function(e) {
-          list(df = df_inf, added = FALSE, reason = e$message)
-        })
-
-        if (!is.null(ppi_inf_res) && isTRUE(ppi_inf_res$added)) {
-          df_inf <- ppi_inf_res$df
-          cat(sprintf("[PPI] Auto-added PPI to inference data (reason: %s)\n", ppi_inf_res$reason))
-        } else {
-          if (!is.null(ppi_inf_res) && !is.null(ppi_inf_res$df)) {
-            df_inf <- ppi_inf_res$df
-          }
-          stop("[PPI] Failed to auto-add PPI to inference data")
-        }
+      if (exists("add_ppi_columns") && "PPI" %in% avail && !"PPI" %in% names(df_inf)) {
+        dvi_soil_vec_inf <- compute_dvi_soil_per_location(df_inf, quantile_p = 0.10)
+        df_inf <- add_ppi_columns(df_inf, dvi_soil = dvi_soil_vec_inf)
+        cat("[PPI] Added PPI to inference data (per-location dvi_soil + per-location M).\n")
       }
 
       if (!"PPI" %in% names(df_inf) || all(!is.finite(df_inf$PPI))) {
@@ -4093,11 +3354,8 @@ load_and_prepare_inference_data <- function() {
       if ("prediction_date" %in% names(df_inf)) df_inf$prediction_date <- as.Date(df_inf$prediction_date)
       if ("reference_date" %in% names(df_inf)) df_inf$reference_date <- as.Date(df_inf$reference_date)
 
-      # AGENT: Backup raw PPI for visualization weighting (inference)
-      if ("PPI" %in% names(df_inf)) {
-        df_inf$PPI_raw <- df_inf$PPI
-        cat("[NOTICE] Backed up raw inference PPI values to 'PPI_raw' before normalization.\n")
-      }
+      # Backup raw PPI before normalization (inference)
+      if ("PPI" %in% names(df_inf) && !"PPI_raw" %in% names(df_inf)) df_inf$PPI_raw <- df_inf$PPI
 
       # Backup raw MSAVI and key bands for cover estimation (inference).
       # NOTE: apply_stored_normalization() z-scores indices/bands; MSAVI-based FVC must use raw units.
@@ -4118,19 +3376,8 @@ load_and_prepare_inference_data <- function() {
         df_inf <- inf_norm_result$df 
       }
 
-      # Create a clamped per-observation PPI normalization fraction for inference
       ppi_max_inf <- if (exists("PPI_FULL_VEG_COVER")) get("PPI_FULL_VEG_COVER") else 0.4
-      if (!"ppi_norm" %in% names(df_inf)) df_inf$ppi_norm <- NA_real_
-      if ("PPI_raw" %in% names(df_inf) && any(is.finite(df_inf$PPI_raw))) {
-        df_inf$ppi_norm <- pmin(pmax(df_inf$PPI_raw / ppi_max_inf, 0), 1)
-        cat(sprintf("[PPI NORM] Inference: created 'ppi_norm' from 'PPI_raw' and clamped to [0,1] using PPI_FULL_VEG_COVER=%.3f\n", ppi_max_inf))
-      } else if ("PPI" %in% names(df_inf) && any(is.finite(df_inf$PPI))) {
-        df_inf$ppi_norm <- pmin(pmax(df_inf$PPI / ppi_max_inf, 0), 1)
-        warning("Inference: 'PPI_raw' not found - computed 'ppi_norm' from 'PPI' (may be z-scored); values were clamped to [0,1]. Consider backing up raw PPI before normalization.")
-      } else {
-        df_inf$ppi_norm <- NA_real_
-        cat("[PPI NORM] Inference: No PPI or PPI_raw available to compute 'ppi_norm' (all NA)\n")
-      }
+      df_inf <- backup_and_normalize_ppi(df_inf, ppi_max_inf, label = "Inference")
 
       df_tasks_inference <<- df_inf
 
@@ -4432,10 +3679,6 @@ load_and_prepare_inference_data <- function() {
     return(w_out)
   }
 
-  cos_angle <- function(a, b) {
-    sum(a * b) / (sqrt(sum(a^2)) * sqrt(sum(b^2)))
-  }
-
 
 
 
@@ -4491,7 +3734,7 @@ load_and_prepare_inference_data <- function() {
     sample_sizes_no_barren <- NULL
     if ("Veg" %in% names(df_tasks)) {
       sample_sizes_no_barren <- df_tasks |>
-        dplyr::filter(!is.na(.data$Veg) & tolower(trimws(as.character(.data$Veg))) != "barren") |>
+        dplyr::filter(!is.na(.data$Veg) & normalize_veg_name(.data$Veg) != "barren") |>
         dplyr::group_by(location_id, pheno_year) |>
         dplyr::summarize(n_obs = dplyr::n(), .groups = "drop")
     }
@@ -4927,16 +4170,10 @@ load_and_prepare_inference_data <- function() {
       return(results)
     }
 
-    # Greedy EAR-based endmember extraction wrapper
-    ear_extract_all_levels <- function(data_mat, max_k, w_vec = NULL) {
-      cat(sprintf("[ENDMEMBER EXTRACTION] Using greedy EAR (n=%d, max_k=%d)\n", nrow(data_mat), max_k))
-      return(ear_extract_all_levels_greedy(data_mat, max_k, w_vec))
-    }
-
     # Endmember extraction wrapper: returns endmembers for a specific k
     ear_extract_endmembers <- function(data_mat, k, w_vec = NULL) {
       if (k < 1) return(NULL)
-      res <- ear_extract_all_levels(data_mat, k, w_vec)
+      res <- ear_extract_all_levels_greedy(data_mat, k, w_vec)
       return(res[[as.character(k)]])
     }
     
@@ -4981,7 +4218,7 @@ load_and_prepare_inference_data <- function() {
                      v, nrow(veg_mat_train), max_k_needed))
 
          # Compute ALL levels at once
-         all_levels <- ear_extract_all_levels(veg_mat_train, max_k_needed, w_vec)
+         all_levels <- ear_extract_all_levels_greedy(veg_mat_train, max_k_needed, w_vec)
 
          for(k in k_ranges[[v]]) {
            k_char <- as.character(k)
@@ -5030,13 +4267,6 @@ load_and_prepare_inference_data <- function() {
                     nrow(train_sets[[1]]$Y), length(unique(train_lbls))))
       } else {
         cat("    [WARNING] No training samples available for combined evaluation; using OOB only\n")
-      }
-
-      # Use FCLS solver for evaluation (wrapper)
-      run_solver_fcls <- function(y, M, w) {
-        res <- solve_weights_fcls(M, y, feature_weights = w)
-        if (is.null(res)) return(rep(0, ncol(M)))
-        return(res$w)
       }
 
       # 3b. Fitness Function - Evaluate on OOB holdout AND training data
@@ -6319,9 +5549,13 @@ sample_oob_residual <- function(dominant_class) {
 
 # ============================================================================
 # CLASSIFICATION UNCERTAINTY: DIRICHLET PERTURBATION
-# Propagates classification/misclassification uncertainty through bootstrap
-# by resampling fractional covers from a Dirichlet distribution centered on
-# the confusion matrix row for the true class.
+# Propagates classification/misclassification uncertainty through bootstrap by
+# resampling fractional covers from a Dirichlet distribution whose mean is
+# derived from the confusion matrix.
+#
+# IMPORTANT: This implementation is mixture-aware: it does NOT condition on a
+# single dominant/true class. Instead, it uses the current fraction vector as
+# weights over confusion-matrix rows.
 # ============================================================================
 
 # Global storage for confusion matrix and validation sample sizes
@@ -6466,24 +5700,128 @@ apply_dirichlet_perturbation <- function(fractions, true_class,
   return(result)
 }
 
-# Batch apply Dirichlet perturbation to a data frame of coefficients
-# Useful for bootstrap resampling of location-level results
+# Apply mixture-aware Dirichlet perturbation to fractional covers.
 #
-# Parameters:
-#   coef_df: Data frame with columns for fractional covers and a true_veg column
-#   frac_cols: Names of fractional cover columns
-#   true_class_col: Name of column containing true vegetation class
-#
-# Returns:
-#   Data frame with perturbed fractional covers
-#
-apply_dirichlet_perturbation_batch <- function(coef_df, frac_cols, true_class_col = "true_veg") {
-  if (!isTRUE(ENABLE_CLASSIFICATION_UNCERTAINTY)) {
-    return(coef_df)
+# Instead of conditioning on a single "true" class, this builds a Dirichlet mean
+# as a weighted mixture of confusion-matrix rows using the current fraction
+# vector as weights.
+apply_dirichlet_perturbation_mixture <- function(fractions,
+                                                 conf_matrix = NULL,
+                                                 sample_sizes = NULL,
+                                                 concentration_scale = DIRICHLET_CONCENTRATION_SCALE,
+                                                 min_weight = 1e-6) {
+  if (is.null(conf_matrix)) {
+    if (exists(".CONFUSION_MATRIX", envir = globalenv())) {
+      conf_matrix <- get(".CONFUSION_MATRIX", envir = globalenv())
+    } else {
+      stop("[DIRICHLET] No confusion matrix available")
+    }
   }
 
-  if (!true_class_col %in% names(coef_df)) {
-    stop(sprintf("[DIRICHLET] True class column '%s' not found in data frame", true_class_col))
+  if (is.null(sample_sizes) && exists(".VALIDATION_SAMPLE_SIZES", envir = globalenv())) {
+    sample_sizes <- get(".VALIDATION_SAMPLE_SIZES", envir = globalenv())
+  }
+
+  if (is.null(conf_matrix) || !is.matrix(conf_matrix) || nrow(conf_matrix) != ncol(conf_matrix)) {
+    stop("[DIRICHLET] Invalid confusion matrix")
+  }
+
+  if (is.null(fractions) || length(fractions) == 0) {
+    return(fractions)
+  }
+
+  fracs <- as.numeric(fractions)
+  names(fracs) <- names(fractions)
+  fracs[!is.finite(fracs)] <- 0
+  fracs[fracs < 0] <- 0
+
+  frac_sum <- sum(fracs)
+  if (!is.finite(frac_sum) || frac_sum <= 0) {
+    return(fractions)
+  }
+  fracs <- fracs / frac_sum
+
+  row_names <- tolower(rownames(conf_matrix))
+  col_names <- colnames(conf_matrix)
+  frac_names_lower <- tolower(names(fracs))
+
+  # Map fraction names to confusion-matrix rows (support 'frac_' prefix)
+  mapped_row <- rep(NA_character_, length(fracs))
+  for (i in seq_along(fracs)) {
+    nm <- frac_names_lower[i]
+    nm2 <- sub("^frac_", "", nm)
+    if (nm %in% row_names) {
+      mapped_row[i] <- nm
+    } else if (nm2 %in% row_names) {
+      mapped_row[i] <- nm2
+    }
+  }
+
+  keep <- is.finite(fracs) & fracs > 0 & !is.na(mapped_row) & (fracs >= min_weight)
+  if (!any(keep)) {
+    # No overlap with confusion matrix; leave unchanged
+    return(fracs)
+  }
+
+  w <- fracs[keep]
+  w <- w / sum(w)
+  rows <- mapped_row[keep]
+  row_idx <- match(rows, row_names)
+
+  # Weighted mean confusion row
+  mu <- rep(0, ncol(conf_matrix))
+  for (k in seq_along(row_idx)) {
+    mu <- mu + w[k] * as.numeric(conf_matrix[row_idx[k], ])
+  }
+
+  mu[!is.finite(mu)] <- 0
+  mu[mu < 1e-6] <- 1e-6
+  mu <- mu / sum(mu)
+
+  # Concentration based on validation support (fraction-weighted)
+  n_eff <- 20
+  if (!is.null(sample_sizes) && length(sample_sizes) > 0) {
+    ss_names <- tolower(names(sample_sizes))
+    ss <- as.numeric(sample_sizes)
+    ss[!is.finite(ss) | ss < 0] <- 0
+    ss_match <- ss[match(rows, ss_names)]
+    ss_match[is.na(ss_match)] <- 0
+    if (sum(ss_match) > 0) {
+      n_eff <- sum(w * ss_match)
+    }
+  }
+
+  alpha <- max(concentration_scale * n_eff, 5)
+  alpha_vec <- alpha * mu
+  gamma_draws <- rgamma(length(alpha_vec), shape = alpha_vec, rate = 1)
+  if (sum(gamma_draws) < 1e-10) {
+    gamma_draws <- mu
+  }
+  perturbed <- gamma_draws / sum(gamma_draws)
+
+  # Map back to original fraction names
+  result <- fracs
+  for (i in seq_along(col_names)) {
+    class_lower <- tolower(col_names[i])
+    match_idx <- which(frac_names_lower == class_lower |
+                         frac_names_lower == paste0("frac_", class_lower))
+    if (length(match_idx) > 0) {
+      result[match_idx[1]] <- perturbed[i]
+    }
+  }
+
+  if (sum(result) > 0) {
+    result <- result / sum(result)
+  }
+
+  return(result)
+}
+
+# Batch apply mixture-aware Dirichlet perturbation to a data frame of fractions.
+# Useful for resampling location-level results without requiring class labels.
+apply_dirichlet_perturbation_batch <- function(coef_df, frac_cols, true_class_col = NULL) {
+  if (!isTRUE(ENABLE_CLASSIFICATION_UNCERTAINTY)) {
+    return(coef_df)
   }
 
   # Check if confusion matrix is available
@@ -6494,18 +5832,12 @@ apply_dirichlet_perturbation_batch <- function(coef_df, frac_cols, true_class_co
   result_df <- coef_df
 
   for (i in seq_len(nrow(coef_df))) {
-    true_class <- as.character(coef_df[[true_class_col]][i])
-
-    if (is.na(true_class) || true_class == "") {
-      next
-    }
-
     # Extract current fractions
     fracs <- as.numeric(coef_df[i, frac_cols])
     names(fracs) <- frac_cols
 
-    # Apply perturbation
-    perturbed <- apply_dirichlet_perturbation(fracs, true_class)
+    # Apply mixture-aware perturbation
+    perturbed <- apply_dirichlet_perturbation_mixture(fracs)
 
     # Store back
     result_df[i, frac_cols] <- perturbed
@@ -6545,7 +5877,6 @@ simple_residual_bootstrap <- function(residuals) {
     loc <- as.character(task_data$location_id[1])
     yr <- as.integer(task_data$pheno_year[1])
     
-    write_debug(sprintf("Processing loc=%s yr=%d rows=%d", loc, yr, nrow(task_data)))
 
     # Extract lat/lon if available
     lat_val <- NA_real_
@@ -6564,13 +5895,10 @@ simple_residual_bootstrap <- function(residuals) {
                   !is.null(PARAMS$indices), 
                   !is.null(PARAMS$means), 
                   !is.null(PARAMS$sds)))
-      write_debug(sprintf("loc=%s yr=%d: PARAMS incomplete - returning NULL", loc, yr))
       return(NULL)
     }
     
     # DEBUG: Log feature space
-    write_debug(sprintf("loc=%s yr=%d: PARAMS$indices (%d features): %s", 
-                       loc, yr, length(PARAMS$indices), paste(PARAMS$indices, collapse=", ")))
     if (isTRUE(TESTING_MODE)) {
       cat(sprintf("[FEATURE SPACE] loc=%s yr=%d: Using %d indices: %s\n",
                   loc, yr, length(PARAMS$indices), paste(head(PARAMS$indices, 5), collapse=", ")))
@@ -6587,7 +5915,6 @@ simple_residual_bootstrap <- function(residuals) {
     raw_mat <- build_pentad_matrix(task_data, base_indices_for_build, interpolate = isTRUE(interpolate_for_inference))
     if (is.null(raw_mat)) {
       if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG] loc=%s yr=%d: build_pentad_matrix returned NULL\n", loc, yr))
-      write_debug(sprintf("loc=%s yr=%d: build_pentad_matrix returned NULL", loc, yr))
       return(NULL)
     }
 
@@ -6615,7 +5942,6 @@ simple_residual_bootstrap <- function(residuals) {
       if (exists("TESTING_MODE") && isTRUE(TESTING_MODE)) {
         cat(sprintf("[SKIP] loc=%s pheno_year=%d: no valid observations (n_valid=0) - skipping\n", loc, yr))
       }
-      write_debug(sprintf("loc=%s yr=%d: n_valid=0 - returning NULL", loc, yr))
       return(NULL)
     } else {
       MIN_VALID_FRACTION <- 0.01
@@ -6700,13 +6026,11 @@ simple_residual_bootstrap <- function(residuals) {
     # This avoids dependency on external calibration models.
     fvc_predicted <- current_msavi / (0.5 + current_msavi)
     # Log approximate MM-based mapping (note: not a calibrated FVC model)
-    write_debug(sprintf("loc=%s yr=%d: %s=%.4f -> FVC=%.4f", loc, yr, msavi_col, current_msavi, fvc_predicted))
 
     # Clamp to [0, 1] for safety
     total_veg_cover <- pmin(pmax(fvc_predicted, 0), 1)
     barren_fraction <- 1 - total_veg_cover
 
-    write_debug(sprintf("loc=%s yr=%d: %s=%.4f -> FVC=%.4f", loc, yr, msavi_col, current_msavi, total_veg_cover))
 
     # Verify barren_fraction is finite - error if not
     if (!is.finite(barren_fraction)) {
@@ -6714,7 +6038,6 @@ simple_residual_bootstrap <- function(residuals) {
                    loc, yr, as.character(barren_fraction)))
     }
 
-    write_debug(sprintf("loc=%s yr=%d: Barren fraction from MSAVI linear model=%.4f, proceeding to unmixing", loc, yr, barren_fraction))
 
     # ===== MESMA UNMIXING =====
       # Get indices from params
@@ -6732,8 +6055,7 @@ simple_residual_bootstrap <- function(residuals) {
       # PCA-LDA-scored feature space as training. This is applied before masking so column
       # indices remain aligned between obs and library templates.
       if (!is.null(PARAMS$weights) && length(PARAMS$weights) == length(y_norm)) {
-        y_norm_full_pca_lda <- tryCatch({ apply_pca_lda_transform(y_norm, PARAMS) }, error = function(e) { if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG] apply_pca_lda_transform failed for loc=%s yr=%d: %s\n", loc, yr, e$message)); y_norm })
-        if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG PCA-LDA] Applied PCA-LDA transform to z-scored observation (loc=%s yr=%d).\n", loc, yr))
+        y_norm_full_pca_lda <- y_norm  # PCA-LDA weights applied in solver via feature_weights
       } else {
         y_norm_full_pca_lda <- y_norm
       }
@@ -6783,26 +6105,18 @@ simple_residual_bootstrap <- function(residuals) {
       # DEBUG: Check library availability
       if (is.null(OPTIMIZED_LIBRARY) || length(OPTIMIZED_LIBRARY) == 0) {
         cat(sprintf("[ERROR] loc=%s yr=%d: OPTIMIZED_LIBRARY is NULL or empty\n", loc, yr))
-        write_debug(sprintf("loc=%s yr=%d: OPTIMIZED_LIBRARY NULL or empty - returning NULL", loc, yr))
         return(NULL)
       }
-      write_debug(sprintf("loc=%s yr=%d: OPTIMIZED_LIBRARY has %d veg types: %s", 
-                         loc, yr, length(OPTIMIZED_LIBRARY), paste(names(OPTIMIZED_LIBRARY), collapse=", ")))
-      if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG LIBRARY] loc=%s yr=%d: OPTIMIZED_LIBRARY contains %d vegetation types: %s\n", 
+      if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG LIBRARY] loc=%s yr=%d: OPTIMIZED_LIBRARY contains %d vegetation types: %s\n",
                   loc, yr, length(OPTIMIZED_LIBRARY), paste(names(OPTIMIZED_LIBRARY), collapse=", ")))
       
-      write_debug(sprintf("loc=%s yr=%d: Starting variant loop for veg_kept: %s", loc, yr, paste(veg_kept, collapse=", ")))
       top_variants <- list()
 
       for(v in veg_kept) {
         lib <- OPTIMIZED_LIBRARY[[v]]
         if(is.null(lib)) {
-          write_debug(sprintf("loc=%s yr=%d: veg=%s lib is NULL, skipping", loc, yr, v))
           next
         }
-        
-        write_debug(sprintf("loc=%s yr=%d: veg=%s lib has %d variants", loc, yr, v, 
-                           if(!is.null(lib$M_norm)) nrow(lib$M_norm) else 0))
 
         # Build masked templates from raw library matrix, applying the SAME PCA-LDA transform
         # used in training (if available) so the observation and templates lie in identical
@@ -6814,9 +6128,7 @@ simple_residual_bootstrap <- function(residuals) {
         # Apply PCA-LDA transform to each variant row (if we have matching weights)
         if (!is.null(PARAMS$weights) && length(PARAMS$weights) == ncol(M_full)) {
           M_full_trans <- t(apply(M_full, 1, function(r) {
-            r_num <- as.numeric(r)
-            res <- tryCatch(apply_pca_lda_transform(r_num, PARAMS), error = function(e) { if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG] apply_pca_lda_transform failed for lib variant of veg=%s: %s\n", v, e$message)); r_num })
-            res
+            as.numeric(r)  # PCA-LDA weights applied in solver via feature_weights
           }))
         } else {
           M_full_trans <- M_full
@@ -6831,7 +6143,6 @@ simple_residual_bootstrap <- function(residuals) {
         lib_ids_kept <- lib$ids
 
         if (nrow(lib_M_masked) == 0) {
-          write_debug(sprintf("loc=%s yr=%d: veg=%s has 0 variants, skipping", loc, yr, v))
           next
         }
 
@@ -6855,7 +6166,6 @@ simple_residual_bootstrap <- function(residuals) {
         sims <- as.numeric(lib_M_norm_masked %*% y_sim_norm)
         # Include all variants for consideration (remove similarity-based top-K filtering)
         best_idx <- order(sims, decreasing=TRUE)
-        write_debug(sprintf("loc=%s yr=%d: veg=%s computed similarities, keeping %d variants", loc, yr, v, length(best_idx)))
         
         top_variants[[v]] <- lapply(best_idx, function(i) {
           # Use L2-normalized masked template for unmixing
@@ -6871,23 +6181,17 @@ simple_residual_bootstrap <- function(residuals) {
       # Remove empty vegetation types
       empty_vegs <- names(top_variants)[sapply(top_variants, function(x) is.null(x) || length(x) == 0)]
       if (length(empty_vegs) > 0) {
-        write_debug(sprintf("loc=%s yr=%d: Removing %d empty veg types: %s", loc, yr, length(empty_vegs), paste(empty_vegs, collapse=", ")))
         for (ev in empty_vegs) top_variants[[ev]] <- NULL
       }
       
-      write_debug(sprintf("loc=%s yr=%d: After filtering, top_variants has %d veg types: %s", 
-                         loc, yr, length(top_variants), paste(names(top_variants), collapse=", ")))
 
       if (length(top_variants) == 0) {
         if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] loc=%s yr=%d: no top_variants available after filtering empties, skipping\n", loc, yr))
-        write_debug(sprintf("loc=%s yr=%d: no top_variants after filtering - returning NULL", loc, yr))
         return(NULL)
       }
       
       # Evaluate all combinations of endmembers
       # Pass unweighted observation; weighting happens inside solve_weights_fcls
-      write_debug(sprintf("loc=%s yr=%d: Calling evaluate_all_combinations with y length=%d, %d veg types", 
-                         loc, yr, length(y_for_unmixing), length(top_variants)))
       
       best_result <- tryCatch({
         evaluate_all_combinations(
@@ -6897,7 +6201,6 @@ simple_residual_bootstrap <- function(residuals) {
           feature_weights = weights_masked
         )
       }, error = function(e) {
-        write_debug(sprintf("loc=%s yr=%d: evaluate_all_combinations ERROR: %s", loc, yr, e$message))
         cat(sprintf("[ERROR fit_one_task] evaluate_all_combinations failed for loc=%s year=%d: %s\n", as.character(loc), as.integer(yr), e$message))
         NULL
       })
@@ -6905,20 +6208,12 @@ simple_residual_bootstrap <- function(residuals) {
       # BEGIN SAFETY BLOCK (Agent added)
       # tryCatch({
       
-      write_debug(sprintf("loc=%s yr=%d: evaluate_all_combinations returned %s", 
-                         loc, yr, if(is.null(best_result)) "NULL" else "result"))
 
       if (is.null(best_result)) {
         if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] loc=%s yr=%d: evaluate_all_combinations returned NULL\n", loc, yr))
-        write_debug(sprintf("loc=%s yr=%d: evaluate_all_combinations returned NULL", loc, yr))
         return(NULL)
       }
       
-      write_debug(sprintf("loc=%s yr=%d: best_result contents - ids=%s, w=%s, rmse=%s", 
-                         loc, yr,
-                         if(is.null(best_result$ids)) "NULL" else paste(names(best_result$ids), collapse=","),
-                         if(is.null(best_result$w)) "NULL" else paste(round(best_result$w,3), collapse=","),
-                         if(is.null(best_result$rmse)) "NULL" else round(best_result$rmse,4)))
 
       # Extract coefficients and create output
       chosen_ids <- best_result$ids
@@ -6928,10 +6223,6 @@ simple_residual_bootstrap <- function(residuals) {
       E_best_masked <- if (!is.null(best_result$E_best)) best_result$E_best else NULL
 
       # DIAGNOSTIC: Check coefficient values immediately after extraction
-      write_debug(sprintf("loc=%s yr=%d: [DIAGNOSTIC] coefs class=%s, length=%d, values=%s, any NA=%s",
-                         loc, yr, class(coefs), length(coefs),
-                         paste(round(coefs, 4), collapse=","),
-                         any(is.na(coefs))))
 
       # CRITICAL DEBUG: Print MESMA coefficients to console for diagnosis
       cat(sprintf("[MESMA OUTPUT] loc=%s yr=%d: %s (rmse=%.4f)\n",
@@ -7121,9 +6412,6 @@ simple_residual_bootstrap <- function(residuals) {
       )
 
       # DIAGNOSTIC: Check coef_df immediately after creation
-      write_debug(sprintf("loc=%s yr=%d: [DIAGNOSTIC] coef_df created with %d rows, coef class=%s, coef values=%s",
-                         loc, yr, nrow(coef_df), class(coef_df$coef),
-                         paste(sprintf("%s=%.4f", coef_df$Veg, coef_df$coef), collapse=", ")))
 
       # --- Rename high-similarity populus/tamarix variants to "woody_unknown" ---
       # Variants with cross-class similarity > 0.95 between populus and tamarix are indistinguishable
@@ -7136,8 +6424,6 @@ simple_residual_bootstrap <- function(residuals) {
             n_renamed <- sum(rename_mask)
             old_vegs <- coef_df$Veg[rename_mask]
             coef_df$Veg[rename_mask] <- "woody_unknown"
-            write_debug(sprintf("loc=%s yr=%d: Renamed %d variants to 'woody_unknown' (originally: %s)",
-                               loc, yr, n_renamed, paste(unique(old_vegs), collapse=", ")))
           }
         }
       }
@@ -7195,17 +6481,10 @@ simple_residual_bootstrap <- function(residuals) {
       # Barren is kept as from MESMA - no replacement
       # Aggregate by vegetation type (sum coefficients for same veg type)
       # Must happen AFTER all filtering but BEFORE creating diagnostics/coef_agg usage
-      write_debug(sprintf("loc=%s yr=%d: [DEBUG 3] Before aggregation: nrow(coef_df)=%d", loc, yr, nrow(coef_df)))
       if (nrow(coef_df) > 0) {
         # DIAGNOSTIC: Check coef values before aggregation
-        write_debug(sprintf("loc=%s yr=%d: [DIAGNOSTIC] Before aggregate - coef_df$coef class=%s, any NA=%s, values=%s",
-                           loc, yr, class(coef_df$coef), any(is.na(coef_df$coef)),
-                           paste(sprintf("%s=%.4f", coef_df$Veg, coef_df$coef), collapse=", ")))
         coef_agg <- aggregate(coef ~ Veg, data = coef_df, FUN = sum)
         # DIAGNOSTIC: Check coef values after aggregation
-        write_debug(sprintf("loc=%s yr=%d: [DIAGNOSTIC] After aggregate - coef_agg$coef class=%s, any NA=%s, values=%s",
-                           loc, yr, class(coef_agg$coef), any(is.na(coef_agg$coef)),
-                           paste(sprintf("%s=%.4f", coef_agg$Veg, coef_agg$coef), collapse=", ")))
       } else {
         # CRITICAL FIX: When coef_df is empty (e.g., MESMA picked 100% barren),
         # create coef_agg with vegetation types from library, initialized to 0
@@ -7221,7 +6500,6 @@ simple_residual_bootstrap <- function(residuals) {
           coef_agg <- data.frame(Veg = character(0), coef = numeric(0), stringsAsFactors = FALSE)
         }
       }
-      write_debug(sprintf("loc=%s yr=%d: [DEBUG 4] After aggregation: nrow(coef_agg)=%d", loc, yr, nrow(coef_agg)))
 
       # --- Scale vegetation fractions by index-derived total vegetation cover ---
       # MESMA provides relative proportions among vegetation types.
@@ -7239,12 +6517,8 @@ simple_residual_bootstrap <- function(residuals) {
       if (is.finite(sum_original_veg_coefs) && sum_original_veg_coefs > 1e-9) {
         scale_factor <- total_veg_cover / sum_original_veg_coefs
         coef_agg$coef[veg_coefs_mask] <- coef_agg$coef[veg_coefs_mask] * scale_factor
-        write_debug(sprintf("loc=%s yr=%d: Scaled veg fractions by %.4f (total_veg_cover=%.4f, sum_mesma_veg=%.4f)",
-                           loc, yr, scale_factor, total_veg_cover, sum_original_veg_coefs))
       } else {
         # MESMA returned 0 vegetation - keep it as 0, don't fabricate equal fractions
-        write_debug(sprintf("loc=%s yr=%d: MESMA returned 0 vegetation (sum=%.6f), keeping as-is (no equal distribution fallback)",
-                           loc, yr, sum_original_veg_coefs))
       }
 
       # Keep MESMA's barren fraction - do NOT replace with index-derived estimate
@@ -7256,12 +6530,10 @@ simple_residual_bootstrap <- function(residuals) {
         mesma_barren <- pmax(0, pmin(1, mesma_barren))
         barren_row <- data.frame(Veg = "barren", coef = mesma_barren)
         coef_agg <- rbind(coef_agg, barren_row)
-        write_debug(sprintf("loc=%s yr=%d: Added barren row with fraction %.4f (1 - sum_veg)", loc, yr, mesma_barren))
       }
       # Note: If barren already exists in coef_agg, we keep MESMA's original value
 
       # --- Propagate scaling to coef_df (no equal distribution fallback) ---
-      write_debug(sprintf("loc=%s yr=%d: [DEBUG 5] Before scaling: nrow(coef_df)=%d, sum_original_veg_coefs=%.4f", loc, yr, nrow(coef_df), sum_original_veg_coefs))
 
       # Wrap scaling in a defensive tryCatch to diagnose errors
       tryCatch({
@@ -7276,14 +6548,9 @@ simple_residual_bootstrap <- function(residuals) {
           if ("coef_975" %in% names(coef_df)) coef_df$coef_975[v_rows] <- coef_df$coef_975[v_rows] * scale_factor
         }
         # If MESMA returned 0 vegetation, coef_df veg fractions stay at 0 - no fallback
-        write_debug(sprintf("loc=%s yr=%d: [DEBUG 6] After scaling: nrow(coef_df)=%d", loc, yr, nrow(coef_df)))
       }, error = function(e) {
         # Detailed diagnostics to help track down TRUE/FALSE NA issues
-        write_debug(sprintf("loc=%s yr=%d: ERROR in scaling block: %s", loc, yr, e$message))
-        write_debug(sprintf("loc=%s yr=%d: DIAG: sum_original_veg_coefs=%s total_veg_cover=%s nrow(coef_df)=%d nrow(coef_agg)=%d", loc, yr, as.character(sum_original_veg_coefs), as.character(total_veg_cover), if(exists("coef_df")) nrow(coef_df) else -1, if(exists("coef_agg")) nrow(coef_agg) else -1))
         if (exists("coef_df")) {
-          write_debug(sprintf("loc=%s yr=%d: DIAG: coef_df head Veg: %s", loc, yr, paste(head(as.character(coef_df$Veg), 5), collapse=",")))
-          write_debug(sprintf("loc=%s yr=%d: DIAG: coef_df head variant_id: %s", loc, yr, paste(head(as.character(coef_df$variant_id), 5), collapse=",")))
         }
         stop(e)
       })
@@ -7328,7 +6595,6 @@ simple_residual_bootstrap <- function(residuals) {
           )
         } else {
           # No vegetation and no barren - fail
-          write_debug(sprintf("loc=%s yr=%d: No vegetation detected (100%% barren solution) - returning NULL", loc, yr))
           if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] loc=%s yr=%d: coef_df empty after barren removal\n", loc, yr))
           return(NULL)
         }
@@ -7356,7 +6622,6 @@ simple_residual_bootstrap <- function(residuals) {
         vid <- chosen_ids[[v]]
         # Defensive: ensure we have candidate variants for this veg
         if (is.null(top_variants[[v]]) || length(top_variants[[v]]) == 0) {
-          write_debug(sprintf("loc=%s yr=%d: No candidate variants present for veg=%s when reconstructing E_best", loc, yr, v))
           next
         }
         found <- FALSE
@@ -7371,19 +6636,15 @@ simple_residual_bootstrap <- function(residuals) {
         # Fallback: if chosen variant not found (e.g., NA mismatch), use first candidate and log
         if (!found) {
           E_best_list[[v]] <- top_variants[[v]][[1]]$vec
-          write_debug(sprintf("loc=%s yr=%d: Warning - chosen variant '%s' not found for veg=%s; using first candidate variant_id=%s", loc, yr, as.character(vid), v, as.character(top_variants[[v]][[1]]$id)))
         }
       }
       E_best <- do.call(cbind, E_best_list)
 
-      write_debug(sprintf("loc=%s yr=%d: SUCCESS - preparing to return coef_df with %d rows", loc, yr, nrow(coef_df)))
       # DEBUG: Log coefficient values before returning
       if (nrow(coef_df) > 0) {
         coef_summary <- sprintf("coefs: %s", paste(sprintf("%s=%.4f", coef_df$Veg, coef_df$coef), collapse=", "))
-        write_debug(sprintf("loc=%s yr=%d: %s", loc, yr, coef_summary))
         na_count <- sum(is.na(coef_df$coef))
         if (na_count > 0) {
-          write_debug(sprintf("loc=%s yr=%d: WARNING - %d/%d coefficients are NA!", loc, yr, na_count, nrow(coef_df)))
         }
       }
       return(tryCatch({
@@ -7400,17 +6661,9 @@ simple_residual_bootstrap <- function(residuals) {
           valid_mask = valid_mask
         )
       }, error = function(e) {
-        write_debug(sprintf("loc=%s yr=%d: ERROR in final return: %s", loc, yr, e$message))
         if (isTRUE(TESTING_MODE)) cat(sprintf("[ERROR fit_one_task] loc=%s yr=%d: final return failed: %s\n", loc, yr, e$message))
         stop(e)
       }))
-      
-      # }, error = function(e) {
-      #    write_debug(sprintf("loc=%s yr=%d: ERROR in post-processing: %s", loc, yr, e$message))
-      #    # Also print to stdout to be visible in terminal
-      #    cat(sprintf("[CRITICAL ERROR fit_one_task] Post-processing failed for loc=%s yr=%d: %s\n", loc, yr, e$message))
-      #    return(NULL)
-      # })
 
       # ===== END MESMA UNMIXING =====
   # These variables are already set in the earlier conditional blocks above.
@@ -7422,13 +6675,11 @@ simple_residual_bootstrap <- function(residuals) {
 # New function: Process all years for a single location with multi-year bootstrap
   fit_one_location <- function(location_data) {
     if (is.null(location_data) || nrow(location_data) == 0) {
-      write_debug("Received NULL or empty location_data")
       if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_location] Received NULL or empty location_data\n"))
       return(NULL)
     }
 
     loc <- as.character(location_data$location_id[1])
-    write_debug(sprintf("Processing location: %s, rows: %d", loc, nrow(location_data)))
     if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_location] Processing location: %s, rows: %d\n", loc, nrow(location_data)))
 
     # Get all phenological years for this location
@@ -7452,29 +6703,24 @@ simple_residual_bootstrap <- function(residuals) {
     out <- tryCatch({
       for (yr in years) {
         year_data <- location_data[location_data$pheno_year == yr, , drop = FALSE]
-        write_debug(sprintf("loc=%s yr=%d: year_data has %d rows", loc, yr, nrow(year_data)))
         
         res_yr <- tryCatch({
             fit_one_task(year_data)
           }, error = function(e) {
             msg <- sprintf("loc=%s yr=%d: ERROR in fit_one_task: %s", loc, yr, e$message)
-            write_debug(msg)
             message(paste("[ERROR fit_one_task CRASH]", msg))
             # Capture a compact call stack to pinpoint the failing if() condition
             calls <- tryCatch(sys.calls(), error = function(e2) NULL)
             if (!is.null(calls)) {
               tail_calls <- tail(calls, 12)
               call_str <- paste(vapply(tail_calls, function(x) paste(deparse(x), collapse = ""), character(1)), collapse = " | ")
-              write_debug(sprintf("loc=%s yr=%d: call stack (tail): %s", loc, yr, call_str))
             }
             NULL
           })
 
-        write_debug(sprintf("loc=%s yr=%d: fit_one_task returned %s", loc, yr, if(is.null(res_yr)) "NULL" else "result"))
         if (!is.null(res_yr)) {
           tryCatch({
             year_results[[as.character(yr)]] <- res_yr
-            write_debug(sprintf("loc=%s yr=%d: Added to year_results (now has %d entries)", loc, yr, length(year_results)))
           }, error = function(e) {
             if (isTRUE(TESTING_MODE)) cat(sprintf("[ERROR assigning year_results] loc=%s yr=%d: %s\n", loc, yr, e$message))
             stop(e)  # Re-throw to be caught by outer handler
@@ -7499,8 +6745,7 @@ simple_residual_bootstrap <- function(residuals) {
               expected_length <- length(MESMA_PARAMS$indices) * n_bins
               if (length(y_norm) != expected_length) {
                 if (isTRUE(TESTING_MODE)) {
-                  cat(sprintf("[WARN fit_one_location] loc=%s yr=%d: y_norm length mismatch (got %d, expected %d)\n",
-                              loc, yr, length(y_norm), expected_length))
+                  cat(sprintf("[WARN fit_one_location] loc=%s yr=%d: y_norm length mismatch (got %d, expected %d)\n"))
                 }
               } else {
                 y_norm[!is.finite(y_norm)] <- 0
@@ -7523,14 +6768,11 @@ simple_residual_bootstrap <- function(residuals) {
           })
         } else {
           if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_location] loc=%s yr=%d: fit_one_task returned NULL\n", loc, yr))
-          write_debug(sprintf("loc=%s yr=%d: fit_one_task returned NULL", loc, yr))
         }
       }
 
-      write_debug(sprintf("loc=%s: After year loop, year_results has %d entries", loc, length(year_results)))
       # If we have results for multiple years and ENABLE_UNCERTAINTY, do multi-year bootstrap
       if (length(year_results) == 0) {
-        write_debug(sprintf("loc=%s: year_results empty - returning NULL", loc))
         if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_location] loc=%s: no successful year results\n", loc))
         return(NULL)
       }
@@ -7578,31 +6820,7 @@ simple_residual_bootstrap <- function(residuals) {
             year_data <- location_data[location_data$pheno_year == yr, , drop = FALSE]
             n_obs <- nrow(year_data)
             if (n_obs < max(6, MIN_OBS_PER_LOC_YEAR)) {
-              if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG] Too few observations for bootstrap loc=%s yr=%s (n_obs=%d); applying small-n CI inflation fallback\n", loc, yr, n_obs))
-
-              # Populate conservative uncertainty directly on the coefficient table
-              curr_df <- year_results[[as.character(yr)]]$coef_df
-              if (!is.null(curr_df) && nrow(curr_df) > 0) {
-                for (r in seq_len(nrow(curr_df))) {
-                  # Keep any existing sd signal (e.g., top-model spread) but inflate aggressively for small n
-                  ci <- small_n_inflated_ci(
-                    est = curr_df$coef[r],
-                    sd_in = if ("coef_sd" %in% names(curr_df)) curr_df$coef_sd[r] else NA_real_,
-                    n_obs = n_obs
-                  )
-                  curr_df$coef_025[r] <- ci$coef_025
-                  curr_df$coef_975[r] <- ci$coef_975
-                  curr_df$coef_sd[r] <- ci$coef_sd
-                  curr_df$interval[r] <- ci$interval
-                }
-                year_results[[as.character(yr)]]$coef_df <- curr_df
-
-                if (isTRUE(TESTING_MODE)) {
-                  widths <- curr_df$coef_975 - curr_df$coef_025
-                  cat(sprintf("[DEBUG] small-n fallback CI widths loc=%s yr=%s: median=%.3f (n_obs=%d)\n",
-                              loc, yr, median(widths, na.rm = TRUE), n_obs))
-                }
-              }
+              if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG] Too few observations for bootstrap loc=%s yr=%s (n_obs=%d); skipping\n", loc, yr, n_obs))
               next
             }
 
@@ -7611,30 +6829,13 @@ simple_residual_bootstrap <- function(residuals) {
             boot_rmse <- numeric(0)
 
             # Suppress verbose output during bootstraps
-            sink_file <- tempfile()
-            con_out <- tryCatch(file(sink_file, open = "wt"), error = function(e) NULL)
-            con_msg <- tryCatch(file(paste0(sink_file, ".msg"), open = "wt"), error = function(e) NULL)
-            tryCatch({
-              if (!is.null(con_out) && inherits(con_out, "connection") && isOpen(con_out)) {
-                sink(con_out, type = "output")
-              }
-              if (!is.null(con_msg) && inherits(con_msg, "connection") && isOpen(con_msg)) {
-                sink(con_msg, type = "message")
-              }
-
+            suppress_output_safely({
               for (b in seq_len(B_loc)) {
-                
-                # Bootstrap residuals using simple i.i.d. resampling
                 residuals_boot <- simple_residual_bootstrap(res_yr$residuals)
                 y_boot <- res_yr$y_hat + residuals_boot
 
-                # OPTIMIZATION: Reuse the endmember matrix from the initial fit
-                # Instead of searching all variant combinations again, just re-solve weights
-                # with the same E_best matrix. This is ~100-1000x faster per bootstrap rep.
                 E_boot <- res_yr$E_best
-                if (is.null(E_boot) || !is.matrix(E_boot) || ncol(E_boot) < 1) {
-                  next  # Skip if no valid endmember matrix
-                }
+                if (is.null(E_boot) || !is.matrix(E_boot) || ncol(E_boot) < 1) next
 
                 res_b <- tryCatch({
                   solve_weights_fcls(E_boot, y_boot, feature_weights = res_yr$weights_masked)
@@ -7643,18 +6844,16 @@ simple_residual_bootstrap <- function(residuals) {
                 if (is.null(res_b)) next
 
                 coefs_b <- res_b$w
-                # Use the original chosen variant IDs from the initial fit
                 chosen_ids_b <- res_yr$coef_df$variant_id
                 names(chosen_ids_b) <- res_yr$coef_df$Veg
                 names(coefs_b) <- res_yr$coef_df$Veg
-                
+
                 dfb <- data.frame(
                     Veg = sapply(strsplit(chosen_ids_b, "_(v|opt)"), `[`, 1),
                     coef = coefs_b,
                     stringsAsFactors = FALSE
                 )
 
-                # collect coefficients
                 for (i in seq_len(nrow(dfb))) {
                   vg <- as.character(dfb$Veg[i])
                   if (is.na(vg)) next
@@ -7664,7 +6863,6 @@ simple_residual_bootstrap <- function(residuals) {
                   boot_coef_by_veg[[vg]] <- c(boot_coef_by_veg[[vg]], val)
                 }
 
-                # collect chosen variant ids
                 for (i in seq_along(chosen_ids_b)) {
                   vg <- names(chosen_ids_b)[i]
                   if (is.na(vg) || !is.character(vg)) next
@@ -7674,16 +6872,8 @@ simple_residual_bootstrap <- function(residuals) {
                   boot_variant_counts[[vg]][[as.character(vid)]] <- (boot_variant_counts[[vg]][[as.character(vid)]] %||% 0) + 1L
                 }
 
-                # rmse
                 if (!is.null(res_b$rmse) && is.finite(as.numeric(res_b$rmse))) boot_rmse <- c(boot_rmse, as.numeric(res_b$rmse))
               }
-
-            }, finally = {
-              try(sink(type = "message"), silent = TRUE)
-              try(sink(type = "output"), silent = TRUE)
-              if (!is.null(con_out)) try(close(con_out), silent = TRUE)
-              if (!is.null(con_msg)) try(close(con_msg), silent = TRUE)
-              try(unlink(sink_file), silent = TRUE); try(unlink(paste0(sink_file, ".msg")), silent = TRUE)
             })
             
             # Build coef CI table
@@ -7749,14 +6939,14 @@ simple_residual_bootstrap <- function(residuals) {
                               if ("coef_median" %in% names(coef_ci_df)) {
                                 curr_df$coef_median[match_idx] <- coef_ci_df$coef_median[r_idx]
                               }
-                          }
-                      }
-                      year_results[[as.character(yr)]]$coef_df <- curr_df
-                  }
+                            }
+                        }
+                        year_results[[as.character(yr)]]$coef_df <- curr_df
+                    }
+                }
               }
             }
           }
-        }
 
         if (!is.null(top_variants) && exists("mesma_lib")) {
           comp_templates <- list()
@@ -7768,12 +6958,10 @@ simple_residual_bootstrap <- function(residuals) {
         }
       }
 
-      write_debug(sprintf("Returning %d year results", length(year_results)))
       # Return results for all years
       return(year_results)
 
     }, error = function(e) {
-      write_debug(sprintf("ERROR in fit_one_location: %s", e$message))
       cat(sprintf("[ERROR fit_one_location] loc=%s: %s\n", loc, e$message))
       if (length(year_results) > 0) {
         if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_location] loc=%s: returning partial %d year(s) after error\n", loc, length(year_results)))
@@ -7782,9 +6970,6 @@ simple_residual_bootstrap <- function(residuals) {
       return(NULL)
     })
 
-    write_debug(sprintf("Final return for %s: out is %s with %d items", loc, 
-                        if(is.null(out)) "NULL" else "non-NULL",
-                        if(is.null(out)) 0 else length(out)))
     out
   }
 
@@ -7793,32 +6978,6 @@ simple_residual_bootstrap <- function(residuals) {
   validation_coefs <- data.frame()
   validation_results_list <- list()
 
-  debug_unmix_loc_year <- function(loc, yr, df = NULL) {
-    if (is.null(df)) {
-      if (exists('df_tasks_inference') && !is.null(df_tasks_inference) && nrow(df_tasks_inference) > 0) df <- df_tasks_inference
-      else if (exists('df_tasks') && !is.null(df_tasks) && nrow(df_tasks) > 0) df <- df_tasks
-      else stop('No task data available in workspace (df_tasks_inference or df_tasks)')
-    }
-    task_data <- df[df$location_id == loc & df$pheno_year == yr, , drop = FALSE]
-    if (nrow(task_data) == 0) stop(sprintf('No rows found for loc=%s pheno_year=%s', as.character(loc), as.character(yr)))
-
-    old_testing <- if (exists('TESTING_MODE', inherits = TRUE)) get('TESTING_MODE', envir = globalenv()) else FALSE
-    on.exit({ assign('TESTING_MODE', old_testing, envir = globalenv()) })
-
-    assign('TESTING_MODE', TRUE, envir = globalenv())
-
-    cat(sprintf('\n=== DEBUG UNMIX: loc=%s pheno_year=%s ===\n', as.character(loc), as.character(yr)))
-    
-    res <- tryCatch({ fit_one_task(task_data) }, error = function(e) { cat(sprintf('DEBUG UNMIX ERROR: %s\n', e$message)); NULL })
-    
-    if (!is.null(res)) {
-      cat('--- RESULT SUMMARY ---\n')
-      if (!is.null(res$diagnostics)) print(res$diagnostics)
-      if (!is.null(res$coef_df)) print(head(res$coef_df, n = 20))
-    }
-    cat('=== END DEBUG UNMIX ===\n\n')
-    res
-  }
   cat("Starting main processing loop...\n")
   
 
@@ -7834,28 +6993,7 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
   stop(sprintf("Failed to create temporary results directory: %s", TEMP_RESULTS_DIR))
 }
 
-aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap") {
-    if (!requireNamespace("dplyr", quietly = TRUE)) stop("dplyr required")
-    # Debug: print method to diagnose "Unknown method" errors
-    if (exists("TESTING_MODE") && isTRUE(TESTING_MODE)) {
-      cat(sprintf("[DEBUG] aggregate_to_global_pattern called with method='%s'\n", method))
-    }
-    # AGENT: Changed requirement to pheno_year
-    required_cols <- c("location_id", "pheno_year", "Veg", "coef")
-    missing <- setdiff(required_cols, names(all_coefs))
-    if (length(missing) > 0) stop(paste("Missing columns:", paste(missing, collapse = ", ")))
-    # Compatibility: Ensure 'year' exists for downstream functions that expect it
-    if (!"year" %in% names(all_coefs)) all_coefs$year <- all_coefs$pheno_year
-    if (method == "location_bootstrap") {
-      # pheno_year is guaranteed present
-      result <- location_bootstrap_aggregate(all_coefs, B = BOOTSTRAP_B)
-    } else {
-      stop(sprintf("Unknown method '%s'. Use 'location_bootstrap'.", method))
-    }
-    result
-  }
-
-  plot_global_vegetation_pattern <- function(global_pattern, 
+  plot_global_vegetation_pattern <- function(global_pattern,
                                               title = "Global Vegetation Composition Over Time",
                                               show_ci = TRUE,
                                               ci_type = "auto") {
@@ -7998,7 +7136,6 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
       df_tasks <- data.frame()  # Empty if no inference data
     }
 
-    b_templates <- NULL
     n_train_loc_years <- 0L
     n_infer_loc_years <- 0L
     if (exists("df_train") && !is.null(df_train) && nrow(df_train) > 0) {
@@ -8048,7 +7185,6 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
   # Use centralized BATCH_SIZE setting from the top-level CONFIG (to change batch size, edit the USER-TUNABLE PARAMETERS block)
   loc_batches <- split(target_locations, ceiling(seq_along(target_locations) / BATCH_SIZE))
   n_batches <- length(loc_batches)
-  pb_width <- min(40L, max(4L, n_batches))
 
   if (!isTRUE(QUIET_MODE)) cat(sprintf("Processing %d locations in %d batches (approx %d locations/batch)...\n",
               n_locs_to_process, length(loc_batches), BATCH_SIZE))
@@ -8063,55 +7199,11 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
     batch_df <- df_tasks[df_tasks$location_id %in% batch_locs, ]
     batch_location_list <- split(batch_df, batch_df$location_id)
     # Suppress any verbose output from per-location processing
-    sink_file <- tempfile()
-    con_out <- tryCatch(file(sink_file, open = "wt"), error = function(e) NULL)
-    con_msg <- tryCatch(file(paste0(sink_file, ".msg"), open = "wt"), error = function(e) NULL)
-    tryCatch({
-      if (!is.null(con_out) && inherits(con_out, "connection") && isOpen(con_out)) {
-        sink(con_out, type = "output")
-      }
-      if (!is.null(con_msg) && inherits(con_msg, "connection") && isOpen(con_msg)) {
-        sink(con_msg, type = "message")
-      }
-      batch_results <- .run_map(batch_location_list, fit_one_location, show_pb = FALSE)
-    }, finally = {
-      try(sink(type = "message"), silent = TRUE)
-      try(sink(type = "output"), silent = TRUE)
-      if (!is.null(con_out)) try(close(con_out), silent = TRUE)
-      if (!is.null(con_msg)) try(close(con_msg), silent = TRUE)
-      try(unlink(sink_file), silent = TRUE); try(unlink(paste0(sink_file, ".msg")), silent = TRUE)
-    })
+    batch_results <- suppress_output_safely(
+      .run_map(batch_location_list, fit_one_location, show_pb = FALSE)
+    )
 
-    for (k in names(batch_results)) {
-      loc_result <- batch_results[[k]]
-      if (is.null(loc_result)) next
-
-      loc_data <- do.call(rbind, lapply(loc_result, function(yr_res) yr_res$coef_df))
-
-      if (!is.null(loc_data) && nrow(loc_data) > 0) {
-        out_fname <- file.path(TEMP_RESULTS_DIR, paste0("result_", make.names(k), ".csv"))
-        readr::write_csv(loc_data, out_fname)
-      }
-      
-      # Append each per-year result to results_list for downstream analysis (e.g. plotting)
-      for (yr_char in names(loc_result)) {
-        r <- loc_result[[yr_char]]
-        if (is.null(r)) next
-        res_key <- if (!is.null(r$coef_df) && 'pheno_year' %in% names(r$coef_df)) {
-          paste(k, r$coef_df$pheno_year[1], sep = "_")
-        } else {
-          paste(k, yr_char, sep = "_")
-        }
-                  training_results_list[[res_key]] <- (function(r_in) {
-                    if (is.null(r_in)) return(NULL)
-                    list(
-                      coef_df = r_in$coef_df,
-                      diagnostics = r_in$diagnostics,
-                      uncertainty = r_in$uncertainty
-                    )
-                  })(r)
-      }
-    }
+    training_results_list <- aggregate_batch_results(batch_results, training_results_list, save_csv_dir = TEMP_RESULTS_DIR)
 
   if (!isTRUE(QUIET_MODE)) cat(sprintf("\r  [Batch %d/%d complete]  ", i, n_batches))
   }
@@ -8176,42 +7268,13 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
       }
 
       # Suppress verbose per-location output
-      sink_file_val <- tempfile(pattern = "validation_batch_")
-      con_out_val <- NULL
-      batch_results <- NULL
-      tryCatch({
-        if (isTRUE(QUIET_MODE)) {
-          con_out_val <- tryCatch(file(sink_file_val, open = "wt"), error = function(e) NULL)
-          if (!is.null(con_out_val) && inherits(con_out_val, "connection") && isOpen(con_out_val)) {
-            sink(con_out_val, type = "output")
-          }
-        }
-        batch_results <- .run_map(batch_location_list, fit_one_location, show_pb = FALSE)
-      }, finally = {
-        try(sink(type = "output"), silent = TRUE)
-        if (!is.null(con_out_val)) try(close(con_out_val), silent = TRUE)
-        try(unlink(sink_file_val), silent = TRUE)
-      })
-
-      for (k in names(batch_results)) {
-        loc_result <- batch_results[[k]]
-        if (is.null(loc_result)) next
-
-        for (yr_char in names(loc_result)) {
-          r <- loc_result[[yr_char]]
-          if (is.null(r)) next
-          res_key <- if (!is.null(r$coef_df) && "pheno_year" %in% names(r$coef_df)) {
-            paste(k, r$coef_df$pheno_year[1], sep = "_")
-          } else {
-            paste(k, yr_char, sep = "_")
-          }
-          validation_results_list[[res_key]] <- list(
-            coef_df = r$coef_df,
-            diagnostics = r$diagnostics,
-            uncertainty = r$uncertainty
-          )
-        }
+      batch_results <- if (isTRUE(QUIET_MODE)) {
+        suppress_output_safely(.run_map(batch_location_list, fit_one_location, show_pb = FALSE), quiet_message = FALSE)
+      } else {
+        .run_map(batch_location_list, fit_one_location, show_pb = FALSE)
       }
+
+      validation_results_list <- aggregate_batch_results(batch_results, validation_results_list)
 
       if (!isTRUE(QUIET_MODE)) {
         elapsed_batch <- as.numeric(difftime(Sys.time(), batch_t0, units = "secs"))
@@ -8232,13 +7295,11 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
 
     # Remove rows with NA or empty Veg values
     if (!is.null(validation_coefs) && nrow(validation_coefs) > 0) {
-      valid_veg <- !is.na(validation_coefs$Veg) &
-                   nchar(trimws(as.character(validation_coefs$Veg))) > 0 &
-                   trimws(as.character(validation_coefs$Veg)) != "NA"
-      na_veg_count <- sum(!valid_veg)
+      n_before <- nrow(validation_coefs)
+      validation_coefs <- filter_valid_vegetation(validation_coefs, exclude_barren = FALSE)
+      na_veg_count <- n_before - nrow(validation_coefs)
       if (na_veg_count > 0) {
         cat(sprintf("[VALIDATION] Removing %d rows with NA/empty Veg values\n", na_veg_count))
-        validation_coefs <- validation_coefs[valid_veg, ]
       }
     }
 
@@ -8391,76 +7452,16 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
       }
 
       # Suppress verbose stdout from per-location processing only in QUIET_MODE.
-      # Never sink messages/errors so failures remain visible and debuggable.
-      sink_file_inf <- tempfile(pattern = "inference_batch_")
-      con_out_inf <- NULL
-      batch_err <- NULL
-      batch_results <- NULL
-      tryCatch({
-        if (isTRUE(QUIET_MODE)) {
-          con_out_inf <- tryCatch(file(sink_file_inf, open = "wt"), error = function(e) NULL)
-          if (!is.null(con_out_inf) && inherits(con_out_inf, "connection") && isOpen(con_out_inf)) {
-            sink(con_out_inf, type = "output")
-          }
-        }
-        batch_results <- .run_map(batch_location_list, fit_one_location, show_pb = FALSE)
-      }, error = function(e) {
-        batch_err <<- e
-      }, finally = {
-        try(sink(type = "output"), silent = TRUE)
-        if (!is.null(con_out_inf)) try(close(con_out_inf), silent = TRUE)
-      })
-
-      if (!is.null(batch_err)) {
-        if (isTRUE(QUIET_MODE) && file.exists(sink_file_inf)) {
-          cat(sprintf("[INFERENCE] Batch %d/%d FAILED (stdout captured at %s)\n", i, n_inference_batches, sink_file_inf))
-        }
-        stop(batch_err)
+      batch_results <- if (isTRUE(QUIET_MODE)) {
+        suppress_output_safely(.run_map(batch_location_list, fit_one_location, show_pb = FALSE), quiet_message = FALSE)
+      } else {
+        .run_map(batch_location_list, fit_one_location, show_pb = FALSE)
       }
 
-      # Clean up captured stdout only when successful
-      if (isTRUE(QUIET_MODE)) {
-        try(unlink(sink_file_inf), silent = TRUE)
-      }
-      
-      # Store results
-      n_null_results <- 0
-      n_empty_years <- 0
-      n_empty_coefs <- 0
-      n_stored <- 0
-      
-      for (nm in names(batch_results)) {
-        loc_result <- batch_results[[nm]]
-        if (is.null(loc_result)) {
-          n_null_results <- n_null_results + 1
-          next
-        }
-        
-        # fit_one_location returns a list of year results
-        for (yr_char in names(loc_result)) {
-          r <- loc_result[[yr_char]]
-          if (is.null(r)) {
-            n_empty_years <- n_empty_years + 1
-            next
-          }
-          if (is.null(r$coef_df) || nrow(r$coef_df) == 0) {
-            n_empty_coefs <- n_empty_coefs + 1
-            next
-          }
-          
-          res_key <- if ('pheno_year' %in% names(r$coef_df)) {
-            paste(nm, unique(r$coef_df$pheno_year), sep = "_")
-          } else {
-            paste(nm, yr_char, sep = "_")
-          }
-          inference_results_list[[res_key]] <- list(
-            coef_df = r$coef_df,
-            diagnostics = r$diagnostics,
-            uncertainty = r$uncertainty
-          )
-          n_stored <- n_stored + 1
-        }
-      }
+      # Store results using shared helper
+      n_before <- length(inference_results_list)
+      inference_results_list <- aggregate_batch_results(batch_results, inference_results_list)
+      n_stored <- length(inference_results_list) - n_before
       
       if (isTRUE(TESTING_MODE)) {
         cat(sprintf("  [Batch %d] Results: %d stored, %d null locations, %d null years, %d empty coefs\n",
@@ -8515,13 +7516,11 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
 
     # Remove rows with NA or empty Veg values
     if (!is.null(inference_coefs) && nrow(inference_coefs) > 0) {
-      valid_veg <- !is.na(inference_coefs$Veg) &
-                   nchar(trimws(as.character(inference_coefs$Veg))) > 0 &
-                   trimws(as.character(inference_coefs$Veg)) != "NA"
-      na_veg_count <- sum(!valid_veg)
+      n_before <- nrow(inference_coefs)
+      inference_coefs <- filter_valid_vegetation(inference_coefs, exclude_barren = FALSE)
+      na_veg_count <- n_before - nrow(inference_coefs)
       if (na_veg_count > 0) {
         cat(sprintf("[INFERENCE] Removing %d rows with NA/empty Veg values\n", na_veg_count))
-        inference_coefs <- inference_coefs[valid_veg, ]
       }
     }
 
@@ -8535,180 +7534,10 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
       if (is.null(ppi_inf_full) || nrow(ppi_inf_full) == 0) {
         cat("[INFERENCE] PPI inference aggregation returned no results (no matching loc-year PPI values).\n")
       } else {
-        ppi_inf_veg <- ppi_inf_full[!tolower(trimws(ppi_inf_full$Veg)) %in% c("barren"), ]
-        ppi_inf_barren <- ppi_inf_full[tolower(trimws(ppi_inf_full$Veg)) %in% c("barren"), ]
-
-        if (!is.null(ppi_inf_veg) && nrow(ppi_inf_veg) > 0) {
-          p_inf_ppi_ts <- ggplot(ppi_inf_veg, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
-            add_excluded_years_shade(is_date = FALSE) + add_year_lines(is_date = FALSE) +
-            geom_line(linewidth = 1) +
-            geom_point(show.legend = FALSE) +
-            geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
-            labs(title = "PPI-Normalized Vegetation Fractions",
-                 x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
-            theme_minimal()
-          ggsave(file.path(OUT_DIR, "inference_ppi_normalized_timeseries.png"), p_inf_ppi_ts, width = 8, height = 6)
-          cat(sprintf("Saved inference PPI-normalized time series plot to: %s\n", file.path(OUT_DIR, "inference_ppi_normalized_timeseries.png")))
-
-        }
-
-        if (!is.null(ppi_inf_barren) && nrow(ppi_inf_barren) > 0) {
-          p_inf_barren <- ggplot(ppi_inf_barren, aes(x = year, y = global_coef)) +
-            add_excluded_years_shade(is_date = FALSE) + add_year_lines(is_date = FALSE) +
-            geom_line(color = "saddlebrown", linewidth = 1) +
-            geom_point(color = "saddlebrown") +
-            geom_ribbon(aes(ymin = coef_025, ymax = coef_975), alpha = 0.15, fill = "saddlebrown", color = NA) +
-            labs(title = "PPI-Based Barren Fraction", x = "Year", y = "Barren Fraction") +
-            scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
-            theme_minimal()
-          ggsave(file.path(OUT_DIR, "inference_ppi_barren_cover.png"), p_inf_barren, width = 8, height = 6)
-          cat(sprintf("Saved inference PPI-based barren cover plot to: %s\n", file.path(OUT_DIR, "inference_ppi_barren_cover.png")))
-
-
-          # Herbs vs Woody (inference PPI)
-          herbs_woody_inf <- ppi_inf_full[tolower(trimws(ppi_inf_full$Veg)) %in% c("herbs", "woody"), ]
-          if (nrow(herbs_woody_inf) > 0) {
-            herbs_woody_inf$Veg <- ifelse(tolower(herbs_woody_inf$Veg) == "herbs", "Herbs", "Woody")
-            p_inf_ppi_herbs_woody <- ggplot(herbs_woody_inf, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
-              add_excluded_years_shade(is_date = FALSE) + add_year_lines(is_date = FALSE) +
-              geom_line(linewidth = 1) +
-              geom_point(show.legend = FALSE) +
-              geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
-              scale_color_manual(values = c("Herbs" = "#2E8B57", "Woody" = "#8B4513")) +
-              scale_fill_manual(values = c("Herbs" = "#2E8B57", "Woody" = "#8B4513")) +
-              labs(title = "Inference PPI: Herbs vs Woody Vegetation",
-                   x = "Year", y = "Total Normalized Fraction", color = "Type", fill = "Type") +
-              theme_minimal()
-            ggsave(file.path(OUT_DIR, "inference_ppi_herbs_vs_woody.png"), p_inf_ppi_herbs_woody, width = 8, height = 6)
-            cat(sprintf("Saved inference PPI herbs vs woody plot to: %s\n", file.path(OUT_DIR, "inference_ppi_herbs_vs_woody.png")))
-
-            # --- Species-level plots (no "Woody" aggregation): Populus / Tamarix / Herbs / Woody Unknown ---
-            species_inf <- ppi_inf_full[tolower(trimws(ppi_inf_full$Veg)) %in% c("herbs","populus","tamarix","woody_unknown"), ]
-            if (nrow(species_inf) > 0) {
-              species_inf$Veg <- dplyr::case_when(
-                tolower(species_inf$Veg) == "herbs" ~ "Herbs",
-                tolower(species_inf$Veg) == "populus" ~ "Populus",
-                tolower(species_inf$Veg) == "tamarix" ~ "Tamarix",
-                tolower(species_inf$Veg) == "woody_unknown" ~ "Woody Unknown",
-                TRUE ~ species_inf$Veg
-              )
-
-              p_inf_ppi_species_ts <- ggplot(species_inf, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
-                add_excluded_years_shade(is_date = FALSE) + add_year_lines(is_date = FALSE) +
-                geom_line(linewidth = 1) +
-                geom_point(show.legend = FALSE) +
-                geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.12, color = NA) +
-                scale_color_manual(values = c("Herbs" = "#2E8B57", "Populus" = "#228B22", "Tamarix" = "#CD853F", "Woody Unknown" = "#808080")) +
-                scale_fill_manual(values = c("Herbs" = "#2E8B57", "Populus" = "#228B22", "Tamarix" = "#CD853F", "Woody Unknown" = "#808080")) +
-                labs(title = "Inference PPI: Species (no Woody aggregation)", x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
-                theme_minimal()
-              ggsave(file.path(OUT_DIR, "inference_ppi_species_separate.png"), p_inf_ppi_species_ts, width = 8, height = 6)
-              cat(sprintf("Saved inference PPI species (no woody aggregation) plot to: %s\n", file.path(OUT_DIR, "inference_ppi_species_separate.png")))
-
-              df_wide_sp <- tryCatch({ tidyr::pivot_wider(species_inf |> dplyr::select(year, Veg, global_coef), names_from = Veg, values_from = global_coef) }, error = function(e) NULL)
-              if (!is.null(df_wide_sp)) {
-                sp_cols <- intersect(c("Herbs","Populus","Tamarix","Woody Unknown"), names(df_wide_sp))
-                if (length(sp_cols) >= 2) {
-                  for (col in sp_cols) {
-                    df_wide_sp[[col]] <- as.numeric(df_wide_sp[[col]])
-                    df_wide_sp[[col]][is.na(df_wide_sp[[col]])] <- 0
-                  }
-                  df_wide_sp$total <- rowSums(df_wide_sp[, sp_cols, drop = FALSE], na.rm = TRUE)
-                  df_prop_sp <- df_wide_sp |> dplyr::filter(is.finite(total) & total > 0) |> dplyr::mutate(across(all_of(sp_cols), ~ . / total)) |> tidyr::pivot_longer(cols = all_of(sp_cols), names_to = "Veg", values_to = "prop")
-
-                  p_inf_ppi_species_stacked <- ggplot(df_prop_sp, aes(x = year, y = prop, fill = Veg)) +
-                    geom_area() +
-                    scale_fill_manual(values = c("Herbs" = "#2E8B57", "Populus" = "#228B22", "Tamarix" = "#CD853F", "Woody Unknown" = "#808080")) +
-                    labs(title = "Inference PPI: Species (Proportion, stacked)", x = "Year", y = "Proportion", fill = "Veg") +
-                    theme_minimal()
-                  ggsave(file.path(OUT_DIR, "inference_ppi_species_stacked.png"), p_inf_ppi_species_stacked, width = 8, height = 6)
-                  cat(sprintf("Saved inference PPI species stacked plot to: %s\n", file.path(OUT_DIR, "inference_ppi_species_stacked.png")))
-                }
-              }
-            }
-
-
-            # --- Stacked area (Proportion) and Woody/Herbs ratio (Inference PPI) ---
-            df_wide <- tryCatch({
-              tidyr::pivot_wider(herbs_woody_inf |> dplyr::select(year, Veg, global_coef), names_from = Veg, values_from = global_coef)
-            }, error = function(e) NULL)
-            if (!is.null(df_wide) && all(c("Herbs","Woody") %in% names(df_wide))) {
-              df_wide$Herbs <- as.numeric(df_wide$Herbs)
-              df_wide$Woody <- as.numeric(df_wide$Woody)
-              df_wide$total <- rowSums(df_wide[, c("Herbs","Woody")], na.rm = TRUE)
-
-              df_prop <- df_wide |> dplyr::filter(is.finite(total) & total > 0) |> dplyr::mutate(Herbs = Herbs/total, Woody = Woody/total) |> tidyr::pivot_longer(cols = c("Herbs","Woody"), names_to = "Veg", values_to = "prop")
-              p_inf_ppi_stacked <- ggplot(df_prop, aes(x = year, y = prop, fill = Veg)) +
-                geom_area() +
-                scale_fill_manual(values = c("Herbs" = "#2E8B57", "Woody" = "#8B4513")) +
-                labs(title = "Inference PPI: Herbs vs Woody (Proportion, stacked)", x = "Year", y = "Proportion", fill = "Type") +
-                theme_minimal()
-              ggsave(file.path(OUT_DIR, "inference_ppi_herbs_vs_woody_stacked.png"), p_inf_ppi_stacked, width = 8, height = 6)
-              cat(sprintf("Saved inference PPI herbs vs woody stacked plot to: %s\n", file.path(OUT_DIR, "inference_ppi_herbs_vs_woody_stacked.png")))
-
-              df_ratio <- df_wide |> dplyr::mutate(ratio = ifelse(is.finite(Herbs) & Herbs > 0, Woody / Herbs, NA_real_))
-              p_inf_ppi_ratio <- ggplot(df_ratio, aes(x = year, y = ratio)) +
-                geom_line(color = "#8B4513", linewidth = 1) +
-                geom_point() +
-                labs(title = "Inference PPI: Woody / Herbs Ratio", x = "Year", y = "Woody / Herbs") +
-                theme_minimal()
-              ggsave(file.path(OUT_DIR, "inference_ppi_woody_over_herbs.png"), p_inf_ppi_ratio, width = 8, height = 6)
-              cat(sprintf("Saved inference PPI woody/herbs ratio plot to: %s\n", file.path(OUT_DIR, "inference_ppi_woody_over_herbs.png")))
-            } else {
-              cat("Cannot create inference PPI stacked/ratio plot: missing Herbs/Woody rows.\n")
-            }
-
-            # --- Tamarix vs Populus vs Woody_unknown stacked plot (Inference PPI) ---
-            woody_types_inf <- ppi_inf_full[tolower(trimws(ppi_inf_full$Veg)) %in% c("tamarix", "populus", "woody_unknown"), ]
-            if (nrow(woody_types_inf) > 0) {
-              woody_types_inf$Veg <- dplyr::case_when(
-                tolower(woody_types_inf$Veg) == "tamarix" ~ "Tamarix",
-                tolower(woody_types_inf$Veg) == "populus" ~ "Populus",
-                tolower(woody_types_inf$Veg) == "woody_unknown" ~ "Woody Unknown",
-                TRUE ~ woody_types_inf$Veg
-              )
-
-              df_wide_woody <- tryCatch({
-                tidyr::pivot_wider(woody_types_inf |> dplyr::select(year, Veg, global_coef), names_from = Veg, values_from = global_coef)
-              }, error = function(e) NULL)
-
-              if (!is.null(df_wide_woody)) {
-                woody_cols <- intersect(c("Tamarix", "Populus", "Woody Unknown"), names(df_wide_woody))
-                if (length(woody_cols) >= 2) {
-                  for (col in woody_cols) {
-                    df_wide_woody[[col]] <- as.numeric(df_wide_woody[[col]])
-                    df_wide_woody[[col]][is.na(df_wide_woody[[col]])] <- 0
-                  }
-                  df_wide_woody$total <- rowSums(df_wide_woody[, woody_cols, drop = FALSE], na.rm = TRUE)
-
-                  df_prop_woody <- df_wide_woody |>
-                    dplyr::filter(is.finite(total) & total > 0) |>
-                    dplyr::mutate(across(all_of(woody_cols), ~ . / total)) |>
-                    tidyr::pivot_longer(cols = all_of(woody_cols), names_to = "Veg", values_to = "prop")
-
-                  p_inf_ppi_woody_stacked <- ggplot(df_prop_woody, aes(x = year, y = prop, fill = Veg)) +
-                    geom_area() +
-                    scale_fill_manual(values = c("Tamarix" = "#CD853F", "Populus" = "#228B22", "Woody Unknown" = "#808080")) +
-                    labs(title = "Inference PPI: Tamarix vs Populus vs Woody Unknown (Proportion, stacked)",
-                         x = "Year", y = "Proportion", fill = "Type") +
-                    theme_minimal()
-                  ggsave(file.path(OUT_DIR, "inference_ppi_tamarix_populus_woody_unknown_stacked.png"), p_inf_ppi_woody_stacked, width = 8, height = 6)
-                  cat(sprintf("Saved inference PPI Tamarix vs Populus vs Woody Unknown stacked plot to: %s\n", file.path(OUT_DIR, "inference_ppi_tamarix_populus_woody_unknown_stacked.png")))
-                } else {
-                  cat("Cannot create inference PPI Tamarix/Populus/Woody_unknown stacked plot: need at least 2 of these veg types.\n")
-                }
-              } else {
-                cat("Cannot create inference PPI Tamarix/Populus/Woody_unknown stacked plot: pivot failed.\n")
-              }
-            } else {
-              cat("No Tamarix/Populus/Woody_unknown data available for inference PPI woody types stacked plot.\n")
-            }
-          } else {
-            cat("No herbs/woody data available for inference PPI herbs vs woody plot.\n")
-          }
-        } else {
-          cat("[INFERENCE] No barren rows found in PPI inference aggregation results.\n")
-        }
+        plot_inference_method_results(ppi_inf_full, "PPI", "ppi",
+                                      use_excluded_years_shade = TRUE,
+                                      include_species_plots = TRUE,
+                                      include_woody_types_plot = TRUE)
       }
     } else {
       cat("[INFERENCE] PPI data not available for inference; skipping PPI barren estimation.\n")
@@ -8719,134 +7548,9 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
       cat("[INFERENCE] Running MSAVI-based aggregation (inference mode)\n")
       msavi_inf_full <- tryCatch({ location_bootstrap_msavi(inference_coefs, df_tasks_inference_proc, B = BOOTSTRAP_B, seed = get_mesma_seed(123)) }, error = function(e) { cat(sprintf("[MSAVI INFERENCE] failed: %s\n", e$message)); NULL })
       if (!is.null(msavi_inf_full) && nrow(msavi_inf_full) > 0) {
-        msavi_inf_veg <- msavi_inf_full[!tolower(trimws(msavi_inf_full$Veg)) %in% c("barren"), ]
-        msavi_inf_barren <- msavi_inf_full[tolower(trimws(msavi_inf_full$Veg)) %in% c("barren"), ]
-
-        if (!is.null(msavi_inf_veg) && nrow(msavi_inf_veg) > 0) {
-          p_inf_msavi_ts <- ggplot(msavi_inf_veg, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
-            add_excluded_years_shade(is_date = FALSE) + add_year_lines(is_date = FALSE) +
-            geom_line(linewidth = 1) +
-            geom_point(show.legend = FALSE) +
-            geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
-            labs(title = "MSAVI-Normalized Vegetation Fractions",
-                 x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
-            theme_minimal()
-          ggsave(file.path(OUT_DIR, "inference_msavi_normalized_timeseries.png"), p_inf_msavi_ts, width = 8, height = 6)
-          cat(sprintf("Saved inference MSAVI-normalized time series plot to: %s\n", file.path(OUT_DIR, "inference_msavi_normalized_timeseries.png")))
-
-        }
-
-        if (!is.null(msavi_inf_barren) && nrow(msavi_inf_barren) > 0) {
-          p_inf_msavi_barren <- ggplot(msavi_inf_barren, aes(x = year, y = global_coef)) +
-            add_excluded_years_shade(is_date = FALSE) + add_year_lines(is_date = FALSE) +
-            geom_line(color = "saddlebrown", linewidth = 1) +
-            geom_point(color = "saddlebrown") +
-            geom_ribbon(aes(ymin = coef_025, ymax = coef_975), alpha = 0.15, fill = "saddlebrown", color = NA) +
-            labs(title = "MSAVI-Based Barren Fraction", x = "Year", y = "Barren Fraction") +
-            scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
-            theme_minimal()
-          ggsave(file.path(OUT_DIR, "inference_msavi_barren_cover.png"), p_inf_msavi_barren, width = 8, height = 6)
-          cat(sprintf("Saved inference MSAVI-based barren cover plot to: %s\n", file.path(OUT_DIR, "inference_msavi_barren_cover.png")))
-
-
-          # Herbs vs Woody (inference MSAVI)
-          herbs_woody_msavi_inf <- msavi_inf_full[tolower(trimws(msavi_inf_full$Veg)) %in% c("herbs", "woody"), ]
-          if (nrow(herbs_woody_msavi_inf) > 0) {
-            herbs_woody_msavi_inf$Veg <- ifelse(tolower(herbs_woody_msavi_inf$Veg) == "herbs", "Herbs", "Woody")
-            p_inf_msavi_herbs_woody <- ggplot(herbs_woody_msavi_inf, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
-              add_excluded_years_shade(is_date = FALSE) + add_year_lines(is_date = FALSE) +
-              geom_line(linewidth = 1) +
-              geom_point(show.legend = FALSE) +
-              geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
-              scale_color_manual(values = c("Herbs" = "#2E8B57", "Woody" = "#8B4513")) +
-              scale_fill_manual(values = c("Herbs" = "#2E8B57", "Woody" = "#8B4513")) +
-              labs(title = "Inference MSAVI: Herbs vs Woody Vegetation",
-                   x = "Year", y = "Total Normalized Fraction", color = "Type", fill = "Type") +
-              theme_minimal()
-            ggsave(file.path(OUT_DIR, "inference_msavi_herbs_vs_woody.png"), p_inf_msavi_herbs_woody, width = 8, height = 6)
-
-            # --- Species-level plots (no "Woody" aggregation) for MSAVI ---
-            species_msavi <- msavi_inf_full[tolower(trimws(msavi_inf_full$Veg)) %in% c("herbs","populus","tamarix","woody_unknown"), ]
-            if (nrow(species_msavi) > 0) {
-              species_msavi$Veg <- dplyr::case_when(
-                tolower(species_msavi$Veg) == "herbs" ~ "Herbs",
-                tolower(species_msavi$Veg) == "populus" ~ "Populus",
-                tolower(species_msavi$Veg) == "tamarix" ~ "Tamarix",
-                tolower(species_msavi$Veg) == "woody_unknown" ~ "Woody Unknown",
-                TRUE ~ species_msavi$Veg
-              )
-
-              p_inf_msavi_species_ts <- ggplot(species_msavi, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
-                add_excluded_years_shade(is_date = FALSE) + add_year_lines(is_date = FALSE) +
-                geom_line(linewidth = 1) +
-                geom_point(show.legend = FALSE) +
-                geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.12, color = NA) +
-                scale_color_manual(values = c("Herbs" = "#2E8B57", "Populus" = "#228B22", "Tamarix" = "#CD853F", "Woody Unknown" = "#808080")) +
-                scale_fill_manual(values = c("Herbs" = "#2E8B57", "Populus" = "#228B22", "Tamarix" = "#CD853F", "Woody Unknown" = "#808080")) +
-                labs(title = "Inference MSAVI: Species (no Woody aggregation)", x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
-                theme_minimal()
-              ggsave(file.path(OUT_DIR, "inference_msavi_species_separate.png"), p_inf_msavi_species_ts, width = 8, height = 6)
-              cat(sprintf("Saved inference MSAVI species (no woody aggregation) plot to: %s\n", file.path(OUT_DIR, "inference_msavi_species_separate.png")))
-
-              df_wide_sp_msavi <- tryCatch({ tidyr::pivot_wider(species_msavi |> dplyr::select(year, Veg, global_coef), names_from = Veg, values_from = global_coef) }, error = function(e) NULL)
-              if (!is.null(df_wide_sp_msavi)) {
-                sp_cols_msavi <- intersect(c("Herbs","Populus","Tamarix","Woody Unknown"), names(df_wide_sp_msavi))
-                if (length(sp_cols_msavi) >= 2) {
-                  for (col in sp_cols_msavi) {
-                    df_wide_sp_msavi[[col]] <- as.numeric(df_wide_sp_msavi[[col]])
-                    df_wide_sp_msavi[[col]][is.na(df_wide_sp_msavi[[col]])] <- 0
-                  }
-                  df_wide_sp_msavi$total <- rowSums(df_wide_sp_msavi[, sp_cols_msavi, drop = FALSE], na.rm = TRUE)
-                  df_prop_sp_msavi <- df_wide_sp_msavi |> dplyr::filter(is.finite(total) & total > 0) |> dplyr::mutate(across(all_of(sp_cols_msavi), ~ . / total)) |> tidyr::pivot_longer(cols = all_of(sp_cols_msavi), names_to = "Veg", values_to = "prop")
-
-                  p_inf_msavi_species_stacked <- ggplot(df_prop_sp_msavi, aes(x = year, y = prop, fill = Veg)) +
-                    geom_area() +
-                    scale_fill_manual(values = c("Herbs" = "#2E8B57", "Populus" = "#228B22", "Tamarix" = "#CD853F", "Woody Unknown" = "#808080")) +
-                    labs(title = "Inference MSAVI: Species (Proportion, stacked)", x = "Year", y = "Proportion", fill = "Veg") +
-                    theme_minimal()
-                  ggsave(file.path(OUT_DIR, "inference_msavi_species_stacked.png"), p_inf_msavi_species_stacked, width = 8, height = 6)
-                  cat(sprintf("Saved inference MSAVI species stacked plot to: %s\n", file.path(OUT_DIR, "inference_msavi_species_stacked.png")))
-                }
-              }
-            }
-            cat(sprintf("Saved inference MSAVI herbs vs woody plot to: %s\n", file.path(OUT_DIR, "inference_msavi_herbs_vs_woody.png")))
-
-
-            # --- Stacked area (Proportion) and Woody/Herbs ratio (Inference MSAVI) ---
-            df_wide <- tryCatch({
-              tidyr::pivot_wider(herbs_woody_msavi_inf |> dplyr::select(year, Veg, global_coef), names_from = Veg, values_from = global_coef)
-            }, error = function(e) NULL)
-            if (!is.null(df_wide) && all(c("Herbs","Woody") %in% names(df_wide))) {
-              df_wide$Herbs <- as.numeric(df_wide$Herbs)
-              df_wide$Woody <- as.numeric(df_wide$Woody)
-              df_wide$total <- rowSums(df_wide[, c("Herbs","Woody")], na.rm = TRUE)
-
-              df_prop <- df_wide |> dplyr::filter(is.finite(total) & total > 0) |> dplyr::mutate(Herbs = Herbs/total, Woody = Woody/total) |> tidyr::pivot_longer(cols = c("Herbs","Woody"), names_to = "Veg", values_to = "prop")
-              p_inf_msavi_stacked <- ggplot(df_prop, aes(x = year, y = prop, fill = Veg)) +
-                geom_area() +
-                scale_fill_manual(values = c("Herbs" = "#2E8B57", "Woody" = "#8B4513")) +
-                labs(title = "Inference MSAVI: Herbs vs Woody (Proportion, stacked)", x = "Year", y = "Proportion", fill = "Type") +
-                theme_minimal()
-              ggsave(file.path(OUT_DIR, "inference_msavi_herbs_vs_woody_stacked.png"), p_inf_msavi_stacked, width = 8, height = 6)
-              cat(sprintf("Saved inference MSAVI herbs vs woody stacked plot to: %s\n", file.path(OUT_DIR, "inference_msavi_herbs_vs_woody_stacked.png")))
-
-              df_ratio <- df_wide |> dplyr::mutate(ratio = ifelse(is.finite(Herbs) & Herbs > 0, Woody / Herbs, NA_real_))
-              p_inf_msavi_ratio <- ggplot(df_ratio, aes(x = year, y = ratio)) +
-                geom_line(color = "#8B4513", linewidth = 1) +
-                geom_point() +
-                labs(title = "Inference MSAVI: Woody / Herbs Ratio", x = "Year", y = "Woody / Herbs") +
-                theme_minimal()
-              ggsave(file.path(OUT_DIR, "inference_msavi_woody_over_herbs.png"), p_inf_msavi_ratio, width = 8, height = 6)
-              cat(sprintf("Saved inference MSAVI woody/herbs ratio plot to: %s\n", file.path(OUT_DIR, "inference_msavi_woody_over_herbs.png")))
-            } else {
-              cat("Cannot create inference MSAVI stacked/ratio plot: missing Herbs/Woody rows.\n")
-            }
-          } else {
-            cat("No herbs/woody data available for inference MSAVI herbs vs woody plot.\n")
-          }
-        } else {
-          cat("[INFERENCE] No barren rows found in MSAVI inference aggregation results.\n")
-        }
+        plot_inference_method_results(msavi_inf_full, "MSAVI", "msavi",
+                                      use_excluded_years_shade = TRUE,
+                                      include_species_plots = TRUE)
       } else {
         cat("[INFERENCE] MSAVI inference aggregation returned no results.\n")
       }
@@ -8859,134 +7563,9 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
       cat("[INFERENCE] Running NDVI-based aggregation (inference mode)\n")
       ndvi_inf_full <- tryCatch({ location_bootstrap_ndvi(inference_coefs, df_tasks_inference_proc, B = BOOTSTRAP_B, seed = get_mesma_seed(123)) }, error = function(e) { cat(sprintf("[NDVI INFERENCE] failed: %s\n", e$message)); NULL })
       if (!is.null(ndvi_inf_full) && nrow(ndvi_inf_full) > 0) {
-        ndvi_inf_veg <- ndvi_inf_full[!tolower(trimws(ndvi_inf_full$Veg)) %in% c("barren"), ]
-        ndvi_inf_barren <- ndvi_inf_full[tolower(trimws(ndvi_inf_full$Veg)) %in% c("barren"), ]
-
-        if (!is.null(ndvi_inf_veg) && nrow(ndvi_inf_veg) > 0) {
-          p_inf_ndvi_ts <- ggplot(ndvi_inf_veg, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
-            add_excluded_years_shade(is_date = FALSE) + add_year_lines(is_date = FALSE) +
-            geom_line(linewidth = 1) +
-            geom_point(show.legend = FALSE) +
-            geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
-            labs(title = "NDVI-Normalized Vegetation Fractions",
-                 x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
-            theme_minimal()
-          ggsave(file.path(OUT_DIR, "inference_ndvi_normalized_timeseries.png"), p_inf_ndvi_ts, width = 8, height = 6)
-          cat(sprintf("Saved inference NDVI-normalized time series plot to: %s\n", file.path(OUT_DIR, "inference_ndvi_normalized_timeseries.png")))
-
-        }
-
-        if (!is.null(ndvi_inf_barren) && nrow(ndvi_inf_barren) > 0) {
-          p_inf_ndvi_barren <- ggplot(ndvi_inf_barren, aes(x = year, y = global_coef)) +
-            add_excluded_years_shade(is_date = FALSE) + add_year_lines(is_date = FALSE) +
-            geom_line(color = "saddlebrown", linewidth = 1) +
-            geom_point(color = "saddlebrown") +
-            geom_ribbon(aes(ymin = coef_025, ymax = coef_975), alpha = 0.15, fill = "saddlebrown", color = NA) +
-            labs(title = "NDVI-Based Barren Fraction", x = "Year", y = "Barren Fraction") +
-            scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
-            theme_minimal()
-          ggsave(file.path(OUT_DIR, "inference_ndvi_barren_cover.png"), p_inf_ndvi_barren, width = 8, height = 6)
-          cat(sprintf("Saved inference NDVI-based barren cover plot to: %s\n", file.path(OUT_DIR, "inference_ndvi_barren_cover.png")))
-
-
-          # Herbs vs Woody (inference NDVI)
-          herbs_woody_ndvi_inf <- ndvi_inf_full[tolower(trimws(ndvi_inf_full$Veg)) %in% c("herbs", "woody"), ]
-          if (nrow(herbs_woody_ndvi_inf) > 0) {
-            herbs_woody_ndvi_inf$Veg <- ifelse(tolower(herbs_woody_ndvi_inf$Veg) == "herbs", "Herbs", "Woody")
-            p_inf_ndvi_herbs_woody <- ggplot(herbs_woody_ndvi_inf, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
-              add_excluded_years_shade(is_date = FALSE) + add_year_lines(is_date = FALSE) +
-              geom_line(linewidth = 1) +
-              geom_point(show.legend = FALSE) +
-              geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
-              scale_color_manual(values = c("Herbs" = "#2E8B57", "Woody" = "#8B4513")) +
-              scale_fill_manual(values = c("Herbs" = "#2E8B57", "Woody" = "#8B4513")) +
-              labs(title = "Inference NDVI: Herbs vs Woody Vegetation",
-                   x = "Year", y = "Total Normalized Fraction", color = "Type", fill = "Type") +
-              theme_minimal()
-            ggsave(file.path(OUT_DIR, "inference_ndvi_herbs_vs_woody.png"), p_inf_ndvi_herbs_woody, width = 8, height = 6)
-
-            # --- Species-level plots (no "Woody" aggregation) for NDVI ---
-            species_ndvi <- ndvi_inf_full[tolower(trimws(ndvi_inf_full$Veg)) %in% c("herbs","populus","tamarix","woody_unknown"), ]
-            if (nrow(species_ndvi) > 0) {
-              species_ndvi$Veg <- dplyr::case_when(
-                tolower(species_ndvi$Veg) == "herbs" ~ "Herbs",
-                tolower(species_ndvi$Veg) == "populus" ~ "Populus",
-                tolower(species_ndvi$Veg) == "tamarix" ~ "Tamarix",
-                tolower(species_ndvi$Veg) == "woody_unknown" ~ "Woody Unknown",
-                TRUE ~ species_ndvi$Veg
-              )
-
-              p_inf_ndvi_species_ts <- ggplot(species_ndvi, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
-                add_excluded_years_shade(is_date = FALSE) + add_year_lines(is_date = FALSE) +
-                geom_line(linewidth = 1) +
-                geom_point(show.legend = FALSE) +
-                geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.12, color = NA) +
-                scale_color_manual(values = c("Herbs" = "#2E8B57", "Populus" = "#228B22", "Tamarix" = "#CD853F", "Woody Unknown" = "#808080")) +
-                scale_fill_manual(values = c("Herbs" = "#2E8B57", "Populus" = "#228B22", "Tamarix" = "#CD853F", "Woody Unknown" = "#808080")) +
-                labs(title = "Inference NDVI: Species (no Woody aggregation)", x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
-                theme_minimal()
-              ggsave(file.path(OUT_DIR, "inference_ndvi_species_separate.png"), p_inf_ndvi_species_ts, width = 8, height = 6)
-              cat(sprintf("Saved inference NDVI species (no woody aggregation) plot to: %s\n", file.path(OUT_DIR, "inference_ndvi_species_separate.png")))
-
-              df_wide_sp_ndvi <- tryCatch({ tidyr::pivot_wider(species_ndvi |> dplyr::select(year, Veg, global_coef), names_from = Veg, values_from = global_coef) }, error = function(e) NULL)
-              if (!is.null(df_wide_sp_ndvi)) {
-                sp_cols_ndvi <- intersect(c("Herbs","Populus","Tamarix","Woody Unknown"), names(df_wide_sp_ndvi))
-                if (length(sp_cols_ndvi) >= 2) {
-                  for (col in sp_cols_ndvi) {
-                    df_wide_sp_ndvi[[col]] <- as.numeric(df_wide_sp_ndvi[[col]])
-                    df_wide_sp_ndvi[[col]][is.na(df_wide_sp_ndvi[[col]])] <- 0
-                  }
-                  df_wide_sp_ndvi$total <- rowSums(df_wide_sp_ndvi[, sp_cols_ndvi, drop = FALSE], na.rm = TRUE)
-                  df_prop_sp_ndvi <- df_wide_sp_ndvi |> dplyr::filter(is.finite(total) & total > 0) |> dplyr::mutate(across(all_of(sp_cols_ndvi), ~ . / total)) |> tidyr::pivot_longer(cols = all_of(sp_cols_ndvi), names_to = "Veg", values_to = "prop")
-
-                  p_inf_ndvi_species_stacked <- ggplot(df_prop_sp_ndvi, aes(x = year, y = prop, fill = Veg)) +
-                    geom_area() +
-                    scale_fill_manual(values = c("Herbs" = "#2E8B57", "Populus" = "#228B22", "Tamarix" = "#CD853F", "Woody Unknown" = "#808080")) +
-                    labs(title = "Inference NDVI: Species (Proportion, stacked)", x = "Year", y = "Proportion", fill = "Veg") +
-                    theme_minimal()
-                  ggsave(file.path(OUT_DIR, "inference_ndvi_species_stacked.png"), p_inf_ndvi_species_stacked, width = 8, height = 6)
-                  cat(sprintf("Saved inference NDVI species stacked plot to: %s\n", file.path(OUT_DIR, "inference_ndvi_species_stacked.png")))
-                }
-              }
-            }
-            cat(sprintf("Saved inference NDVI herbs vs woody plot to: %s\n", file.path(OUT_DIR, "inference_ndvi_herbs_vs_woody.png")))
-
-
-            # --- Stacked area (Proportion) and Woody/Herbs ratio (Inference NDVI) ---
-            df_wide <- tryCatch({
-              tidyr::pivot_wider(herbs_woody_ndvi_inf |> dplyr::select(year, Veg, global_coef), names_from = Veg, values_from = global_coef)
-            }, error = function(e) NULL)
-            if (!is.null(df_wide) && all(c("Herbs","Woody") %in% names(df_wide))) {
-              df_wide$Herbs <- as.numeric(df_wide$Herbs)
-              df_wide$Woody <- as.numeric(df_wide$Woody)
-              df_wide$total <- rowSums(df_wide[, c("Herbs","Woody")], na.rm = TRUE)
-
-              df_prop <- df_wide |> dplyr::filter(is.finite(total) & total > 0) |> dplyr::mutate(Herbs = Herbs/total, Woody = Woody/total) |> tidyr::pivot_longer(cols = c("Herbs","Woody"), names_to = "Veg", values_to = "prop")
-              p_inf_ndvi_stacked <- ggplot(df_prop, aes(x = year, y = prop, fill = Veg)) +
-                geom_area() +
-                scale_fill_manual(values = c("Herbs" = "#2E8B57", "Woody" = "#8B4513")) +
-                labs(title = "Inference NDVI: Herbs vs Woody (Proportion, stacked)", x = "Year", y = "Proportion", fill = "Type") +
-                theme_minimal()
-              ggsave(file.path(OUT_DIR, "inference_ndvi_herbs_vs_woody_stacked.png"), p_inf_ndvi_stacked, width = 8, height = 6)
-              cat(sprintf("Saved inference NDVI herbs vs woody stacked plot to: %s\n", file.path(OUT_DIR, "inference_ndvi_herbs_vs_woody_stacked.png")))
-
-              df_ratio <- df_wide |> dplyr::mutate(ratio = ifelse(is.finite(Herbs) & Herbs > 0, Woody / Herbs, NA_real_))
-              p_inf_ndvi_ratio <- ggplot(df_ratio, aes(x = year, y = ratio)) +
-                geom_line(color = "#8B4513", linewidth = 1) +
-                geom_point() +
-                labs(title = "Inference NDVI: Woody / Herbs Ratio", x = "Year", y = "Woody / Herbs") +
-                theme_minimal()
-              ggsave(file.path(OUT_DIR, "inference_ndvi_woody_over_herbs.png"), p_inf_ndvi_ratio, width = 8, height = 6)
-              cat(sprintf("Saved inference NDVI woody/herbs ratio plot to: %s\n", file.path(OUT_DIR, "inference_ndvi_woody_over_herbs.png")))
-            } else {
-              cat("Cannot create inference NDVI stacked/ratio plot: missing Herbs/Woody rows.\n")
-            }
-          } else {
-            cat("No herbs/woody data available for inference NDVI herbs vs woody plot.\n")
-          }
-        } else {
-          cat("[INFERENCE] No barren rows found in NDVI inference aggregation results.\n")
-        }
+        plot_inference_method_results(ndvi_inf_full, "NDVI", "ndvi",
+                                      use_excluded_years_shade = TRUE,
+                                      include_species_plots = TRUE)
       } else {
         cat("[INFERENCE] NDVI inference aggregation returned no results.\n")
       }
@@ -8999,94 +7578,63 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
       cat("[INFERENCE] Running no-index normalization aggregation (inference mode)\n")
       noindex_inf_full <- tryCatch({ location_bootstrap_noindex(inference_coefs, df_tasks_inference_proc, B = BOOTSTRAP_B, seed = get_mesma_seed(123)) }, error = function(e) { cat(sprintf("[NOINDEX INFERENCE] failed: %s\n", e$message)); NULL })
       if (!is.null(noindex_inf_full) && nrow(noindex_inf_full) > 0) {
-        noindex_inf_veg <- noindex_inf_full[!tolower(trimws(noindex_inf_full$Veg)) %in% c("barren"), ]
-        noindex_inf_barren <- noindex_inf_full[tolower(trimws(noindex_inf_full$Veg)) %in% c("barren"), ]
-
-        if (!is.null(noindex_inf_veg) && nrow(noindex_inf_veg) > 0) {
-          p_inf_noindex_ts <- ggplot(noindex_inf_veg, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
-            add_year_lines(is_date = FALSE) +
-            geom_line(linewidth = 1) +
-            geom_point(show.legend = FALSE) +
-            geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
-            labs(title = "No-Index Normalized Vegetation Fractions",
-                 x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
-            theme_minimal()
-          ggsave(file.path(OUT_DIR, "inference_noindex_normalized_timeseries.png"), p_inf_noindex_ts, width = 8, height = 6)
-          cat(sprintf("Saved inference no-index normalized time series plot to: %s\n", file.path(OUT_DIR, "inference_noindex_normalized_timeseries.png")))
-
-        }
-
-        if (!is.null(noindex_inf_barren) && nrow(noindex_inf_barren) > 0) {
-          p_inf_noindex_barren <- ggplot(noindex_inf_barren, aes(x = year, y = global_coef)) +
-            add_year_lines(is_date = FALSE) +
-            geom_line(color = "saddlebrown", linewidth = 1) +
-            geom_point(color = "saddlebrown") +
-            geom_ribbon(aes(ymin = coef_025, ymax = coef_975), alpha = 0.15, fill = "saddlebrown", color = NA) +
-            labs(title = "No-Index Based Barren Fraction", x = "Year", y = "Barren Fraction") +
-            scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
-            theme_minimal()
-          ggsave(file.path(OUT_DIR, "inference_noindex_barren_cover.png"), p_inf_noindex_barren, width = 8, height = 6)
-          cat(sprintf("Saved inference no-index based barren cover plot to: %s\n", file.path(OUT_DIR, "inference_noindex_barren_cover.png")))
-
-
-          # Herbs vs Woody (inference NoIndex)
-          herbs_woody_noindex_inf <- noindex_inf_full[tolower(trimws(noindex_inf_full$Veg)) %in% c("herbs", "woody"), ]
-          if (nrow(herbs_woody_noindex_inf) > 0) {
-            herbs_woody_noindex_inf$Veg <- ifelse(tolower(herbs_woody_noindex_inf$Veg) == "herbs", "Herbs", "Woody")
-            p_inf_noindex_herbs_woody <- ggplot(herbs_woody_noindex_inf, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
-              add_year_lines(is_date = FALSE) +
-              geom_line(linewidth = 1) +
-              geom_point(show.legend = FALSE) +
-              geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
-              scale_color_manual(values = c("Herbs" = "#2E8B57", "Woody" = "#8B4513")) +
-              scale_fill_manual(values = c("Herbs" = "#2E8B57", "Woody" = "#8B4513")) +
-              labs(title = "Inference No-Index: Herbs vs Woody Vegetation",
-                   x = "Year", y = "Total Normalized Fraction", color = "Type", fill = "Type") +
-              theme_minimal()
-            ggsave(file.path(OUT_DIR, "inference_noindex_herbs_vs_woody.png"), p_inf_noindex_herbs_woody, width = 8, height = 6)
-            cat(sprintf("Saved inference NoIndex herbs vs woody plot to: %s\n", file.path(OUT_DIR, "inference_noindex_herbs_vs_woody.png")))
-
-
-            # --- Stacked area (Proportion) and Woody/Herbs ratio (Inference NoIndex) ---
-            df_wide <- tryCatch({
-              tidyr::pivot_wider(herbs_woody_noindex_inf |> dplyr::select(year, Veg, global_coef), names_from = Veg, values_from = global_coef)
-            }, error = function(e) NULL)
-            if (!is.null(df_wide) && all(c("Herbs","Woody") %in% names(df_wide))) {
-              df_wide$Herbs <- as.numeric(df_wide$Herbs)
-              df_wide$Woody <- as.numeric(df_wide$Woody)
-              df_wide$total <- rowSums(df_wide[, c("Herbs","Woody")], na.rm = TRUE)
-
-              df_prop <- df_wide |> dplyr::filter(is.finite(total) & total > 0) |> dplyr::mutate(Herbs = Herbs/total, Woody = Woody/total) |> tidyr::pivot_longer(cols = c("Herbs","Woody"), names_to = "Veg", values_to = "prop")
-              p_inf_noindex_stacked <- ggplot(df_prop, aes(x = year, y = prop, fill = Veg)) +
-                geom_area() +
-                scale_fill_manual(values = c("Herbs" = "#2E8B57", "Woody" = "#8B4513")) +
-                labs(title = "Inference NoIndex: Herbs vs Woody (Proportion, stacked)", x = "Year", y = "Proportion", fill = "Type") +
-                theme_minimal()
-              ggsave(file.path(OUT_DIR, "inference_noindex_herbs_vs_woody_stacked.png"), p_inf_noindex_stacked, width = 8, height = 6)
-              cat(sprintf("Saved inference NoIndex herbs vs woody stacked plot to: %s\n", file.path(OUT_DIR, "inference_noindex_herbs_vs_woody_stacked.png")))
-
-              df_ratio <- df_wide |> dplyr::mutate(ratio = ifelse(is.finite(Herbs) & Herbs > 0, Woody / Herbs, NA_real_))
-              p_inf_noindex_ratio <- ggplot(df_ratio, aes(x = year, y = ratio)) +
-                geom_line(color = "#8B4513", linewidth = 1) +
-                geom_point() +
-                labs(title = "Inference NoIndex: Woody / Herbs Ratio", x = "Year", y = "Woody / Herbs") +
-                theme_minimal()
-              ggsave(file.path(OUT_DIR, "inference_noindex_woody_over_herbs.png"), p_inf_noindex_ratio, width = 8, height = 6)
-              cat(sprintf("Saved inference NoIndex woody/herbs ratio plot to: %s\n", file.path(OUT_DIR, "inference_noindex_woody_over_herbs.png")))
-            } else {
-              cat("Cannot create inference NoIndex stacked/ratio plot: missing Herbs/Woody rows.\n")
-            }
-          } else {
-            cat("No herbs/woody data available for inference NoIndex herbs vs woody plot.\n")
-          }
-        } else {
-          cat("[INFERENCE] No barren rows found in no-index inference aggregation results.\n")
-        }
+        plot_inference_method_results(noindex_inf_full, "No-Index", "noindex",
+                                      use_excluded_years_shade = FALSE,
+                                      include_species_plots = FALSE)
       } else {
         cat("[INFERENCE] No-index inference aggregation returned no results.\n")
       }
     } else {
       cat("[INFERENCE] No inference coefficients available; skipping no-index aggregation.\n")
+    }
+
+    # --- INFERENCE: Dirichlet-perturbed aggregate bootstrap ---
+    if (!is.null(inference_coefs) && nrow(inference_coefs) > 0) {
+      cat("[INFERENCE] Running Dirichlet-perturbed aggregate bootstrap\n")
+      aggregate_inf_full <- tryCatch({
+        location_bootstrap_aggregate(inference_coefs, B = BOOTSTRAP_B, seed = get_mesma_seed(123))
+      }, error = function(e) { cat(sprintf("[AGGREGATE BOOTSTRAP] failed: %s\n", e$message)); NULL })
+
+      if (!is.null(aggregate_inf_full) && nrow(aggregate_inf_full) > 0) {
+        agg_veg_norm <- normalize_veg_name(aggregate_inf_full$Veg)
+        agg_inf_veg <- aggregate_inf_full[!agg_veg_norm %in% c("barren"), ]
+        agg_inf_barren <- aggregate_inf_full[agg_veg_norm %in% c("barren"), ]
+
+        if (!is.null(agg_inf_veg) && nrow(agg_inf_veg) > 0) {
+          p_inf_agg_ts <- ggplot(agg_inf_veg, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
+            add_year_lines(is_date = FALSE) +
+            geom_line(linewidth = 1) +
+            geom_point(show.legend = FALSE) +
+            geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
+            labs(title = "Dirichlet-Perturbed Aggregate Vegetation Fractions",
+                 x = "Year", y = "Mean Fraction", color = "Veg", fill = "Veg") +
+            theme_minimal()
+          ggsave(file.path(OUT_DIR, "inference_aggregate_dirichlet_timeseries.png"), p_inf_agg_ts, width = 8, height = 6)
+          readr::write_csv(agg_inf_veg, file.path(OUT_DIR, "inference_aggregate_dirichlet_timeseries.csv"))
+          cat(sprintf("Saved Dirichlet-perturbed aggregate time series plot to: %s\n", file.path(OUT_DIR, "inference_aggregate_dirichlet_timeseries.png")))
+
+          # Herbs vs Woody
+          herbs_woody_agg <- aggregate_inf_full[agg_veg_norm %in% c("herbs", "woody"), ]
+          if (nrow(herbs_woody_agg) > 0) {
+            herbs_woody_agg$Veg <- ifelse(tolower(herbs_woody_agg$Veg) == "herbs", "Herbs", "Woody")
+            p_inf_agg_hw <- ggplot(herbs_woody_agg, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
+              add_year_lines(is_date = FALSE) +
+              geom_line(linewidth = 1) +
+              geom_point(show.legend = FALSE) +
+              geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
+              scale_color_manual(values = HERBS_WOODY_COLORS) +
+              scale_fill_manual(values = HERBS_WOODY_COLORS) +
+              labs(title = "Dirichlet-Perturbed: Herbs vs Woody",
+                   x = "Year", y = "Mean Fraction", color = "Type", fill = "Type") +
+              theme_minimal()
+            ggsave(file.path(OUT_DIR, "inference_aggregate_dirichlet_herbs_vs_woody.png"), p_inf_agg_hw, width = 8, height = 6)
+            readr::write_csv(herbs_woody_agg, file.path(OUT_DIR, "inference_aggregate_dirichlet_herbs_vs_woody.csv"))
+            cat(sprintf("Saved Dirichlet-perturbed herbs vs woody plot to: %s\n", file.path(OUT_DIR, "inference_aggregate_dirichlet_herbs_vs_woody.png")))
+          }
+        }
+      } else {
+        cat("[INFERENCE] Dirichlet-perturbed aggregate bootstrap returned no results.\n")
+      }
     }
 
   } else {
@@ -9123,40 +7671,6 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
     cat("[INFO] Training results CSV saving skipped (training outputs removed by config)\n")
   }
 
-  # --- Optional: Estimate uncertainty inflation parameters from data (Option A) ---
-  # Use inference data (loaded after df_tasks was initially assigned) if available
-  df_tasks_for_upe <- if (exists("df_tasks_inference") && !is.null(df_tasks_inference) && nrow(df_tasks_inference) > 0) {
-    df_tasks_inference
-  } else {
-    df_tasks
-  }
-  if (isTRUE(ESTIMATE_UNCERTAINTY_PARAMS_OPTION_A)) {
-    cat("[UNCERTAINTY PARAM EST] Running Option A subsampling calibration...\n")
-    est <- tryCatch({
-      estimate_uncertainty_params_optionA(
-        df_tasks = df_tasks_for_upe,
-        high_n = UNCERTAINTY_PARAM_EST_HIGH_N,
-        max_groups = UNCERTAINTY_PARAM_EST_MAX_GROUPS,
-        target_ns = UNCERTAINTY_PARAM_EST_TARGET_NS,
-        reps = UNCERTAINTY_PARAM_EST_REPS,
-        seed = UNCERTAINTY_PARAM_EST_SEED,
-        veg_levels = ALLOWED_VEG,
-        quiet = TRUE
-      )
-    }, error = function(e) {
-      cat(sprintf("[UNCERTAINTY PARAM EST] Failed: %s\n", e$message))
-      NULL
-    })
-    if (!is.null(est)) {
-      cat(sprintf("[UNCERTAINTY PARAM EST] Estimated N_POWER ~ %.3f\n", est$N_POWER_hat))
-      cat(sprintf("[UNCERTAINTY PARAM EST] Estimated N_REF ~ %d\n", est$N_REF_hat))
-      # Persist results for inspection
-      out_csv <- file.path(OUT_DIR, "uncertainty_param_estimate_optionA.csv")
-      try(write.csv(est$summary, out_csv, row.names = FALSE), silent = TRUE)
-      cat(sprintf("[UNCERTAINTY PARAM EST] Wrote summary to %s\n", out_csv))
-    }
-  }
-
   # Calculate total number of year results processed
   n_year_results <- 0
   if (!is.null(all_coefs) && nrow(all_coefs) > 0) {
@@ -9170,9 +7684,6 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
   }
 
   # Ensure required library/templates exist for visualization
-  ensure_library_and_templates()
-
-  # Ensure library + templates exist
   ensure_library_and_templates()
 
   # Helper to report validation accuracy (including artificial mixes) to avoid duplication
@@ -9215,7 +7726,7 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
     labels_df <- df_tasks_inference %>% dplyr::select(location_id, Veg) %>% dplyr::distinct()
     
     # Normalize labels
-    labels_df$Veg <- tolower(trimws(as.character(labels_df$Veg)))
+    labels_df$Veg <- normalize_veg_name(labels_df$Veg)
     labels_df <- labels_df %>% dplyr::rename(true_veg = Veg)
     
     # Filter validation coefficients to only those with labels
@@ -9640,30 +8151,13 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
       return(res)
     }
 
-    sink_file <- tempfile()
-    con_out <- tryCatch(file(sink_file, open = "wt"), error = function(e) NULL)
-    con_msg <- tryCatch(file(paste0(sink_file, ".msg"), open = "wt"), error = function(e) NULL)
-    # Suppress output and messages while running heavy inference
-    results <- NULL
-    tryCatch({
-      if (!is.null(con_out) && inherits(con_out, "connection") && isOpen(con_out)) {
-        sink(con_out, type = "output")
+    results <- tryCatch(
+      suppress_output_safely(.run_map(task_list, fit_task_wrapper, show_pb = FALSE)),
+      error = function(e) {
+        warning(sprintf("run_inference_silent: underlying inference error: %s", e$message))
+        NULL
       }
-      if (!is.null(con_msg) && inherits(con_msg, "connection") && isOpen(con_msg)) {
-        sink(con_msg, type = "message")
-      }
-      results <- .run_map(task_list, fit_task_wrapper, show_pb = FALSE)
-    }, error = function(e) {
-      warning(sprintf("run_inference_silent: underlying inference error: %s", e$message))
-    }, finally = {
-      # Attempt to restore sinks
-      try(sink(type = "message"), silent = TRUE)
-      try(sink(type = "output"), silent = TRUE)
-      if (!is.null(con_out)) try(close(con_out), silent = TRUE)
-      if (!is.null(con_msg)) try(close(con_msg), silent = TRUE)
-      try(unlink(sink_file), silent = TRUE)
-      try(unlink(paste0(sink_file, ".msg")), silent = TRUE)
-    })
+    )
 
     all_coefs_local <- combine_results_from_list(results)
     list(results = results, all_coefs = all_coefs_local)
@@ -9709,7 +8203,7 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
       cat("[SKIP] No Veg column in df_validation\n")
       return(NULL)
     }
-    df_val_with_veg$Veg <- tolower(trimws(as.character(df_val_with_veg$Veg)))
+    df_val_with_veg$Veg <- normalize_veg_name(df_val_with_veg$Veg)
     veg_classes <- unique(df_val_with_veg$Veg[df_val_with_veg$Veg != "barren"])
 
     if (length(veg_classes) < 2) {
@@ -9983,6 +8477,22 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
     NULL
   })
 
+  if (!is.null(artificial_mix_coefs) && nrow(artificial_mix_coefs) > 0) {
+    # Overall accuracy summary across all pairs
+    mix_veg_classes <- unique(artificial_mix_coefs$class_a)
+    mix_veg_classes <- union(mix_veg_classes, unique(artificial_mix_coefs$class_b))
+    overall_errors <- c()
+    for (loc_id in unique(artificial_mix_coefs$location_id)) {
+      loc_coefs <- artificial_mix_coefs[artificial_mix_coefs$location_id == loc_id, ]
+      ca <- loc_coefs$class_a[1]; cb <- loc_coefs$class_b[1]
+      frac_a <- sum(loc_coefs$coef[tolower(loc_coefs$Veg) == tolower(ca)], na.rm = TRUE)
+      frac_b <- sum(loc_coefs$coef[tolower(loc_coefs$Veg) == tolower(cb)], na.rm = TRUE)
+      overall_errors <- c(overall_errors, abs(frac_a - 0.5), abs(frac_b - 0.5))
+    }
+    cat(sprintf("\n  Overall artificial unmixing MAE: %.3f (across %d mix samples)\n",
+                mean(overall_errors, na.rm = TRUE), length(unique(artificial_mix_coefs$location_id))))
+  }
+
   cat("=== END ARTIFICIAL MIX VALIDATION ===\n\n")
 
   # Results are now in validation_coefs and inference_coefs (combined as all_coefs)
@@ -10004,7 +8514,7 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
       for (v_class in names(rmse_vec)) {
         rmse_val <- rmse_vec[[v_class]]
         # Find rows for this class (case-insensitive)
-        idx <- which(tolower(trimws(df$Veg)) == tolower(v_class))
+        idx <- which(normalize_veg_name(df$Veg) == tolower(v_class))
         
         if (length(idx) > 0) {
            # Extract current intervals
@@ -10082,13 +8592,7 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
       # ERROR if ALL samples are 100% barren
       if (barren_one_pct >= 99.9) {
         stop(sprintf(
-          "[FATAL ERROR] All samples are 100%% barren (%.1f%%, %d/%d predictions)!\n\n" ,
-          "This indicates a critical unmixing failure. Possible causes:\n",
-          "1. PPI calibration issue: FVC models may not be properly calibrated\n",
-          "2. Library mismatch: Endmember library may not match the inference data characteristics\n",
-          "3. Barren shortcut threshold too aggressive: Try lowering BARREN_SHORTCUT_THRESHOLD\n",
-          "4. Data preprocessing issue: Check that spectral indices are calculated correctly\n",
-          "\nPlease review the debug log and check PPI values and library quality.\n"
+          "[FATAL ERROR] All samples are 100%% barren (%.1f%%, %d/%d predictions)!\n\n" 
         ), barren_one_pct, barren_one_count, nrow(all_coefs))
       }
 
@@ -10100,14 +8604,6 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
   # Verify we have results to process
   if (is.null(all_coefs) || nrow(all_coefs) == 0) {
     cat("ERROR: No results to process!\n")
-    cat("Most likely causes:\n")
-    cat("1. Insufficient data quality: Tasks were filtered due to:\n")
-    cat("   - Too few observations per location-year (<15 observations)\n")
-    cat("   - Insufficient temporal coverage (<25 unique days of year)\n")
-    cat("   - Too many missing pentad bins (>85% NA values)\n")
-    cat("2. Data filtering issues or missing indices\n")
-    cat("3. No valid validation/inference data available (no location-year pairs found)\n")
-    cat("\nTo adjust data quality thresholds, modify MIN_OBS, MIN_UNIQUE_DOYS, and MIN_PENTAD_COVERAGE in fit_one_task function.\n")
     stop("No valid results to process")
   }
 
@@ -10133,123 +8629,8 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
   if ("interval" %in% names(all_coefs)) all_coefs$interval <- as.numeric(all_coefs$interval)
   all_coefs$location_id <- trimws(all_coefs$location_id)
 
-  # Note: variant_trajectory and diagnostics are not currently tracked in the new processing flow
-  all_variants_pca <- NULL
-  all_diagnostics <- NULL
-
-  q_dvi_data <- NULL
-
-  # Variant similarity (this runs normally - not inside the if(FALSE) block)
-  variant_similarity_table <- NULL
-  variant_similarity_summary <- NULL
-  if (exists("VARIANT_SIMILARITY_TABLE")) {
-    variant_similarity_table <- VARIANT_SIMILARITY_TABLE
-  } else if (exists("INSEPARABLE_VARIANT_INFO") && !is.null(INSEPARABLE_VARIANT_INFO$similarity_table)) {
-    variant_similarity_table <- INSEPARABLE_VARIANT_INFO$similarity_table
-  }
-  if (!is.null(variant_similarity_table) && nrow(variant_similarity_table) > 0) {
-    variant_similarity_table <- variant_similarity_table[order(variant_similarity_table$veg, variant_similarity_table$euclidean_dist), , drop = FALSE]
-    if (requireNamespace("dplyr", quietly = TRUE)) {
-      variant_similarity_summary <- variant_similarity_table |> 
-        dplyr::group_by(.data$veg) |> 
-        dplyr::summarise(
-          pair_count = dplyr::n(),
-          min_euclidean_dist = if (all(is.na(.data$euclidean_dist))) NA_real_ else min(.data$euclidean_dist, na.rm = TRUE),
-          median_euclidean_dist = if (all(is.na(.data$euclidean_dist))) NA_real_ else stats::median(.data$euclidean_dist, na.rm = TRUE),
-          .groups = "drop"
-        )
-    } else {
-      by_veg <- split(variant_similarity_table, variant_similarity_table$veg)
-      summary_rows <- lapply(names(by_veg), function(veg_name) {
-        tbl <- by_veg[[veg_name]]
-        data.frame(
-          veg = veg_name,
-          pair_count = nrow(tbl),
-          min_euclidean_dist = if (all(is.na(tbl$euclidean_dist))) NA_real_ else min(tbl$euclidean_dist, na.rm = TRUE),
-          median_euclidean_dist = if (all(is.na(tbl$euclidean_dist))) NA_real_ else stats::median(tbl$euclidean_dist, na.rm = TRUE),
-          stringsAsFactors = FALSE
-        )
-      })
-      variant_similarity_summary <- do.call(rbind, summary_rows)
-    }
-  }
-
-    unique_locations <- unique(trimws(as.character(all_coefs$location_id)))
-    unique_locations <- unique_locations[!is.na(unique_locations) & unique_locations != ""]
-    if (length(unique_locations) == 0) {
-      stop("No valid location IDs found in results")
-    }
-
-    true_veg_map <- gpts_map |> dplyr::select(location_id, true_veg = Veg)
-    if (!is.character(all_coefs$location_id)) {
-      all_coefs$location_id <- as.character(all_coefs$location_id)
-    }
-    if (!is.character(true_veg_map$location_id)) {
-      true_veg_map$location_id <- as.character(true_veg_map$location_id)
-    }
-    if (length(all_coefs$location_id) > 0 && length(true_veg_map$location_id) > 0) {
-      s1 <- unique(na.omit(all_coefs$location_id))
-      s2 <- unique(na.omit(true_veg_map$location_id))
-      if (length(s1) && length(s2) && all(grepl("^[0-9]+$", s1)) && any(grepl("^L_", s2))) {
-        cat("[WARNING] all_coefs$location_id looks numeric while true_veg_map$location_id looks like 'L_x_y' strings — matching will likely fail.\n")
-      }
-    }
-    all_coefs <- dplyr::left_join(all_coefs, true_veg_map, by = "location_id")
-    if (!"coef_025" %in% names(all_coefs)) all_coefs$coef_025 <- NA_real_
-    if (!"coef_975" %in% names(all_coefs)) all_coefs$coef_975 <- NA_real_
-    if (DEBUG_UNCERTAINTY) {
-      cat("After combining all_coefs with true_veg_map:\n")
-      cat("Number of rows with finite coef_025:", sum(is.finite(all_coefs$coef_025)), "\n")
-      cat("Number of rows with finite coef_975:", sum(is.finite(all_coefs$coef_975)), "\n")
-      cat("Number of rows with finite interval:", sum(is.finite(all_coefs$interval)), "\n")
-    }
-
-    inseparable_flags_detail <- NULL
-    inseparable_flags_summary <- NULL
-    if ("inseparable_variant_flag" %in% names(all_coefs)) {
-      flagged_rows <- which(!is.na(all_coefs$inseparable_variant_flag) & all_coefs$inseparable_variant_flag)
-      if (length(flagged_rows) > 0) {
-        cols_keep <- intersect(c("location_id", "year", "Veg", "coef", "rmse", "true_veg", "inseparable_variant_details"), names(all_coefs))
-        inseparable_flags_detail <- all_coefs[flagged_rows, cols_keep, drop = FALSE]
-        inseparable_flags_detail <- inseparable_flags_detail[order(inseparable_flags_detail$location_id, inseparable_flags_detail$year, inseparable_flags_detail$Veg), , drop = FALSE]
-
-        if (requireNamespace("dplyr", quietly = TRUE)) {
-          inseparable_flags_summary <- inseparable_flags_detail |> 
-            dplyr::group_by(.data$location_id, .data$year) |> 
-            dplyr::summarise(
-              veg_components = paste(sort(unique(.data$Veg)), collapse = ", "),
-              max_coef = if (all(is.na(.data$coef))) NA_real_ else max(.data$coef, na.rm = TRUE),
-              details = paste(unique(na.omit(.data$inseparable_variant_details)), collapse = " | "),
-              .groups = "drop"
-            ) |> 
-            dplyr::arrange(.data$location_id, .data$year)
-        } else {
-          summary_keys <- unique(inseparable_flags_detail[, c("location_id", "year"), drop = FALSE])
-          summary_keys <- summary_keys[order(summary_keys$location_id, summary_keys$pheno_year), , drop = FALSE]
-          build_summary <- function(loc, yr) {
-            rows <- inseparable_flags_detail$location_id == loc & inseparable_flags_detail$pheno_year == yr
-            vegs <- sort(unique(inseparable_flags_detail$Veg[rows]))
-            coef_vals <- inseparable_flags_detail$coef[rows]
-            details <- unique(na.omit(inseparable_flags_detail$inseparable_variant_details[rows]))
-            data.frame(
-              location_id = loc,
-              pheno_year = yr,
-              veg_components = paste(vegs, collapse = ", "),
-              max_coef = if (all(is.na(coef_vals))) NA_real_ else max(coef_vals, na.rm = TRUE),
-              details = paste(details, collapse = " | "),
-              stringsAsFactors = FALSE
-            )
-          }
-          if (nrow(summary_keys) > 0) {
-            summary_list <- apply(summary_keys, 1, function(row) build_summary(row[["location_id"]], as.integer(row[["year"]])))
-            inseparable_flags_summary <- do.call(rbind, summary_list)
-          }
-        }
-      }
-    }
-
     # Collect uncertainty data for merging (training + inference)
-    unc_coef_rows <- list(); unc_var_rows <- list(); unc_rmse_rows <- list(); unc_meta_rows <- list()
+    unc_coef_rows <- list()
 
     results_for_uncertainty <- list()
     if (exists("training_results_list") && is.list(training_results_list)) {
@@ -10274,16 +8655,6 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
         ci$location_id <- loc; ci$year <- yr
         unc_coef_rows[[length(unc_coef_rows) + 1]] <- ci[, c("location_id","year","Veg","coef_025","coef_975", "coef_sd", "interval"), drop = FALSE]
       }
-      vr <- res$uncertainty$variant_freq
-      if (!is.null(vr) && nrow(vr) > 0) {
-        vr$location_id <- loc; vr$year <- yr
-        unc_var_rows[[length(unc_var_rows) + 1]] <- vr[, c("location_id","year","Veg","Variant","N","Percent"), drop = FALSE]
-      }
-      rc <- res$uncertainty$rmse_ci
-      if (!is.null(rc) && length(rc) == 2) {
-        unc_rmse_rows[[length(unc_rmse_rows) + 1]] <- data.frame(location_id = loc, year = yr, rmse_lo = rc[1], rmse_hi = rc[2], stringsAsFactors = FALSE)
-      }
-
     }
     if (length(unc_coef_rows) > 0) {
       if (requireNamespace("dplyr", quietly = TRUE)) all_unc_coef <- dplyr::bind_rows(unc_coef_rows) else all_unc_coef <- do.call(rbind, unc_coef_rows)
@@ -10320,95 +8691,6 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
         warning("dplyr not available - bootstrap CIs will not be merged into main results")
       }
     }
-    if (length(unc_var_rows) > 0) {
-      if (requireNamespace("dplyr", quietly = TRUE)) all_unc_var <- dplyr::bind_rows(unc_var_rows) else all_unc_var <- do.call(rbind, unc_var_rows)
-    } else all_unc_var <- NULL
-    if (length(unc_rmse_rows) > 0) {
-      if (requireNamespace("dplyr", quietly = TRUE)) all_unc_rmse <- dplyr::bind_rows(unc_rmse_rows) else all_unc_rmse <- do.call(rbind, unc_rmse_rows)
-    } else all_unc_rmse <- NULL
-    if (length(unc_meta_rows) > 0) {
-      if (requireNamespace("dplyr", quietly = TRUE)) all_unc_meta <- dplyr::bind_rows(unc_meta_rows) else all_unc_meta <- do.call(rbind, unc_meta_rows)
-    } else all_unc_meta <- NULL
-
-    best_fit_summary <- do.call(rbind, lapply(unique_locations, function(loc) {
-      yrs <- unique(all_coefs$pheno_year[all_coefs$location_id == loc])
-      tv <- true_veg_map$true_veg[true_veg_map$location_id == loc]
-      tv_val <- if (length(tv) > 0) tv[1] else NA_character_
-      tv_lower <- tolower(tv_val)
-
-      do.call(rbind, lapply(yrs, function(yr) {
-        row <- all_coefs[all_coefs$location_id == loc & all_coefs$pheno_year == yr & tolower(all_coefs$Veg) == tv_lower, , drop = FALSE]
-        pred <- NA_real_
-        if (nrow(row) == 1) {
-          if ("coef_median" %in% names(row) && is.finite(row$coef_median)) pred <- row$coef_median else pred <- row$coef
-        }
-        pred_abs <- pred
-        rmse_val <- if (nrow(row) == 1 && "rmse" %in% names(row)) row$rmse else NA_real_
-        # Prefer median bootstrap-based veg totals when available
-        if ("coef_median" %in% names(all_coefs)) {
-          sum_veg_coef <- sum(all_coefs$coef_median[all_coefs$location_id == loc & all_coefs$pheno_year == yr & tolower(all_coefs$Veg) != "barren"], na.rm = TRUE)
-        } else {
-          sum_veg_coef <- sum(all_coefs$coef[all_coefs$location_id == loc & all_coefs$pheno_year == yr & tolower(all_coefs$Veg) != "barren"], na.rm = TRUE)
-        }
-        pred_rel <- if (!is.na(pred) && is.finite(sum_veg_coef) && sum_veg_coef > 0) pred / sum_veg_coef else NA_real_
-        pred_rel <- pmin(pred_rel, 1)  # Clamp to 1 to prevent >100%
-        abs_pct <- if (!is.na(pred_abs) && !is.na(tv_val)) abs(1 - pred_abs) * 100 else NA_real_
-        abs_pct_rel <- if (!is.na(pred_rel) && !is.na(tv_val)) abs(1 - pred_rel) * 100 else NA_real_
-
-        is_barren_truth <- isTRUE(tv_lower == "barren")
-        pred_total_veg_cover <- sum_veg_coef
-
-        if (is_barren_truth) {
-          pred <- NA_real_; pred_abs <- NA_real_; pred_rel <- NA_real_; abs_pct <- NA_real_; abs_pct_rel <- NA_real_
-        }
-
-        data.frame(
-          location_id = loc,
-          year = yr,
-          true_veg = tv_val,
-          pred_coef = pred_rel,
-          pred_coef_abs = pred_abs,
-          pred_coef_rel = pred_rel,
-          rmse = rmse_val,
-          abs_pct_diff = abs_pct_rel,
-          abs_pct_diff_abs = abs_pct,
-          abs_pct_diff_rel = abs_pct_rel,
-          is_barren_truth = is_barren_truth,
-          pred_total_veg_cover = pred_total_veg_cover,
-          true_veg_cover_ppi = NA_real_,
-          veg_cover_error_ppi = NA_real_,
-          stringsAsFactors = FALSE
-        )
-      }))
-    }))
-
-    # Attach PPI-derived vegetation cover truth when available
-    ppi_truth_summary <- NULL
-    if (exists("all_diagnostics") && !is.null(all_diagnostics) &&
-        all(c("location_id", "pheno_year") %in% names(all_diagnostics)) &&
-        "barren_fraction_ppi_based" %in% names(all_diagnostics)) {
-      ppi_truth_summary <- all_diagnostics %>%
-        dplyr::select(location_id, pheno_year, barren_fraction_ppi_based) %>%
-        dplyr::mutate(
-          barren_fraction_ppi_based_join = pmin(pmax(barren_fraction_ppi_based, 0), 1),
-          true_veg_cover_ppi_join = 1 - barren_fraction_ppi_based_join
-        ) %>%
-        dplyr::rename(year = pheno_year) %>%
-        dplyr::distinct()
-    }
-
-    if (!is.null(ppi_truth_summary)) {
-      best_fit_summary <- best_fit_summary %>%
-        dplyr::left_join(ppi_truth_summary, by = c("location_id", "year")) %>%
-        dplyr::mutate(
-          true_veg_cover_ppi = dplyr::coalesce(true_veg_cover_ppi, true_veg_cover_ppi_join),
-          veg_cover_error_ppi = ifelse(is.finite(pred_total_veg_cover) & is.finite(true_veg_cover_ppi),
-                                       pred_total_veg_cover - true_veg_cover_ppi,
-                                       veg_cover_error_ppi)
-        ) %>%
-        dplyr::select(-dplyr::any_of(c("true_veg_cover_ppi_join", "barren_fraction_ppi_based_join", "barren_fraction_ppi_based")))
-    }
-
   timing_info$end_time <- Sys.time()
   total_time <- as.numeric(difftime(timing_info$end_time, timing_info$start_time, units = "secs"))
 
@@ -10431,65 +8713,3 @@ aggregate_to_global_pattern <- function(all_coefs, method = "location_bootstrap"
   ))
 
   cat("\nMESMA fitting completed successfully!\n")
-
-# --- Modular helpers to re-run or run pieces of the main processing separately ---
-process_batches <- function(BATCH_SIZE = 6, overwrite_wb = FALSE) { 
-  cat("[INFO] process_batches: building batch list\n"); flush.console()
-  target_locations <- unique(df_tasks$location_id)
-  n_locs_to_process <- length(target_locations)
-  loc_batches <- split(target_locations, ceiling(seq_along(target_locations) / BATCH_SIZE))
-  results_local <- list()
-
-  for (i in seq_along(loc_batches)) {
-    batch_locs <- loc_batches[[i]]
-    batch_df <- df_tasks[df_tasks$location_id %in% batch_locs, ]
-    batch_location_list <- split(batch_df, batch_df$location_id)
-    # Suppress any verbose output from per-location processing in helper
-    sink_file <- tempfile()
-    con_out <- tryCatch(file(sink_file, open = "wt"), error = function(e) NULL)
-    con_msg <- tryCatch(file(paste0(sink_file, ".msg"), open = "wt"), error = function(e) NULL)
-    tryCatch({
-      if (!is.null(con_out) && inherits(con_out, "connection") && isOpen(con_out)) {
-        sink(con_out, type = "output")
-      }
-      if (!is.null(con_msg) && inherits(con_msg, "connection") && isOpen(con_msg)) {
-        sink(con_msg, type = "message")
-      }
-      batch_results <- .run_map(batch_location_list, fit_one_location, show_pb = FALSE)
-    }, finally = {
-      try(sink(type = "message"), silent = TRUE)
-      try(sink(type = "output"), silent = TRUE)
-      if (!is.null(con_out)) try(close(con_out), silent = TRUE)
-      if (!is.null(con_msg)) try(close(con_msg), silent = TRUE)
-      try(unlink(sink_file), silent = TRUE); try(unlink(paste0(sink_file, ".msg")), silent = TRUE)
-    })
-
-    for (k in names(batch_results)) {
-      loc_result <- batch_results[[k]]
-      if (is.null(loc_result)) next
-
-      # Store year results with composite key 'loc_year'
-      for (yr in names(loc_result)) {
-        key <- paste(k, yr, sep = "_")
-        results_local[[key]] <- loc_result[[yr]]
-      }
-
-      # Build location data (temporary, memory-efficient)
-      loc_data <- do.call(rbind, lapply(loc_result, function(yr_res) yr_res$coef_df))
-    }
-
-  }
-
-  # Build all_coefs from results_local (memory-efficient)
-  cat("[INFO] Building all_coefs from results...\n")
-  all_coefs <- tryCatch({
-    do.call(rbind, lapply(results_local, function(r) {
-      if (!is.null(r$coef_df)) r$coef_df else NULL
-    }))
-  }, error = function(e) NULL)
-  list(all_coefs = all_coefs, results = results_local)
-}
-
-cat("\n=== Script execution finished ===\n")
-
-
