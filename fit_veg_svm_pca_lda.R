@@ -16,7 +16,17 @@ library(ggplot2) # plotting (prototype plots)
 # Respect MESMA_SEED for reproducibility (default 42)
 MESMA_SEED <- as.integer(Sys.getenv("MESMA_SEED", unset = "42"))
 if (!is.finite(MESMA_SEED)) MESMA_SEED <- 42L
-set.seed(MESMA_SEED)
+# Prefer central MESMA helpers and RNG when available for identical behaviour
+if (file.exists("mesma_helpers.R")) {
+  source("mesma_helpers.R")
+  set_mesma_seed(MESMA_SEED)
+} else {
+  set.seed(MESMA_SEED)
+}
+# Source canonical index/feature helpers when present (keeps behaviour identical)
+if (file.exists("mesma_indices.R")) source("mesma_indices.R")
+if (file.exists("mesma_features.R")) source("mesma_features.R")
+
 # --- CONFIG ---
 INPUT_CSV <- "C:/Users/yolan/Downloads/LS_S2_Harmonized_Timeseries_training.csv"
 INFERENCE_CSV <- "C:/Users/yolan/OneDrive/Documenten/UGENT/Master/masterproef/GIS/landsat_lower_inference.csv"
@@ -242,20 +252,35 @@ build_matrix_from_df <- function(df_in, indices, params, weights) {
     sub <- df_in[df_in$location_id == lid & df_in$pheno_year == pyr, ]
     mat <- build_pentad_matrix(sub, indices)
     if (is.null(mat)) next
+
+    # Representation: mirror MESMA exactly
     vec <- as.numeric(mat)
+
+    # 1) L2-normalize the whole-observation vector if MESMA uses L2 representation
+    if (exists("ENABLE_LDA_L2_NORMALIZATION") && isTRUE(ENABLE_LDA_L2_NORMALIZATION)) {
+      vtmp <- vec; vtmp[!is.finite(vtmp)] <- 0
+      nrm <- sqrt(sum(vtmp^2))
+      if (is.finite(nrm) && nrm > 1e-9) vec <- vtmp / nrm else vec <- vtmp
+    }
+
+    # 2) Z-score by index using the training moments produced by PCA-LDA pipeline
     for (k in seq_along(indices)) {
       idx_start <- (k-1)*TEMPORAL_BUDGET + 1; idx_end <- k*TEMPORAL_BUDGET
       vec[idx_start:idx_end] <- (vec[idx_start:idx_end] - params$means[k]) / params$sds[k]
     }
+
     vec[!is.finite(vec)] <- 0
+
+    # 3) Apply PCA/LDA feature weights (same as MESMA)
     vecw <- vec * weights
+
     X_list[[length(X_list) + 1]] <- vecw
     y_vec <- c(y_vec, as.character(traces$Veg[j]))
   }
   if (length(X_list) == 0) return(list(X = NULL, y = NULL))
   X <- do.call(rbind, X_list)
   return(list(X = X, y = y_vec))
-}
+} 
 
 # Plotting helper: generate prototype plots (similar to original pipeline)
 plot_vegetation_prototypes <- function(lib, indices = NULL, out_dir = "prototype_plots", prefix = "veg_prototypes", save_png = TRUE, dpi = 150) {
@@ -549,6 +574,83 @@ if (is.null(MESMA_PARAMS_INITIAL)) stop("PCA-LDA training failed or returned NUL
 MESMA_PARAMS_INITIAL$weights[is.na(MESMA_PARAMS_INITIAL$weights)] <- 0
 MESMA_PARAMS_INITIAL$weights[!is.finite(MESMA_PARAMS_INITIAL$weights)] <- 0
 
+# --- Apply MESMA permutation-based pruning when available (keeps SVM feature-space identical) ---
+apply_mesma_permutation_pruning <- function(params, avail_indices, n_bins = TEMPORAL_BUDGET, perm_path = "permutation_importance_results.csv") {
+  if (!file.exists(perm_path)) return(list(params = params, pruned = FALSE, avail = avail_indices))
+  perm <- tryCatch(read.csv(perm_path, stringsAsFactors = FALSE), error = function(e) NULL)
+  if (is.null(perm) || nrow(perm) == 0) return(list(params = params, pruned = FALSE, avail = avail_indices))
+
+  # default alphas (will be conservative if MESMA did not pick optimal alphas)
+  pa_idx <- if (exists("PERMUTATION_ALPHA")) PERMUTATION_ALPHA else 0.05
+  pa_pent <- if (exists("PERMUTATION_PENTAD_ALPHA")) PERMUTATION_PENTAD_ALPHA else 0.05
+
+  # Robustly extract index-level p-values (rows without a valid 'pentad' treated as index-level)
+  if (!"pentad" %in% names(perm)) perm$pentad <- NA_integer_
+  index_results <- perm[is.na(perm$pentad) | perm$pentad <= 0, , drop = FALSE]
+  pentad_results <- perm[!is.na(perm$pentad) & perm$pentad > 0, , drop = FALSE]
+
+  # If index-level entries missing, compute index-level p as min pentad p (same as MESMA)
+  p_by_index <- setNames(rep(0, length(avail_indices)), avail_indices)
+  if (nrow(index_results) > 0) {
+    tmp <- tapply(as.numeric(index_results$p_value), index_results$index, function(x) suppressWarnings(min(x, na.rm = TRUE)))
+    tmp <- tmp[names(tmp) %in% names(p_by_index)]
+    p_by_index[names(tmp)] <- tmp
+  } else if (nrow(pentad_results) > 0) {
+    tmp2 <- tapply(as.numeric(pentad_results$p_value), pentad_results$index, function(x) suppressWarnings(min(x, na.rm = TRUE)))
+    tmp2 <- tmp2[names(tmp2) %in% names(p_by_index)]
+    p_by_index[names(tmp2)] <- tmp2
+  }
+
+  idx_keep_final <- names(p_by_index)[is.finite(p_by_index) & p_by_index < pa_idx]
+  idx_prune_final <- setdiff(avail_indices, idx_keep_final)
+  pent_prune_final <- if (nrow(pentad_results) > 0) pentad_results[pentad_results$p_value >= pa_pent, c("index", "pentad"), drop = FALSE] else data.frame(index = character(), pentad = integer(), stringsAsFactors = FALSE)
+
+  # Apply pruning to weight vector (mirror apply_pruning_rules behaviour)
+  w <- params$weights
+  if (!is.null(idx_prune_final) && length(idx_prune_final) > 0) {
+    for (idx_name in idx_prune_final) {
+      idx_i <- which(avail_indices == idx_name)
+      if (length(idx_i) == 1) {
+        s <- (idx_i - 1) * n_bins + 1; e <- idx_i * n_bins
+        w[s:e] <- 0
+      }
+    }
+  }
+  if (nrow(pent_prune_final) > 0) {
+    for (i in seq_len(nrow(pent_prune_final))) {
+      idx_name <- as.character(pent_prune_final$index[i])
+      pentad_j <- as.integer(pent_prune_final$pentad[i])
+      idx_i <- which(avail_indices == idx_name)
+      if (length(idx_i) == 1 && is.finite(pentad_j)) {
+        pos <- (idx_i - 1) * n_bins + pentad_j
+        if (pos >= 1 && pos <= length(w)) w[pos] <- 0
+      }
+    }
+  }
+
+  # Safety checks (avoid pruning everything)
+  frac_zero <- sum(w == 0) / length(w)
+  max_frac <- if (exists("PRUNE_ZERO_WEIGHT_MAX_FRAC")) PRUNE_ZERO_WEIGHT_MAX_FRAC else 0.8
+  min_keep <- if (exists("PRUNE_ZERO_MIN_FEATURES")) PRUNE_ZERO_MIN_FEATURES else 3
+  if (frac_zero <= max_frac && (length(w) - sum(w == 0)) >= min_keep) {
+    params$weights <- w
+    kept_idxs <- avail_indices[sapply(seq_along(avail_indices), function(k) any(w[((k-1)*n_bins+1):(k*n_bins)] > 0))]
+    return(list(params = params, pruned = TRUE, avail = kept_idxs))
+  }
+  # Skip pruning if too aggressive
+  list(params = params, pruned = FALSE, avail = avail_indices)
+}
+
+# If MESMA produced permutation results previously, apply identical pruning and retrain PCA-LDA on pruned set
+perm_prune_res <- apply_mesma_permutation_pruning(MESMA_PARAMS_INITIAL, avail, TEMPORAL_BUDGET, perm_path = "permutation_importance_results.csv")
+if (isTRUE(perm_prune_res$pruned)) {
+  cat(sprintf("[SVM] Applied MESMA permutation pruning — reducing features: %d -> %d\n", length(avail), length(perm_prune_res$avail)))
+  avail <- perm_prune_res$avail
+  MESMA_PARAMS_INITIAL <- train_feature_pipeline(multi_class_data, "target_class", avail, use_lda = FALSE)
+  MESMA_PARAMS_INITIAL$weights[is.na(MESMA_PARAMS_INITIAL$weights)] <- 0
+  MESMA_PARAMS_INITIAL$weights[!is.finite(MESMA_PARAMS_INITIAL$weights)] <- 0
+} 
+
 # Evaluate threshold candidates using OOB SVM evaluation
 threshold_results <- data.frame(threshold_quantile = numeric(), threshold_value = numeric(), score = numeric(), accuracy = numeric(), n_zeroed = numeric(), n_kept = numeric(), stringsAsFactors = FALSE)
 for (thresh_q in PCA_LDA_THRESHOLD_CANDIDATES) {
@@ -703,7 +805,12 @@ for (cls in unique_classes) {
     mat <- build_pentad_matrix(sub, avail)
     if (is.null(mat)) next
     vec <- as.numeric(mat)
-    # z-score using training moments
+    # Apply the same L2 + z-score representation used for PCA/LDA
+    if (exists("ENABLE_LDA_L2_NORMALIZATION") && isTRUE(ENABLE_LDA_L2_NORMALIZATION)) {
+      vtmp <- vec; vtmp[!is.finite(vtmp)] <- 0
+      nrm <- sqrt(sum(vtmp^2))
+      if (is.finite(nrm) && nrm > 1e-9) vec <- vtmp / nrm else vec <- vtmp
+    }
     for (k in seq_along(avail)) {
       idx_start <- (k-1)*TEMPORAL_BUDGET + 1; idx_end <- k*TEMPORAL_BUDGET
       vec[idx_start:idx_end] <- (vec[idx_start:idx_end] - MESMA_PARAMS_INITIAL$means[k]) / MESMA_PARAMS_INITIAL$sds[k]
@@ -749,6 +856,12 @@ if (file.exists(INFERENCE_CSV)) {
       mat <- build_pentad_matrix(sub, avail)
       if (is.null(mat)) next
       vec <- as.numeric(mat)
+      # Mirror MESMA representation: apply L2-normalization (if enabled) BEFORE z-scoring
+      if (exists("ENABLE_LDA_L2_NORMALIZATION") && isTRUE(ENABLE_LDA_L2_NORMALIZATION)) {
+        vtmp <- vec; vtmp[!is.finite(vtmp)] <- 0
+        nrm <- sqrt(sum(vtmp^2))
+        if (is.finite(nrm) && nrm > 1e-9) vec <- vtmp / nrm else vec <- vtmp
+      }
       # Z-score using training moments
       for (k in seq_along(avail)) {
         idx_start <- (k-1)*TEMPORAL_BUDGET + 1; idx_end <- k*TEMPORAL_BUDGET

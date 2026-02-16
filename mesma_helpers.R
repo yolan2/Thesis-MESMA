@@ -411,7 +411,6 @@ set_mesma_seed <- function(base = NULL, announce = TRUE, set_env_vars = TRUE) {
   # Ensure common env vars used by scripts are seeded (if not explicitly provided)
   if (isTRUE(set_env_vars)) {
     if (nzchar(Sys.getenv("FVC_SAMPLING_SEED", "")) == FALSE) Sys.setenv(FVC_SAMPLING_SEED = as.character(base))
-    if (nzchar(Sys.getenv("UNCERTAINTY_PARAM_EST_SEED", "")) == FALSE) Sys.setenv(UNCERTAINTY_PARAM_EST_SEED = as.character(base + 123L))
   }
 
   if (isTRUE(announce)) message(sprintf("[MESMA] RNG initialized with MESMA_SEED=%d (override with MESMA_SEED env var)" , base))
@@ -442,4 +441,100 @@ NDDI_DUST_THRESHOLD <- get_nddi_threshold()
 
 # Helper to format threshold for messages
 .nddi_thresh_fmt <- function() sprintf("%.3f", as.numeric(get_nddi_threshold()))
+
+# --- Shared vegetation label canonicalization helpers -------------------------
+
+# Canonical list of herb-group labels (map these to "herbs")
+HERBS_GROUP <- c("herbs", "alhagi", "salicornia", "halocnemum", "phragmites")
+
+# Agriculture alias mapping (map these to "agriculture")
+AGRICULTURE_ALIASES <- c("agri", "agric", "agriculture", "agricultural")
+
+# Canonicalize vegetation labels in a data.frame column.
+# Fixes typos, maps herb-group species -> "herbs", maps agriculture aliases -> "agriculture".
+# `veg_col` is determined automatically if NULL.
+canonicalize_veg_labels <- function(df, veg_col = NULL) {
+  if (is.null(veg_col)) {
+    veg_col <- intersect(c("Veg", "vegetation"), names(df))[1]
+  }
+  if (is.na(veg_col) || !veg_col %in% names(df)) return(df)
+
+  v <- tolower(trimws(as.character(df[[veg_col]])))
+  # Fix typos
+  v[v == "tamairx"] <- "tamarix"
+  # Map herb-group
+  v[v %in% HERBS_GROUP] <- "herbs"
+  # Map agriculture aliases
+  v[v %in% AGRICULTURE_ALIASES] <- "agriculture"
+  df[[veg_col]] <- v
+  df
+}
+
+# --- Woody aggregation helper for bootstrap results --------------------------
+# Sums bootstrap matrices for populus + tamarix + woody_unknown into a "woody" category.
+# `veg_boot_res` is a named list of [B x n_years] matrices. Modifies in place and returns.
+aggregate_woody_bootstrap <- function(veg_boot_res, label = "BOOTSTRAP") {
+  woody_types <- c("populus", "tamarix", "woody_unknown")
+  woody_mats <- veg_boot_res[tolower(names(veg_boot_res)) %in% woody_types]
+  if (length(woody_mats) >= 1) {
+    woody_mat <- Reduce(`+`, lapply(woody_mats, function(m) { m[is.na(m)] <- 0; m }))
+    all_na_mask <- Reduce(`&`, lapply(woody_mats, is.na))
+    woody_mat[all_na_mask] <- NA_real_
+    colnames(woody_mat) <- colnames(woody_mats[[1]])
+    veg_boot_res[["woody"]] <- woody_mat
+    cat(sprintf("[%s] Added 'woody' category (populus + tamarix + woody_unknown) with combined bootstrap CIs\n", label))
+  }
+  veg_boot_res
+}
+
+# --- Bootstrap results compilation helper ------------------------------------
+# Compiles a list of [B x n_years] bootstrap matrices into a single data.frame
+# with columns: year, Veg, global_coef, se, coef_025, coef_975, method, n_locations.
+compile_bootstrap_results <- function(veg_boot_res, years, unique_loc_years, method_name) {
+  final_results <- list()
+  for (v in names(veg_boot_res)) {
+    mat <- veg_boot_res[[v]]
+    if (is.null(mat) || ncol(mat) == 0 || is.null(colnames(mat)) || length(colnames(mat)) == 0) next
+    df_res <- data.frame(
+      year = as.integer(colnames(mat)),
+      Veg = v,
+      global_coef = apply(mat, 2, mean, na.rm = TRUE),
+      se = apply(mat, 2, sd, na.rm = TRUE),
+      coef_025 = apply(mat, 2, quantile, 0.025, na.rm = TRUE),
+      coef_975 = apply(mat, 2, quantile, 0.975, na.rm = TRUE),
+      method = method_name
+    )
+    n_locs_per_year <- sapply(years, function(y) sum(unique_loc_years$pheno_year == y))
+    df_res$n_locations <- n_locs_per_year[match(df_res$year, years)]
+    final_results[[v]] <- df_res
+  }
+  dplyr::bind_rows(final_results)
+}
+
+# --- PPI norm/backup helper --------------------------------------------------
+# Backs up raw PPI to PPI_raw, then creates ppi_norm clamped to [0,1].
+# `ppi_max` is the normalizing constant (PPI_FULL_VEG_COVER).
+backup_and_normalize_ppi <- function(df, ppi_max, label = "") {
+  prefix <- if (nzchar(label)) paste0(label, ": ") else ""
+
+  # Backup raw PPI
+  if (!"PPI_raw" %in% names(df)) {
+    df$PPI_raw <- df$PPI
+    cat(sprintf("[NOTICE] %sBacked up raw PPI values to 'PPI_raw' before normalization.\n", prefix))
+  }
+
+  # Compute ppi_norm
+  if (!"ppi_norm" %in% names(df)) df$ppi_norm <- NA_real_
+  if ("PPI_raw" %in% names(df) && any(is.finite(df$PPI_raw))) {
+    df$ppi_norm <- pmin(pmax(df$PPI_raw / ppi_max, 0), 1)
+    cat(sprintf("[PPI NORM] %sCreated 'ppi_norm' from 'PPI_raw' and clamped to [0,1] using PPI_FULL_VEG_COVER=%.3f\n", prefix, ppi_max))
+  } else if ("PPI" %in% names(df) && any(is.finite(df$PPI))) {
+    df$ppi_norm <- pmin(pmax(df$PPI / ppi_max, 0), 1)
+    warning(sprintf("%s'PPI_raw' not found - computed 'ppi_norm' from 'PPI' (may be z-scored); values were clamped to [0,1].", prefix))
+  } else {
+    df$ppi_norm <- NA_real_
+    cat(sprintf("[PPI NORM] %sNo PPI or PPI_raw available to compute 'ppi_norm' (all NA)\n", prefix))
+  }
+  df
+}
 

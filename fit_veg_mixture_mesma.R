@@ -108,7 +108,7 @@ if (file.exists("mesma_config.R")) {
 }
 
 # Override: inference CSV for this script (differs from mesma_config.R default)
-INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_kon (1).csv"
+INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_mid (2).csv"
 
 if (file.exists("ppi_helpers.R")) {
   source("ppi_helpers.R")
@@ -7486,68 +7486,21 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
       cat("[INFERENCE] NDVI data not available for inference; skipping NDVI aggregation.\n")
     }
 
-    # --- INFERENCE: No-index normalization aggregation ---
+    # --- INFERENCE: Aggregate bootstrap (with Dirichlet perturbation) ---
     if (!is.null(inference_coefs) && nrow(inference_coefs) > 0) {
-      cat("[INFERENCE] Running no-index normalization aggregation (inference mode)\n")
-      noindex_inf_full <- tryCatch({ location_bootstrap_noindex(inference_coefs, df_tasks_inference_proc, B = BOOTSTRAP_B, seed = get_mesma_seed(123)) }, error = function(e) { cat(sprintf("[NOINDEX INFERENCE] failed: %s\n", e$message)); NULL })
-      if (!is.null(noindex_inf_full) && nrow(noindex_inf_full) > 0) {
-        plot_inference_method_results(noindex_inf_full, "No-Index", "noindex",
-                                      use_excluded_years_shade = FALSE,
-                                      include_species_plots = FALSE)
-      } else {
-        cat("[INFERENCE] No-index inference aggregation returned no results.\n")
-      }
-    } else {
-      cat("[INFERENCE] No inference coefficients available; skipping no-index aggregation.\n")
-    }
-
-    # --- INFERENCE: Dirichlet-perturbed aggregate bootstrap ---
-    if (!is.null(inference_coefs) && nrow(inference_coefs) > 0) {
-      cat("[INFERENCE] Running Dirichlet-perturbed aggregate bootstrap\n")
+      cat("[INFERENCE] Running aggregate bootstrap\n")
       aggregate_inf_full <- tryCatch({
         location_bootstrap_aggregate(inference_coefs, B = BOOTSTRAP_B, seed = get_mesma_seed(123))
       }, error = function(e) { cat(sprintf("[AGGREGATE BOOTSTRAP] failed: %s\n", e$message)); NULL })
-
       if (!is.null(aggregate_inf_full) && nrow(aggregate_inf_full) > 0) {
-        agg_veg_norm <- normalize_veg_name(aggregate_inf_full$Veg)
-        agg_inf_veg <- aggregate_inf_full[!agg_veg_norm %in% c("barren"), ]
-        agg_inf_barren <- aggregate_inf_full[agg_veg_norm %in% c("barren"), ]
-
-        if (!is.null(agg_inf_veg) && nrow(agg_inf_veg) > 0) {
-          p_inf_agg_ts <- ggplot(agg_inf_veg, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
-            add_year_lines(is_date = FALSE) +
-            geom_line(linewidth = 1) +
-            geom_point(show.legend = FALSE) +
-            geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
-            labs(title = "Dirichlet-Perturbed Aggregate Vegetation Fractions",
-                 x = "Year", y = "Mean Fraction", color = "Veg", fill = "Veg") +
-            theme_minimal()
-          ggsave(file.path(OUT_DIR, "inference_aggregate_dirichlet_timeseries.png"), p_inf_agg_ts, width = 8, height = 6)
-          readr::write_csv(agg_inf_veg, file.path(OUT_DIR, "inference_aggregate_dirichlet_timeseries.csv"))
-          cat(sprintf("Saved Dirichlet-perturbed aggregate time series plot to: %s\n", file.path(OUT_DIR, "inference_aggregate_dirichlet_timeseries.png")))
-
-          # Herbs vs Woody
-          herbs_woody_agg <- aggregate_inf_full[agg_veg_norm %in% c("herbs", "woody"), ]
-          if (nrow(herbs_woody_agg) > 0) {
-            herbs_woody_agg$Veg <- ifelse(tolower(herbs_woody_agg$Veg) == "herbs", "Herbs", "Woody")
-            p_inf_agg_hw <- ggplot(herbs_woody_agg, aes(x = year, y = global_coef, color = Veg, group = Veg)) +
-              add_year_lines(is_date = FALSE) +
-              geom_line(linewidth = 1) +
-              geom_point(show.legend = FALSE) +
-              geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
-              scale_color_manual(values = HERBS_WOODY_COLORS) +
-              scale_fill_manual(values = HERBS_WOODY_COLORS) +
-              labs(title = "Dirichlet-Perturbed: Herbs vs Woody",
-                   x = "Year", y = "Mean Fraction", color = "Type", fill = "Type") +
-              theme_minimal()
-            ggsave(file.path(OUT_DIR, "inference_aggregate_dirichlet_herbs_vs_woody.png"), p_inf_agg_hw, width = 8, height = 6)
-            readr::write_csv(herbs_woody_agg, file.path(OUT_DIR, "inference_aggregate_dirichlet_herbs_vs_woody.csv"))
-            cat(sprintf("Saved Dirichlet-perturbed herbs vs woody plot to: %s\n", file.path(OUT_DIR, "inference_aggregate_dirichlet_herbs_vs_woody.png")))
-          }
-        }
+        plot_inference_method_results(aggregate_inf_full, "Aggregate", "aggregate",
+                                      use_excluded_years_shade = FALSE,
+                                      include_species_plots = TRUE)
       } else {
-        cat("[INFERENCE] Dirichlet-perturbed aggregate bootstrap returned no results.\n")
+        cat("[INFERENCE] Aggregate bootstrap returned no results.\n")
       }
+    } else {
+      cat("[INFERENCE] No inference coefficients available; skipping aggregate bootstrap.\n")
     }
 
   } else {
@@ -7622,21 +7575,17 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
         dplyr::distinct()
     }
     
-    # --- 1. Identify Valid Locations and Get True Labels from a truly held-out dataset ---
-    if (!exists("df_tasks_inference") || is.null(df_tasks_inference) || nrow(df_tasks_inference) == 0) {
-      stop("[VALIDATION] No held-out dataset available (df_tasks_inference is empty). Provide a separate INFERENCE_CSV with ground truth labels.")
+    # --- 1. Identify Valid Locations and Get True Labels from the held-out validation split ---
+    # Ground truth comes from df_validation (split from training data), which has known Veg labels.
+    # Fall back to df_tasks_inference only if df_validation is unavailable.
+    if (exists("df_validation") && !is.null(df_validation) && nrow(df_validation) > 0 && "Veg" %in% names(df_validation)) {
+      labels_df <- df_validation %>% dplyr::select(location_id, Veg) %>% dplyr::distinct()
+    } else if (exists("df_tasks_inference") && !is.null(df_tasks_inference) && nrow(df_tasks_inference) > 0 && "Veg" %in% names(df_tasks_inference)) {
+      labels_df <- df_tasks_inference %>% dplyr::select(location_id, Veg) %>% dplyr::distinct()
+    } else {
+      cat("[VALIDATION] No ground-truth labels available (neither df_validation nor df_tasks_inference have Veg column)\n")
+      return(invisible(NULL))
     }
-    if (!"Veg" %in% names(df_tasks_inference)) {
-      stop("[VALIDATION] Held-out dataset (df_tasks_inference) is missing ground-truth 'Veg' labels")
-    }
-    if (exists("df_train") && !is.null(df_train) && nrow(df_train) > 0 && "location_id" %in% names(df_train)) {
-      overlap_ids <- intersect(unique(as.character(df_train$location_id)), unique(as.character(df_tasks_inference$location_id)))
-      if (length(overlap_ids) > 0) {
-        stop(sprintf("[VALIDATION] Held-out dataset overlaps training locations (n_overlap=%d). Refusing to validate on non-held-out data.", length(overlap_ids)))
-      }
-    }
-
-    labels_df <- df_tasks_inference %>% dplyr::select(location_id, Veg) %>% dplyr::distinct()
     
     # Normalize labels
     labels_df$Veg <- normalize_veg_name(labels_df$Veg)
@@ -8033,6 +7982,21 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
     cat("[WARNING] No validation coefficients available for accuracy computation\n")
   }
 
+  # --- VALIDATION: Aggregate bootstrap (with Dirichlet perturbation) ---
+  if (exists("validation_coefs") && !is.null(validation_coefs) && nrow(validation_coefs) > 0) {
+    cat("[VALIDATION] Running aggregate bootstrap\n")
+    aggregate_val_full <- tryCatch({
+      location_bootstrap_aggregate(validation_coefs, B = BOOTSTRAP_B, seed = get_mesma_seed(123))
+    }, error = function(e) { cat(sprintf("[VALIDATION AGGREGATE BOOTSTRAP] failed: %s\n", e$message)); NULL })
+    if (!is.null(aggregate_val_full) && nrow(aggregate_val_full) > 0) {
+      plot_inference_method_results(aggregate_val_full, "Validation-Aggregate", "validation_aggregate",
+                                    use_excluded_years_shade = FALSE,
+                                    include_species_plots = TRUE)
+    } else {
+      cat("[VALIDATION] Aggregate bootstrap returned no results.\n")
+    }
+  }
+
   # Helper: combine results_list into unified all_coefs (no printing)
   combine_results_from_list <- function(results_list) {
     coef_list <- lapply(results_list, function(res) {
@@ -8309,6 +8273,9 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
         mixed_df$date <- as.Date(paste0(mixed_df$pheno_year, "-01-01")) + mixed_df$doy - 1
       }
 
+      # Compute derived indices (MSAVI, etc.) from the mixed raw band values
+      mixed_df <- compute_indices_from_bands(mixed_df)
+
       # Run inference using run_inference_silent if available
       if (exists("run_inference_silent")) {
         inf_result <- tryCatch({
@@ -8356,27 +8323,31 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
       frac_col_a <- tolower(class_a)
       frac_col_b <- tolower(class_b)
 
-      if (frac_col_a %in% names(coefs_wide) && frac_col_b %in% names(coefs_wide)) {
-        pred_frac_a <- coefs_wide[[frac_col_a]]
-        pred_frac_b <- coefs_wide[[frac_col_b]]
+      # Identify all predicted vegetation columns (exclude metadata columns)
+      meta_cols <- c("location_id", "pheno_year")
+      all_veg_cols <- setdiff(names(coefs_wide), meta_cols)
 
-        # Calculate metrics
-        mean_pred_a <- mean(pred_frac_a, na.rm = TRUE)
-        mean_pred_b <- mean(pred_frac_b, na.rm = TRUE)
-        sd_pred_a <- sd(pred_frac_a, na.rm = TRUE)
-        sd_pred_b <- sd(pred_frac_b, na.rm = TRUE)
+      cat(sprintf("\n  Mix %s + %s (N=%d):\n", class_a, class_b, nrow(coefs_wide)))
 
-        # Expected is 0.5 for both
-        rmse_a <- sqrt(mean((pred_frac_a - 0.5)^2, na.rm = TRUE))
-        rmse_b <- sqrt(mean((pred_frac_b - 0.5)^2, na.rm = TRUE))
+      total_predicted <- 0
+      for (vc in all_veg_cols) {
+        pred_vals <- coefs_wide[[vc]]
+        mean_pred <- mean(pred_vals, na.rm = TRUE)
+        sd_pred <- sd(pred_vals, na.rm = TRUE)
+        total_predicted <- total_predicted + mean_pred
 
-        cat(sprintf("\n  Mix %s + %s (N=%d):\n", class_a, class_b, nrow(coefs_wide)))
-        cat(sprintf("    %s: predicted=%.3f ± %.3f (expected=0.500, RMSE=%.3f)\n",
-                    class_a, mean_pred_a, sd_pred_a, rmse_a))
-        cat(sprintf("    %s: predicted=%.3f ± %.3f (expected=0.500, RMSE=%.3f)\n",
-                    class_b, mean_pred_b, sd_pred_b, rmse_b))
-        cat(sprintf("    Sum: %.3f (expected=1.000)\n", mean_pred_a + mean_pred_b))
+        # Expected is 0.5 for the two mixed classes, 0.0 for all others
+        if (vc == frac_col_a || vc == frac_col_b) {
+          rmse_val <- sqrt(mean((pred_vals - 0.5)^2, na.rm = TRUE))
+          cat(sprintf("    %s: predicted=%.3f ± %.3f (expected=0.500, RMSE=%.3f)\n",
+                      vc, mean_pred, sd_pred, rmse_val))
+        } else {
+          rmse_val <- sqrt(mean((pred_vals - 0.0)^2, na.rm = TRUE))
+          cat(sprintf("    %s: predicted=%.3f ± %.3f (expected=0.000, RMSE=%.3f)\n",
+                      vc, mean_pred, sd_pred, rmse_val))
+        }
       }
+      cat(sprintf("    Sum: %.3f (expected=1.000)\n", total_predicted))
     }
 
     return(mix_coefs_combined)

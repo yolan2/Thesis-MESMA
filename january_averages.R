@@ -268,30 +268,49 @@ if ("NDDI" %in% names(df_raw)) {
   })
 }
 
-# Ensure PPI exists; try to compute via auto_add_ppi_columns (no global default fallback)
-if (!"PPI" %in% names(df_raw) || all(!is.finite(df_raw$PPI))) {
-  ppi_res <- tryCatch(auto_add_ppi_columns(df_raw), error = function(e) NULL)
-  if (!is.null(ppi_res) && is.list(ppi_res) && !is.null(ppi_res$df)) {
-    df_raw <- ppi_res$df
-    cat("[INDEX SETUP] PPI computed via auto_add_ppi_columns()\n")
-  } else if ("DVI" %in% names(df_raw) && any(is.finite(df_raw$DVI))) {
-    zenith_rad <- calculate_solar_zenith(lat = 40, doy = 180, hour = 10.5)
-    # Prefer median DVI of 'barren' as baseline if available
-    dvi_soil_val <- NULL
-    if ("Veg" %in% names(df_raw)) {
-      barren_dvi <- df_raw$DVI[is.finite(df_raw$DVI) & tolower(df_raw$Veg) == 'barren']
-      if (length(barren_dvi) > 0) {
-        dvi_soil_val <- as.numeric(median(barren_dvi, na.rm = TRUE))
-        cat(sprintf("[INDEX SETUP] Using median barren DVI baseline = %.6f\n", dvi_soil_val))
-      }
-    }
-    if (!is.finite(dvi_soil_val)) {
-      stop("[INDEX SETUP] Cannot determine dvi_soil baseline: no 'barren' observations and auto_add_ppi_columns() failed; provide barren samples or pass explicit dvi_soil to auto_add_ppi_columns().")
-    }
-    df_raw$PPI <- ppi(df_raw$DVI, zenith.angle = zenith_rad, dvi.soil = dvi_soil_val)
-  } else {
-    cat("[INDEX SETUP] WARNING: Cannot compute PPI because DVI is missing or invalid; detrending may fail if PPI is required\n")
+# Compute a per-location DVI soil baseline for PPI.
+# Baseline is the median of the lowest `quantile_p` fraction of DVI within each location.
+compute_dvi_soil_per_location <- function(df, quantile_p = 0.10, min_samples = 5L) {
+  if (is.null(df) || nrow(df) == 0) stop("[PPI] compute_dvi_soil_per_location: empty df")
+  if (!"location_id" %in% names(df)) stop("[PPI] compute_dvi_soil_per_location: missing location_id")
+  if (!"DVI" %in% names(df) && all(c("nir", "red") %in% names(df))) df$DVI <- as.numeric(df$nir) - as.numeric(df$red)
+  if (!"DVI" %in% names(df)) stop("[PPI] compute_dvi_soil_per_location: missing DVI (and nir/red not available)")
+
+  locs <- unique(as.character(df$location_id))
+  dvi_soil_vec <- rep(NA_real_, nrow(df))
+  for (loc in locs) {
+    idx <- which(as.character(df$location_id) == loc)
+    vals <- df$DVI[idx]
+    vals <- vals[is.finite(vals)]
+    if (length(vals) < as.integer(min_samples)) next
+    q <- suppressWarnings(as.numeric(stats::quantile(vals, probs = quantile_p, na.rm = TRUE, names = FALSE, type = 7)))
+    if (!is.finite(q)) next
+    low_vals <- vals[vals <= q]
+    if (length(low_vals) < 2L) next
+    soil <- suppressWarnings(as.numeric(stats::median(low_vals, na.rm = TRUE)))
+    if (!is.finite(soil)) next
+    dvi_soil_vec[idx] <- soil
   }
+
+  need_idx <- is.finite(df$DVI) & !is.finite(dvi_soil_vec)
+  if (any(need_idx)) {
+    bad_locs <- unique(as.character(df$location_id[need_idx]))
+    stop(sprintf("[PPI] Cannot compute per-location dvi_soil for %d rows across %d locations (example locs: %s)",
+                 sum(need_idx), length(bad_locs), paste(head(bad_locs, 10), collapse = ", ")))
+  }
+  dvi_soil_vec
+}
+
+# Ensure PPI exists; require per-location dvi_soil and per-location M (no auto fallbacks)
+if (!"PPI" %in% names(df_raw) || all(!is.finite(df_raw$PPI))) {
+  if (!"location_id" %in% names(df_raw)) stop("[INDEX SETUP] Cannot compute per-location PPI: missing location_id")
+  if (!"DVI" %in% names(df_raw) && all(c("nir", "red") %in% names(df_raw))) df_raw$DVI <- as.numeric(df_raw$nir) - as.numeric(df_raw$red)
+  if (!"DVI" %in% names(df_raw) || !any(is.finite(df_raw$DVI))) {
+    stop("[INDEX SETUP] Cannot compute PPI because DVI is missing or invalid")
+  }
+  dvi_soil_vec <- compute_dvi_soil_per_location(df_raw, quantile_p = 0.10)
+  df_raw <- add_ppi_columns(df_raw, dvi_soil = dvi_soil_vec)
+  cat("[INDEX SETUP] PPI computed via add_ppi_columns() using per-location dvi_soil baseline and per-location M\n")
 }
 
 # Instead of fitting seasonal models, use June-August medians per user request
@@ -521,7 +540,9 @@ calculate_indices <- function(df) {
         zenith_rad <- calculate_solar_zenith(lat = 40, doy = 180, hour = 10.5)
 
         # Calculate PPI using ppi() function
-        df$PPI <- ppi(dvi = df$DVI, zenith.angle = zenith_rad, dvi.soil = dvi_soil_val)
+        M_val <- suppressWarnings(max(df$DVI, na.rm = TRUE))
+        if (!is.finite(M_val)) stop("[PPI] Synthetic mixing: cannot compute finite M")
+        df$PPI <- ppi(dvi = df$DVI, zenith.angle = zenith_rad, M = M_val, dvi.soil = dvi_soil_val)
         cat(sprintf("Calculated PPI for synthetic mixing (dvi_soil=%.6f, zenith=%.4f rad)\n", dvi_soil_val, zenith_rad))
       }
     }
@@ -645,7 +666,9 @@ if (!"PPI" %in% names(df_raw) || all(!is.finite(df_raw$PPI))) {
   }
   if (!is.finite(dvi_soil_val)) stop("Cannot determine dvi_soil baseline for PPI detrending; provide barren samples or set 'dvi_soil' explicitly")
   zenith_rad <- calculate_solar_zenith(lat = 40, doy = 180, hour = 10.5)
-  df_raw$PPI <- ppi(df_raw$DVI, zenith.angle = zenith_rad, dvi.soil = dvi_soil_val)
+  M_val <- suppressWarnings(max(df_raw$DVI, na.rm = TRUE))
+  if (!is.finite(M_val)) stop("[PPI] Cannot compute finite M for df_raw")
+  df_raw$PPI <- ppi(df_raw$DVI, zenith.angle = zenith_rad, M = M_val, dvi.soil = dvi_soil_val)
 }
 
 # Detrend summer indices (June-Sep) using polynomial fit of DOY for each index
@@ -836,7 +859,9 @@ if ("DVI" %in% names(mixtures)) {
     idxs <- mixtures$pair_id == pid
     dvi_soil_val <- mixtures$DVI[idxs & mixtures$fraction_veg == 0][1]
     if (!is.finite(dvi_soil_val)) next
-    mixtures$PPI[idxs] <- ppi(dvi = mixtures$DVI[idxs], zenith.angle = zenith_rad, dvi.soil = dvi_soil_val)
+    M_val <- suppressWarnings(max(mixtures$DVI[idxs], na.rm = TRUE))
+    if (!is.finite(M_val)) next
+    mixtures$PPI[idxs] <- ppi(dvi = mixtures$DVI[idxs], zenith.angle = zenith_rad, M = M_val, dvi.soil = dvi_soil_val)
   }
   cat(sprintf("Calculated PPI for synthetic mixtures across %d pairs\n", length(pair_ids)))
 
@@ -1306,7 +1331,12 @@ build_models_for_soil_veg <- function(soil_rows, veg_rows, veg_label) {
       psub <- mixtures[mixtures$pair_id == pid, , drop = FALSE]
       soil_dvi <- psub$DVI[which(psub$fraction_veg == 0)[1]]
       if (!is.finite(soil_dvi)) soil_dvi <- NA_real_
-      mixtures$PPI[mixtures$pair_id == pid] <- ppi(psub$DVI, zenith.angle = zenith_rad, dvi.soil = soil_dvi)
+      M_val <- suppressWarnings(max(psub$DVI, na.rm = TRUE))
+      if (!is.finite(M_val) || !is.finite(soil_dvi)) {
+        mixtures$PPI[mixtures$pair_id == pid] <- NA_real_
+      } else {
+        mixtures$PPI[mixtures$pair_id == pid] <- ppi(psub$DVI, zenith.angle = zenith_rad, M = M_val, dvi.soil = soil_dvi)
+      }
     }
     mixtures$doy <- 180
     for (idx in INDICES_OF_INTEREST) {
@@ -2062,10 +2092,12 @@ if (file.exists(TRAINING_CSV)) {
     # Outlier removal already applied earlier to the raw CSV; skipping duplicate removal here
   }
 
-  # Ensure PPI is present for training data (uses mapping or internal barren rows)
-  if (exists("auto_add_ppi_columns")) {
-    ppi_res <- tryCatch(auto_add_ppi_columns(training_df), error = function(e) NULL)
-    if (!is.null(ppi_res) && is.list(ppi_res) && !is.null(ppi_res$df)) training_df <- ppi_res$df
+  # Ensure PPI is present for training data (strict per-location dvi_soil + per-location M)
+  if (!"PPI" %in% names(training_df) || all(!is.finite(training_df$PPI))) {
+    if (!"location_id" %in% names(training_df)) stop("[TRAINING] Cannot compute PPI: missing location_id")
+    if (!"DVI" %in% names(training_df) && all(c("nir", "red") %in% names(training_df))) training_df$DVI <- as.numeric(training_df$nir) - as.numeric(training_df$red)
+    dvi_soil_vec <- compute_dvi_soil_per_location(training_df, quantile_p = 0.10)
+    training_df <- add_ppi_columns(training_df, dvi_soil = dvi_soil_vec)
   }
   # Filter training years to the analysis window
   cat("Filtering training data for years 1985-2025...\n")

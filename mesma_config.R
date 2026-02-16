@@ -103,12 +103,9 @@ GENERATE_PROTO_PLOTS <- TRUE     # Turn on to save one plot per prototype (usefu
 GENERATE_PROTO_PLOTS_VARIANTS_ONLY <- TRUE  # Also save a variants-only version (no median overlays)
 
 # Run / testing flags
-SKIP_INFERENCE <- FALSE        # No longer supported (kept for backward compatibility; TRUE will error)
 # Training enabled by default (do not permanently disable training here)
 # Testing mode disabled for production runs: TESTING_MODE set to FALSE
 TESTING_MODE <- FALSE  # Do not set to TRUE in production; reserved for manual debugging only
-
-if (isTRUE(SKIP_INFERENCE)) stop("SKIP_INFERENCE is no longer supported; remove it and provide a proper INFERENCE_CSV")
 
 # Explicitly disable DEBUG to prevent accidental verbose debugging in production
 DEBUG <- FALSE
@@ -179,22 +176,6 @@ ENABLE_FEATURE_PRUNING <- TRUE  # Automatically drop highly correlated features 
 FEATURE_PRUNING_THRESHOLD <- 0.95 # Correlation threshold above which a feature is considered redundant and dropped.
 
 
-
-# Small-N CI inflation (prevent tiny-sample overconfidence)
-UNCERTAINTY_N_REF <- 12L         # Reference observation count; above this, no inflation. Increase if your typical loc-year has more obs.
-UNCERTAINTY_N_POWER <- 1.0       # Strength of small-n inflation; reduced from 2.0 to avoid over-inflation (spatial autocorrelation now handled via n_eff).
-UNCERTAINTY_BASE_SD <- 0.12      # Fallback SD for locations with no empirical SD (before inflation). Reduced from 0.15.
-UNCERTAINTY_SD_MAX <- 0.40       # Cap to avoid absurdly large SD values from inflation. Reduced from 0.50.
-
-# Option A: estimate UNCERTAINTY params by subsampling experiment (auto-calibrate)
-ESTIMATE_UNCERTAINTY_PARAMS_OPTION_A <- TRUE
-UNCERTAINTY_PARAM_EST_HIGH_N <- 20L            # Only use location-years with >= this many obs as 'truth' in the subsampling experiment.
-UNCERTAINTY_PARAM_EST_MAX_GROUPS <- 25L        # Cap the number of loc-years used to limit runtime of the estimation.
-UNCERTAINTY_PARAM_EST_TARGET_NS <- 1:15        # Subsample sizes to evaluate during estimation (typical small-n range).
-UNCERTAINTY_PARAM_EST_REPS <- 20L              # Repeats per subsample size (increase for smoother estimates; slower).
-UNCERTAINTY_PARAM_EST_SEED <- as.integer(
-  if (nzchar(Sys.getenv("UNCERTAINTY_PARAM_EST_SEED", ""))) Sys.getenv("UNCERTAINTY_PARAM_EST_SEED") else Sys.getenv("MESMA_SEED", unset = "123")
-)              # RNG seed for reproducible estimation runs. (fallback before helpers are sourced)
 
 # Data quality thresholds (filtering / skipping)
 MIN_OBS_PER_LOC_YEAR <- 3L      # Minimum rows required per location-year for processing. Increase to be stricter on noisy cases.

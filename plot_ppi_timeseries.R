@@ -218,7 +218,12 @@ if ("DVI" %in% names(df) && "zenith.angle" %in% names(df) && "DVI_max" %in% name
     if (any(complete_idx)) {
         dsoil <- if (exists("PPI_DVI_SOIL", envir = .GlobalEnv)) get("PPI_DVI_SOIL", envir = .GlobalEnv) else 0.09
         # Use fixed M=0.7 per standardized PPI implementation
-        df$PPI[complete_idx] <- ppi(df$DVI[complete_idx], df$zenith.angle[complete_idx], dvi.soil = dsoil)
+        M_val <- suppressWarnings(max(df$DVI[complete_idx], na.rm = TRUE))
+        if (is.finite(M_val)) {
+          df$PPI[complete_idx] <- ppi(df$DVI[complete_idx], df$zenith.angle[complete_idx], M = M_val, dvi.soil = dsoil)
+        } else {
+          df$PPI[complete_idx] <- NA_real_
+        }
     }
 }
 

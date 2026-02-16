@@ -44,37 +44,19 @@ calculate_solar_zenith <- function(lat, doy, hour = 10.5) {
 # parameter is provided. This value is a stable choice used in several experiments.
 DEFAULT_DVI_SOIL <- 0.0308
 
-ppi <- function(dvi, zenith.angle, M = NULL, dvi.soil, G = 0.5){
-  # Determine M: prefer explicit M, otherwise prefer per-call max(DVI), then fallback to 0.7
-  if (is.null(M)) {
-    # Use per-call max(dvi) when available (suitable for per-location or per-pair calls)
-    if (any(is.finite(dvi))) {
-      Mcand <- suppressWarnings(max(dvi, na.rm = TRUE))
-      if (is.finite(Mcand)) {
-        M <- Mcand
-        # Per-call max DVI used as M (silent)
-      }
-    }
-    # If per-call max is not usable, use fallback M = 0.7 (silent)
-    if (!is.finite(M)) {
-      M <- 0.7
-    }
-  } else {
-    if (!is.finite(M)) stop("[PPI ERROR] Provided M is not finite.")
+ppi <- function(dvi, zenith.angle, M, dvi.soil, G = 0.5){
+  # Strict parameter requirements: M and dvi.soil must be provided and finite.
+  if (missing(M) || is.null(M) || any(!is.finite(M))) {
+    stop("[PPI ERROR] M parameter must be provided and finite. No automatic fallback allowed.")
   }
-  
-  # Ensure M sits above dvi.soil to avoid zero/negative denominators
-  if (any(is.finite(dvi.soil))) {
-    min_dsoil <- min(dvi.soil, na.rm = TRUE)
-    if (M <= min_dsoil) {
-      M_old <- M
-      M <- min_dsoil + 1e-3
-      invisible()
-    }
-  }
-  
   if (missing(dvi.soil) || is.null(dvi.soil) || any(!is.finite(dvi.soil))) {
-    stop("[PPI ERROR] dvi.soil parameter is required.")
+    stop("[PPI ERROR] dvi.soil parameter is required and must be finite.")
+  }
+
+  # Ensure M sits above dvi.soil to avoid zero/negative denominators
+  min_dsoil <- min(dvi.soil, na.rm = TRUE)
+  if (is.finite(min_dsoil) && any(is.finite(M)) && any(M <= min_dsoil)) {
+    stop(sprintf("[PPI ERROR] Provided M (<= %.6f) must be greater than dvi.soil baseline (%.6f).", min(M, na.rm = TRUE), min_dsoil))
   }
   
   d_c <- 0.0336 + 0.0477/cos(zenith.angle)
@@ -101,69 +83,35 @@ ppi <- function(dvi, zenith.angle, M = NULL, dvi.soil, G = 0.5){
 
 add_ppi_columns <- function(df, dvi_soil = NULL) {
   df <- as.data.frame(df)
-  
+
   # Ensure necessary columns exist
   if (!"DVI" %in% names(df) && all(c("nir", "red") %in% names(df))) df$DVI <- df$nir - df$red
   if (!inherits(df[["date"]], "Date")) df[["date"]] <- as.Date(df[["date"]])
   if (!"doy" %in% names(df)) df[["doy"]] <- lubridate::yday(df[["date"]])
 
-  # Identify Barren Pixels
-  barren_idx <- rep(FALSE, nrow(df))
-  if ("Veg" %in% names(df)) {
-    barren_idx <- barren_idx | (!is.na(df$Veg) & tolower(trimws(as.character(df$Veg))) == "barren")
-  }
-  
-  # Note: 'no soil' fraction column is deprecated and ignored; barren identification uses Veg=='barren' only
-  
   valid_dvi <- is.finite(df$DVI)
-  barren_idx <- barren_idx & valid_dvi
 
-  # --- CRITICAL: Determine dvi_soil baseline ---
-  # AGENT CHANGE: Per user feedback, using a single global DVI baseline
-  # from 'barren' veg type, with no fallback to other methods.
-
-  dvi_soil_calc <- NULL
-
-  # Priority 1: Use provided dvi_soil parameter (e.g., from training data override)
-  if (!is.null(dvi_soil) && is.finite(dvi_soil)) {
-    dvi_soil_calc <- dvi_soil
-  }
-  # Priority 2: Compute global baseline from 'barren' vegetation type (local-only and optional)
-  else if ("Veg" %in% names(df)) {
-    barren_dvi <- df$DVI[is.finite(df$DVI) & tolower(df$Veg) == 'barren']
-    if (length(barren_dvi) > 0) {
-      dvi_soil_calc <- as.numeric(median(barren_dvi, na.rm = TRUE))
-    }
+  # --- CRITICAL: Require explicit dvi_soil baseline ---
+  # dvi_soil must be provided (scalar or a vector matching rows). No automatic computation from 'Veg' or DJF is allowed.
+  if (missing(dvi_soil) || is.null(dvi_soil) || all(!is.finite(dvi_soil))) {
+    stop("[PPI ERROR] dvi_soil parameter must be provided (scalar or vector) and contain finite values for rows with finite DVI.")
   }
 
-  # Initialize per-row dvi_soil as NA; we will assign per-location DJF medians below or fill from a computed global baseline only if present.
+  # Assign per-row dvi_soil
   df$dvi_soil <- rep(NA_real_, nrow(df))
-  if (is.finite(dvi_soil_calc)) {
-    df$dvi_soil[] <- dvi_soil_calc
-  }
-  
-  # Attempt per-location DVI soil baseline using December-February median (DJF) where available
-  # Minimum samples per location to trust DJF median can be controlled via global PPI_MIN_DJF_SAMPLES (default: 3)
-  if ("location_id" %in% names(df)) {
-    months <- lubridate::month(df$date)
-    djf_idx <- months %in% c(12, 1, 2)
-    locs <- unique(df$location_id)
-    min_samples <- if (exists("PPI_MIN_DJF_SAMPLES", envir = globalenv())) as.integer(get("PPI_MIN_DJF_SAMPLES", envir = globalenv())) else 3
-    n_loc_assigned <- 0
-    for (loc in locs) {
-      vals <- df$DVI[df$location_id == loc & djf_idx & is.finite(df$DVI)]
-      if (length(vals) >= min_samples) {
-        df$dvi_soil[df$location_id == loc] <- as.numeric(median(vals, na.rm = TRUE))
-        n_loc_assigned <- n_loc_assigned + 1
-      }
-    }
-    # Per-location DJF medians assigned to `df$dvi_soil` where available (n_assigned = n_loc_assigned).
+  if (length(dvi_soil) == 1) {
+    if (!is.finite(dvi_soil)) stop("[PPI ERROR] provided scalar dvi_soil is not finite.")
+    df$dvi_soil[] <- as.numeric(dvi_soil)
+  } else if (length(dvi_soil) == nrow(df)) {
+    df$dvi_soil <- as.numeric(dvi_soil)
+  } else {
+    stop("[PPI ERROR] dvi_soil must be a scalar or a vector with length equal to number of rows in df.")
   }
 
   # Require that every row with a finite DVI has a finite dvi_soil baseline; fail fast if not
-  need_idx <- is.finite(df$DVI) & !is.finite(df$dvi_soil)
+  need_idx <- valid_dvi & !is.finite(df$dvi_soil)
   if (any(need_idx)) {
-    stop(sprintf("[PPI ERROR] dvi_soil baseline not established for %d rows; please provide 'barren' samples, per-location DJF data (min %d samples), or pass explicit dvi_soil to add_ppi_columns()\n", sum(need_idx), min_samples))
+    stop(sprintf("[PPI ERROR] dvi_soil baseline not established for %d rows; provide explicit dvi_soil for these rows.\n", sum(need_idx)))
   }
 
   # Note: Global PPI M computation has been removed. Per-location or per-call M is used instead; fallback M=0.7 will be applied only when necessary.
@@ -221,8 +169,15 @@ add_ppi_columns <- function(df, dvi_soil = NULL) {
         df$PPI[idx_loc] <- ppi(dvi_loc, zen_loc, M = M_loc, dvi.soil = dsoil_val)
       }
     } else {
-      # No location info: let ppi() pick per-call max(dvi) as M when M is NULL
-      df$PPI[calc_idx] <- ppi(df$DVI[calc_idx], df$zenith.angle[calc_idx], dvi.soil = df$dvi_soil[calc_idx])
+      # No location info: compute a single M from the available rows (no fallback constants)
+      M_global <- suppressWarnings(max(df$DVI[calc_idx], na.rm = TRUE))
+      if (!is.finite(M_global)) stop("[PPI ERROR] Cannot compute M (non-finite) for dataset without location_id.")
+      # Ensure M is above the soil baseline
+      min_dsoil <- suppressWarnings(min(df$dvi_soil[calc_idx], na.rm = TRUE))
+      if (is.finite(min_dsoil) && M_global <= min_dsoil) {
+        stop("[PPI ERROR] Computed M is not greater than dvi_soil baseline; cannot compute PPI.")
+      }
+      df$PPI[calc_idx] <- ppi(df$DVI[calc_idx], df$zenith.angle[calc_idx], M = M_global, dvi.soil = df$dvi_soil[calc_idx])
     }
 
   }
@@ -232,21 +187,10 @@ add_ppi_columns <- function(df, dvi_soil = NULL) {
 }
 
 auto_add_ppi_columns <- function(df, dvi_soil = NULL, env_var = "MESMA_DVI_SOIL") {
-  tryCatch({
-    if (!is.null(dvi_soil) && is.finite(dvi_soil)) {
-      df_out <- add_ppi_columns(df, dvi_soil = dvi_soil)
-      return(list(df = df_out, added = TRUE, reason = "passed_baseline"))
-    }
-    df_out <- add_ppi_columns(df)
-    return(list(df = df_out, added = TRUE, reason = "calculated"))
-  }, error = function(e) {
-    warning(sprintf("auto_add_ppi_columns caught error: %s", e$message))
-    # Fallback logic: allow explicit environment override if set
-    user_dvi <- suppressWarnings(as.numeric(Sys.getenv(env_var)))
-    if (!is.na(user_dvi)) {
-       df_out <- add_ppi_columns(df, dvi_soil = user_dvi)
-       return(list(df = df_out, added = TRUE, reason = "env_override"))
-    }
-    return(list(df = df, added = FALSE, reason = e$message))
-  })
+  # Strict behavior: require caller to pass explicit dvi_soil. Do not attempt environment or automatic fallbacks.
+  if (!is.null(dvi_soil) && (length(dvi_soil) == 1 || length(dvi_soil) == nrow(df))) {
+    df_out <- add_ppi_columns(df, dvi_soil = dvi_soil)
+    return(list(df = df_out, added = TRUE, reason = "passed_baseline"))
+  }
+  return(list(df = df, added = FALSE, reason = "dvi_soil_required"))
 }
