@@ -108,7 +108,7 @@ if (file.exists("mesma_config.R")) {
 }
 
 # Override: inference CSV for this script (differs from mesma_config.R default)
-INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_mid (2).csv"
+INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_low (3).csv"
 
 if (file.exists("ppi_helpers.R")) {
   source("ppi_helpers.R")
@@ -462,6 +462,197 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
     } else {
       cat(sprintf("No Tamarix/Populus/Woody_unknown data available for inference %s woody types stacked plot.\n", method))
     }
+  }
+
+  invisible(NULL)
+}
+
+# --- Shared utility: plot pure pixel counts per class and mixture trends over time ---
+# Operates on the raw per-pixel MESMA coefficients (one row per veg type per pixel-year).
+# A pixel is "pure" if the dominant vegetation class fraction >= `pure_threshold`.
+# Mixed pixels are labeled by their contributing classes (fraction >= `mix_contrib_threshold`).
+plot_pixel_purity_and_mixtures <- function(coefs_df, pure_threshold = 0.75,
+                                            mix_contrib_threshold = 0.10,
+                                            use_excluded_years_shade = TRUE,
+                                            top_n_mixtures = 8) {
+  if (is.null(coefs_df) || nrow(coefs_df) == 0) return(invisible(NULL))
+  if (!all(c("location_id", "pheno_year", "Veg", "coef") %in% names(coefs_df))) {
+    cat("[PURITY] Missing required columns in coefs_df; skipping purity/mixture plots.\n")
+    return(invisible(NULL))
+  }
+
+  # Helper: base layers for time series plots
+  .ts_layers <- function() {
+    layers <- list()
+    if (use_excluded_years_shade) layers <- c(layers, list(add_excluded_years_shade(is_date = FALSE)))
+    layers <- c(layers, list(add_year_lines(is_date = FALSE)))
+    layers
+  }
+
+  # Pivot to wide: one row per pixel-year, one column per veg class
+  coefs_clean <- coefs_df[is.finite(coefs_df$coef) & !is.na(coefs_df$Veg) & nzchar(coefs_df$Veg), ]
+  coefs_clean$Veg <- normalize_veg_name(coefs_clean$Veg)
+
+  # Aggregate duplicate Veg entries per pixel-year (sum fractions)
+  pixel_wide <- coefs_clean %>%
+    dplyr::group_by(location_id, pheno_year, Veg) %>%
+    dplyr::summarise(coef = sum(coef, na.rm = TRUE), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from = Veg, values_from = coef, values_fill = 0)
+
+  veg_cols <- setdiff(names(pixel_wide), c("location_id", "pheno_year"))
+  if (length(veg_cols) == 0) {
+    cat("[PURITY] No vegetation columns after pivot; skipping.\n")
+    return(invisible(NULL))
+  }
+
+  # Classify each pixel-year
+  pixel_wide$dominant_class <- apply(pixel_wide[, veg_cols, drop = FALSE], 1, function(row) {
+    veg_cols[which.max(row)]
+  })
+  pixel_wide$dominant_frac <- apply(pixel_wide[, veg_cols, drop = FALSE], 1, max)
+  pixel_wide$is_pure <- pixel_wide$dominant_frac >= pure_threshold
+
+  # Build mixture label for mixed pixels
+  pixel_wide$mixture_label <- apply(pixel_wide[, veg_cols, drop = FALSE], 1, function(row) {
+    contributing <- veg_cols[row >= mix_contrib_threshold]
+    contributing <- contributing[order(-row[contributing])]
+    if (length(contributing) <= 1) return("Pure")
+    paste(tools::toTitleCase(contributing), collapse = " + ")
+  })
+  pixel_wide$mixture_label[pixel_wide$is_pure] <- "Pure"
+
+  # --- Plot 1: Pure pixel count per class over time ---
+  pure_pixels <- pixel_wide[pixel_wide$is_pure, ]
+  if (nrow(pure_pixels) > 0) {
+    pure_counts <- pure_pixels %>%
+      dplyr::mutate(dominant_class = tools::toTitleCase(dominant_class)) %>%
+      dplyr::group_by(pheno_year, dominant_class) %>%
+      dplyr::summarise(n = dplyr::n(), .groups = "drop")
+
+    all_colors <- c(SPECIES_COLORS, HERBS_WOODY_COLORS, WOODY_TYPES_COLORS,
+                    c("Barren" = "saddlebrown"))
+    used_classes <- unique(pure_counts$dominant_class)
+    plot_colors <- all_colors[names(all_colors) %in% used_classes]
+    missing <- setdiff(used_classes, names(plot_colors))
+    if (length(missing) > 0) {
+      extra <- setNames(scales::hue_pal()(length(missing)), missing)
+      plot_colors <- c(plot_colors, extra)
+    }
+
+    p_pure <- ggplot(pure_counts, aes(x = pheno_year, y = n, color = dominant_class, group = dominant_class)) +
+      .ts_layers() +
+      geom_line(linewidth = 1) +
+      geom_point(size = 2) +
+      scale_color_manual(values = plot_colors) +
+      labs(title = sprintf("Pure Pixels per Class Over Time (threshold >= %.0f%%)", pure_threshold * 100),
+           x = "Year", y = "Number of Pure Pixels", color = "Class") +
+      theme_minimal()
+    ggsave(file.path(OUT_DIR, "pixel_purity_count_per_class.png"), p_pure, width = 10, height = 6)
+    readr::write_csv(pure_counts, file.path(OUT_DIR, "pixel_purity_count_per_class.csv"))
+    cat(sprintf("[PURITY] Saved pure pixel count plot to: %s\n", file.path(OUT_DIR, "pixel_purity_count_per_class.png")))
+
+    # Stacked proportion version
+    pure_totals <- pure_counts %>%
+      dplyr::group_by(pheno_year) %>%
+      dplyr::mutate(prop = n / sum(n)) %>%
+      dplyr::ungroup()
+
+    p_pure_prop <- ggplot(pure_totals, aes(x = pheno_year, y = prop, fill = dominant_class)) +
+      .ts_layers() +
+      geom_area(alpha = 0.8) +
+      scale_fill_manual(values = plot_colors) +
+      scale_y_continuous(labels = scales::percent_format()) +
+      labs(title = sprintf("Pure Pixel Composition Over Time (threshold >= %.0f%%)", pure_threshold * 100),
+           x = "Year", y = "Proportion of Pure Pixels", fill = "Class") +
+      theme_minimal()
+    ggsave(file.path(OUT_DIR, "pixel_purity_proportion_per_class.png"), p_pure_prop, width = 10, height = 6)
+    cat(sprintf("[PURITY] Saved pure pixel proportion plot to: %s\n", file.path(OUT_DIR, "pixel_purity_proportion_per_class.png")))
+  } else {
+    cat("[PURITY] No pure pixels found at threshold; skipping pure pixel plots.\n")
+  }
+
+  # --- Plot 2: Pure vs Mixed pixel counts over time ---
+  purity_summary <- pixel_wide %>%
+    dplyr::mutate(pixel_type = ifelse(is_pure, "Pure", "Mixed")) %>%
+    dplyr::group_by(pheno_year, pixel_type) %>%
+    dplyr::summarise(n = dplyr::n(), .groups = "drop")
+
+  p_purity <- ggplot(purity_summary, aes(x = pheno_year, y = n, fill = pixel_type)) +
+    .ts_layers() +
+    geom_col(position = "stack", alpha = 0.85) +
+    scale_fill_manual(values = c("Pure" = "#4CAF50", "Mixed" = "#FF9800")) +
+    labs(title = "Pure vs Mixed Pixels Over Time",
+         x = "Year", y = "Number of Pixels", fill = "Type") +
+    theme_minimal()
+  ggsave(file.path(OUT_DIR, "pixel_pure_vs_mixed_count.png"), p_purity, width = 10, height = 6)
+  readr::write_csv(purity_summary, file.path(OUT_DIR, "pixel_pure_vs_mixed_count.csv"))
+  cat(sprintf("[PURITY] Saved pure vs mixed count plot to: %s\n", file.path(OUT_DIR, "pixel_pure_vs_mixed_count.png")))
+
+  # --- Plot 3: Specific mixture trends over time ---
+  mixed_pixels <- pixel_wide[!pixel_wide$is_pure, ]
+  if (nrow(mixed_pixels) > 0) {
+    mix_counts <- mixed_pixels %>%
+      dplyr::group_by(pheno_year, mixture_label) %>%
+      dplyr::summarise(n = dplyr::n(), .groups = "drop")
+
+    # Keep only the top N most frequent mixtures overall
+    top_mixtures <- mix_counts %>%
+      dplyr::group_by(mixture_label) %>%
+      dplyr::summarise(total = sum(n), .groups = "drop") %>%
+      dplyr::arrange(dplyr::desc(total)) %>%
+      dplyr::slice_head(n = top_n_mixtures) %>%
+      dplyr::pull(mixture_label)
+
+    mix_counts_top <- mix_counts %>%
+      dplyr::mutate(mixture_label = ifelse(mixture_label %in% top_mixtures, mixture_label, "Other")) %>%
+      dplyr::group_by(pheno_year, mixture_label) %>%
+      dplyr::summarise(n = sum(n), .groups = "drop")
+
+    # Order factor levels: top mixtures first, "Other" last
+    mix_levels <- c(top_mixtures, if ("Other" %in% mix_counts_top$mixture_label) "Other")
+    mix_counts_top$mixture_label <- factor(mix_counts_top$mixture_label, levels = mix_levels)
+
+    n_mix_colors <- length(mix_levels)
+    mix_palette <- setNames(
+      c(scales::hue_pal()(min(n_mix_colors, top_n_mixtures)),
+        if ("Other" %in% mix_levels) "grey60")[seq_len(n_mix_colors)],
+      mix_levels
+    )
+
+    p_mix <- ggplot(mix_counts_top, aes(x = pheno_year, y = n, color = mixture_label, group = mixture_label)) +
+      .ts_layers() +
+      geom_line(linewidth = 1) +
+      geom_point(size = 1.5) +
+      scale_color_manual(values = mix_palette) +
+      labs(title = "Specific Mixture Types Over Time",
+           subtitle = sprintf("Top %d mixtures shown (contrib. threshold >= %.0f%%)", top_n_mixtures, mix_contrib_threshold * 100),
+           x = "Year", y = "Number of Mixed Pixels", color = "Mixture") +
+      theme_minimal() +
+      theme(legend.position = "right")
+    ggsave(file.path(OUT_DIR, "pixel_mixture_trends.png"), p_mix, width = 12, height = 6)
+    readr::write_csv(mix_counts_top, file.path(OUT_DIR, "pixel_mixture_trends.csv"))
+    cat(sprintf("[PURITY] Saved mixture trends plot to: %s\n", file.path(OUT_DIR, "pixel_mixture_trends.png")))
+
+    # Stacked area: proportion of each mixture type among mixed pixels
+    mix_props <- mix_counts_top %>%
+      dplyr::group_by(pheno_year) %>%
+      dplyr::mutate(prop = n / sum(n)) %>%
+      dplyr::ungroup()
+
+    p_mix_prop <- ggplot(mix_props, aes(x = pheno_year, y = prop, fill = mixture_label)) +
+      .ts_layers() +
+      geom_area(alpha = 0.8) +
+      scale_fill_manual(values = mix_palette) +
+      scale_y_continuous(labels = scales::percent_format()) +
+      labs(title = "Mixture Composition Over Time",
+           subtitle = sprintf("Proportion among mixed pixels (top %d mixtures)", top_n_mixtures),
+           x = "Year", y = "Proportion of Mixed Pixels", fill = "Mixture") +
+      theme_minimal()
+    ggsave(file.path(OUT_DIR, "pixel_mixture_proportion.png"), p_mix_prop, width = 12, height = 6)
+    readr::write_csv(mix_props, file.path(OUT_DIR, "pixel_mixture_proportion.csv"))
+    cat(sprintf("[PURITY] Saved mixture proportion plot to: %s\n", file.path(OUT_DIR, "pixel_mixture_proportion.png")))
+  } else {
+    cat("[PURITY] No mixed pixels found; skipping mixture trend plots.\n")
   }
 
   invisible(NULL)
@@ -1600,6 +1791,80 @@ safe_lda_call <- function(X_pca, y, min_n_pcs = 2) {
   NULL
 }
 
+# Safe LDA call for an arbitrary subset of PC columns.
+# If LDA fails (often due to collinearity), iteratively drop the weakest PCs
+# according to the provided `pc_rank` (strongest -> weakest) and retry.
+safe_lda_call_ranked_subset <- function(X_pca, y, pc_rank = NULL, min_n_pcs = 2) {
+  if (is.null(X_pca) || ncol(X_pca) < min_n_pcs) {
+    cat(sprintf("safe_lda_call_ranked_subset: Not enough PCs (have=%d, min=%d).\n", ncol(X_pca), min_n_pcs))
+    return(NULL)
+  }
+
+  # Default ranking: keep original order, drop from the end.
+  # If `pc_rank` is provided, it may be a FULL ranking (length = ncol) or a SUBSET
+  # ranking (length < ncol) specifying which PCs to try keeping.
+  if (is.null(pc_rank) || length(pc_rank) == 0) {
+    pc_rank <- seq_len(ncol(X_pca))
+  }
+  pc_rank <- as.integer(pc_rank)
+  pc_rank <- pc_rank[is.finite(pc_rank)]
+  pc_rank <- pc_rank[pc_rank >= 1 & pc_rank <= ncol(X_pca)]
+  pc_rank <- unique(pc_rank)
+  if (length(pc_rank) < min_n_pcs) {
+    cat(sprintf("safe_lda_call_ranked_subset: Provided pc_rank has %d valid PCs (< min=%d).\n", length(pc_rank), min_n_pcs))
+    return(NULL)
+  }
+
+  # Work on a mutable selection set.
+  keep <- pc_rank
+
+  while (length(keep) >= min_n_pcs) {
+    lda_res <- NULL
+    warn_msg <- NULL
+
+    withCallingHandlers({
+      lda_res <- tryCatch({
+        MASS::lda(X_pca[, keep, drop = FALSE], grouping = y)
+      }, error = function(e) e)
+    }, warning = function(w) {
+      warn_msg <<- conditionMessage(w)
+      invokeRestart("muffleWarning")
+    })
+
+    if (!inherits(lda_res, "error") && is.null(warn_msg)) {
+      lda_res$.kept_pc_cols <- keep
+      return(lda_res)
+    }
+
+    # If we got an error or a collinearity warning, drop the weakest PC and retry.
+    is_collinear <- (!is.null(warn_msg) && grepl("collinear", warn_msg, ignore.case = TRUE))
+    if (inherits(lda_res, "error") || is_collinear) {
+      if (!is.null(warn_msg)) {
+        cat(sprintf("safe_lda_call_ranked_subset: LDA warning '%s' -> dropping 1 weakest PC (k=%d -> %d) and retrying.\n",
+                    warn_msg, length(keep), length(keep) - 1))
+      } else {
+        cat(sprintf("safe_lda_call_ranked_subset: LDA error '%s' -> dropping 1 weakest PC (k=%d -> %d) and retrying.\n",
+                    if (inherits(lda_res, "error")) lda_res$message else "unknown",
+                    length(keep), length(keep) - 1))
+      }
+      keep <- keep[-length(keep)]
+      next
+    }
+
+    # Non-collinearity warning: accept result if present.
+    if (!inherits(lda_res, "error")) {
+      lda_res$.kept_pc_cols <- keep
+      cat(sprintf("safe_lda_call_ranked_subset: LDA warning (non-collinearity): %s\n", warn_msg))
+      return(lda_res)
+    }
+
+    return(NULL)
+  }
+
+  cat("safe_lda_call_ranked_subset: Exhausted retries; LDA could not be computed after pruning PCs.\n")
+  NULL
+}
+
 
 
 train_feature_pipeline <- function(df, class_col, feature_cols) {
@@ -1730,14 +1995,84 @@ train_feature_pipeline <- function(df, class_col, feature_cols) {
     stop(sprintf("[LDA] Not enough degrees of freedom for LDA (n_pcs=%d < min_required=%d, n_min=%d). Need more samples in smallest class.", n_pcs, min_pcs_for_lda, n_min))
   }
 
-  lda_res <- safe_lda_call(pca_res$x[, 1:n_pcs, drop=FALSE], as.factor(y_labels), min_n_pcs = min_pcs_for_lda)
+  X_pcs_init <- pca_res$x[, 1:n_pcs, drop = FALSE]
+  lda_res <- safe_lda_call(X_pcs_init, as.factor(y_labels), min_n_pcs = min_pcs_for_lda)
 
   if (is.null(lda_res)) {
     stop("[LDA] LDA could not be computed (collinearity / too few samples / invalid feature space)")
   }
+
+  # Optional: prune PCA components with very low discriminative contribution
+  # (as indicated by LDA scaling magnitudes), then refit LDA on the remaining PCs.
+  # This can reduce noise dimensions that add little separation.
+  # Enable PC pruning if the flag is set OR if the user requested <100% LDA contribution.
+  enable_pc_prune <- (exists("ENABLE_LDA_PC_PRUNING") && isTRUE(ENABLE_LDA_PC_PRUNING))
+  pc_cum_keep <- if (exists("LDA_PC_CUM_CONTRIB")) as.numeric(LDA_PC_CUM_CONTRIB) else 0.95
+  pc_cum_keep <- if (is.finite(pc_cum_keep)) pmin(pmax(pc_cum_keep, 0.50), 1.00) else 0.95
+  if (!enable_pc_prune && pc_cum_keep < 0.999) {
+    enable_pc_prune <- TRUE
+    cat(sprintf("[PCA/LDA] Auto-enabling PC pruning because LDA_PC_CUM_CONTRIB=%.2f (<1.0)\n", pc_cum_keep))
+  }
+
+  kept_pc_cols <- seq_len(n_pcs)
+
+  if (isTRUE(enable_pc_prune) && !is.null(lda_res$scaling) && nrow(lda_res$scaling) == n_pcs) {
+    W_pc_init <- lda_res$scaling
+    svd <- lda_res$svd
+    prop <- if (!is.null(svd) && sum(svd) > 0) svd / sum(svd) else rep(1, length(svd))
+
+    if (ncol(W_pc_init) > 1) {
+      n_dim <- min(length(prop), ncol(W_pc_init))
+      pc_strength <- rowSums(abs(W_pc_init[, 1:n_dim, drop = FALSE]) %*% diag(prop[1:n_dim], nrow = n_dim))
+    } else {
+      pc_strength <- abs(W_pc_init[, 1])
+    }
+
+    pc_strength[!is.finite(pc_strength)] <- 0
+    total_strength <- sum(pc_strength)
+
+    if (is.finite(total_strength) && total_strength > 0) {
+      ord <- order(pc_strength, decreasing = TRUE)
+      cum <- cumsum(pc_strength[ord]) / total_strength
+      k_keep <- which(cum >= pc_cum_keep)[1]
+      if (is.na(k_keep)) k_keep <- length(ord)
+      k_keep <- max(min_pcs_for_lda, min(k_keep, n_pcs))
+
+      # Informative audit logging: show why we may keep all PCs even at 90%.
+      cum_at_keep <- cum[k_keep]
+      cum_at_prev <- if (k_keep > 1) cum[k_keep - 1] else NA_real_
+      cat(sprintf("[PCA/LDA] PC pruning target: keep >= %.0f%% of LDA strength; k_keep=%d/%d (cum@k=%.4f, cum@k-1=%s)\n",
+                  100 * pc_cum_keep, k_keep, n_pcs,
+                  ifelse(is.finite(cum_at_keep), cum_at_keep, NA_real_),
+                  ifelse(is.finite(cum_at_prev), sprintf("%.4f", cum_at_prev), "NA")))
+
+      keep_ranked <- ord[seq_len(k_keep)]
+      # Keep order strongest -> weakest for dropping retries
+      keep_ranked <- keep_ranked[order(pc_strength[keep_ranked], decreasing = TRUE)]
+
+      if (length(keep_ranked) < n_pcs) {
+        cat(sprintf("[PCA/LDA] PC pruning enabled: keeping %d/%d PCs to reach %.0f%% LDA contribution (threshold=%.2f).\n",
+                    length(keep_ranked), n_pcs, 100 * pc_cum_keep, pc_cum_keep))
+
+        lda_pruned <- safe_lda_call_ranked_subset(X_pcs_init, as.factor(y_labels), pc_rank = keep_ranked, min_n_pcs = min_pcs_for_lda)
+        if (!is.null(lda_pruned)) {
+          lda_res <- lda_pruned
+          kept_pc_cols <- if (!is.null(lda_pruned$.kept_pc_cols)) lda_pruned$.kept_pc_cols else keep_ranked
+          kept_pc_cols <- as.integer(kept_pc_cols)
+          cat(sprintf("[PCA/LDA] LDA refit after PC pruning: using %d PCs.\n", length(kept_pc_cols)))
+        } else {
+          cat("[PCA/LDA] PC pruning requested but LDA refit failed; falling back to unpruned LDA.\n")
+          kept_pc_cols <- seq_len(n_pcs)
+        }
+      } else {
+        cat(sprintf("[PCA/LDA] PC pruning computed k_keep=%d which equals n_pcs=%d -> no PCs pruned at threshold %.2f\n",
+                    k_keep, n_pcs, pc_cum_keep))
+      }
+    }
+  }
   
   W_pc <- lda_res$scaling
-  R <- pca_res$rotation[, 1:n_pcs, drop=FALSE]
+  R <- pca_res$rotation[, kept_pc_cols, drop = FALSE]
   W_std <- R %*% W_pc
   
   svd <- lda_res$svd
@@ -1755,10 +2090,43 @@ train_feature_pipeline <- function(df, class_col, feature_cols) {
   cat(sprintf("LDA weights (no normalization): min=%.4f, max=%.4f, mean=%.4f\n",
       min(final_weights[final_weights > 0], na.rm=TRUE), max(final_weights, na.rm=TRUE), mean(final_weights, na.rm=TRUE)))
 
+  # Store a deterministic linear transform from standardized feature space -> LDA space.
+  # X_lda = X_z %*% std_to_lda
+  # Where X_z is the post-representation, post-zscore feature vector.
+  n_full_features <- ncol(X_z)
+  n_lda_dims <- ncol(W_pc)
+  std_to_lda <- matrix(0, nrow = n_full_features, ncol = n_lda_dims)
+  std_to_lda[keep_cols, ] <- W_std
+  if (is.null(colnames(std_to_lda))) {
+    colnames(std_to_lda) <- paste0("LD", seq_len(n_lda_dims))
+  }
+  std_to_lda_abs_denom <- colSums(abs(std_to_lda))
+  std_to_lda_abs_denom[!is.finite(std_to_lda_abs_denom) | std_to_lda_abs_denom < 1e-12] <- 1
+
+  # Summarize PC pruning/refit results for logging and downstream inspection
+  n_pcs_original <- n_pcs
+  n_pcs_kept <- length(kept_pc_cols)
+  pruned_pc_indices <- if (n_pcs_original > n_pcs_kept) setdiff(seq_len(n_pcs_original), kept_pc_cols) else integer(0)
+  cat(sprintf("[PCA/LDA] PCs: original=%d, retained=%d, pruned=%d\n", n_pcs_original, n_pcs_kept, length(pruned_pc_indices)))
+
   return(list(
     means = global_means,
     sds = global_sds,
     weights = final_weights,
+    pca_lda = list(
+      feature_space = "pca_lda",
+      keep_cols = keep_cols,
+      n_pcs_original = n_pcs_original,
+      n_pcs_kept = n_pcs_kept,
+      n_pcs_pruned = length(pruned_pc_indices),
+      kept_pc_cols = kept_pc_cols,
+      pruned_pc_indices = pruned_pc_indices,
+      pc_strength = if (exists("pc_strength")) pc_strength else NULL,
+      pc_strength_order = if (exists("ord")) ord else NULL,
+      pc_strength_cum = if (exists("cum")) cum else NULL,
+      std_to_lda = std_to_lda,
+      std_to_lda_abs_denom = std_to_lda_abs_denom
+    ),
     indices = all_feature_cols,
     base_indices = feature_cols,
     l2_normalize = l2_only_mode,
@@ -1868,7 +2236,42 @@ build_pentad_matrix <- function(dly_year, avail_idx, interpolate = TRUE) {
  
 
 
-# PCA-LDA weights are applied only in the solver via feature_weights.
+# PCA-LDA weights are used for diagnostics/plotting.
+# MESMA unmixing can optionally run directly in PCA→LDA feature space by
+# projecting both observations and endmember templates with PARAMS$pca_lda.
+
+compute_pca_lda_feature_weights_from_mask <- function(valid_mask, pca_lda) {
+  if (is.null(pca_lda) || is.null(pca_lda$std_to_lda) || is.null(pca_lda$std_to_lda_abs_denom)) {
+    return(NULL)
+  }
+  A <- pca_lda$std_to_lda
+  denom <- pca_lda$std_to_lda_abs_denom
+
+  if (is.null(valid_mask) || length(valid_mask) == 0) {
+    return(rep(1, ncol(A)))
+  }
+
+  if (length(valid_mask) != nrow(A)) {
+    # Fallback: if mask doesn't match expected dimensionality, treat all as observed.
+    return(rep(1, ncol(A)))
+  }
+
+  # Reliability weight per LD dimension based on how much of its loading mass is observed.
+  numer <- colSums(abs(A[valid_mask, , drop = FALSE]))
+  w <- numer / denom
+  w[!is.finite(w)] <- 0
+  w <- pmin(pmax(w, 0), 1)
+  w
+}
+
+project_vec_to_pca_lda <- function(x_std, pca_lda) {
+  if (is.null(pca_lda) || is.null(pca_lda$std_to_lda)) return(NULL)
+  A <- pca_lda$std_to_lda
+  x <- as.numeric(x_std)
+  if (length(x) != nrow(A)) return(NULL)
+  x[!is.finite(x)] <- 0
+  as.numeric(x %*% A)
+}
 
 
 .run_map <- function(X, FUN, show_pb = TRUE) {
@@ -2677,340 +3080,100 @@ location_bootstrap_msavi <- function(all_coefs, df_tasks, B = BOOTSTRAP_B, seed 
 location_bootstrap_noindex <- function(all_coefs, df_tasks = NULL, B = BOOTSTRAP_B, seed = 123)
   location_bootstrap_index(all_coefs, df_tasks, index_name = "NOINDEX", B = B, seed = seed, noindex = TRUE)
 
-# Precompute B Dirichlet draws for every location-year so that each bootstrap
-# replicate gets a fresh classification perturbation.
-# Returns list(draws = named list of [B x K] matrices, alpha_info = list of alpha metadata).
-precompute_dirichlet_draws <- function(all_coefs, B, conf_matrix, sample_sizes = NULL,
-                                       concentration_scale = DIRICHLET_CONCENTRATION_SCALE) {
-  loc_yr_keys <- unique(paste(all_coefs$location_id, all_coefs$pheno_year, sep = "___"))
-  row_names <- tolower(rownames(conf_matrix))
-  col_names <- colnames(conf_matrix)
-  K <- ncol(conf_matrix)
 
-  draws <- list()
+# Confusion-matrix bootstrapping removed per user request; keep stub for
+# backward compatibility so callers that might still exist do not fail.
 
-  for (key in loc_yr_keys) {
-    parts <- strsplit(key, "___")[[1]]
-    loc_id <- parts[1]
-    p_year <- as.numeric(parts[2])
-
-    mask <- all_coefs$location_id == loc_id & all_coefs$pheno_year == p_year
-    loc_yr_data <- all_coefs[mask, ]
-    if (nrow(loc_yr_data) == 0) next
-
-    # Build fraction vector
-    fracs <- setNames(pmax(as.numeric(loc_yr_data$coef), 0),
-                      tolower(as.character(loc_yr_data$Veg)))
-    fracs[!is.finite(fracs)] <- 0
-    frac_sum <- sum(fracs)
-    if (frac_sum <= 0) next
-    fracs <- fracs / frac_sum
-
-    # Map fraction names to confusion-matrix rows
-    mapped_row <- rep(NA_character_, length(fracs))
-    for (i in seq_along(fracs)) {
-      nm <- names(fracs)[i]
-      nm2 <- sub("^frac_", "", nm)
-      if (nm %in% row_names) mapped_row[i] <- nm
-      else if (nm2 %in% row_names) mapped_row[i] <- nm2
-    }
-
-    keep <- is.finite(fracs) & fracs > 0 & !is.na(mapped_row) & fracs >= 1e-6
-    if (!any(keep)) next
-
-    w <- fracs[keep]; w <- w / sum(w)
-    rows <- mapped_row[keep]
-    row_idx <- match(rows, row_names)
-
-    # Weighted mean confusion row
-    mu <- rep(0, K)
-    for (k in seq_along(row_idx)) {
-      mu <- mu + w[k] * as.numeric(conf_matrix[row_idx[k], ])
-    }
-    mu[!is.finite(mu)] <- 0
-    mu[mu < 1e-6] <- 1e-6
-    mu <- mu / sum(mu)
-
-    # Concentration from validation support
-    n_eff_val <- 20
-    if (!is.null(sample_sizes) && length(sample_sizes) > 0) {
-      ss_names <- tolower(names(sample_sizes))
-      ss <- as.numeric(sample_sizes)
-      ss[!is.finite(ss) | ss < 0] <- 0
-      ss_match <- ss[match(rows, ss_names)]
-      ss_match[is.na(ss_match)] <- 0
-      if (sum(ss_match) > 0) n_eff_val <- sum(w * ss_match)
-    }
-
-    alpha <- max(concentration_scale * n_eff_val, 5)
-    alpha_vec <- alpha * mu
-
-    # Vectorized B Dirichlet draws via rgamma
-    gamma_mat <- matrix(rgamma(B * K, shape = rep(alpha_vec, each = B), rate = 1),
-                        nrow = B, ncol = K)
-    row_sums <- rowSums(gamma_mat)
-    zero_rows <- row_sums < 1e-10
-    if (any(zero_rows)) {
-      gamma_mat[zero_rows, ] <- matrix(rep(mu, sum(zero_rows)),
-                                       nrow = sum(zero_rows), byrow = TRUE)
-      row_sums[zero_rows] <- 1
-    }
-    dirichlet_mat <- gamma_mat / row_sums
-    colnames(dirichlet_mat) <- tolower(col_names)
-
-    draws[[key]] <- dirichlet_mat
-  }
-
-  draws
-}
 
 # Location-based bootstrap for global aggregation
 location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123) {
   set.seed(seed)
+  
+  # Classification-matrix bootstrapping disabled (no per-iteration confusion resampling)
 
-  # =========================================================================
-  # CLASSIFICATION UNCERTAINTY: Precompute B Dirichlet draws per location-year
-  # so each bootstrap replicate gets a fresh classification perturbation.
-  # =========================================================================
-  dirichlet_draws <- NULL
-  if (isTRUE(ENABLE_CLASSIFICATION_UNCERTAINTY) &&
-      exists(".CONFUSION_MATRIX", envir = globalenv())) {
-    conf_matrix <- get(".CONFUSION_MATRIX", envir = globalenv())
-    sample_sizes <- if (exists(".VALIDATION_SAMPLE_SIZES", envir = globalenv())) {
-      get(".VALIDATION_SAMPLE_SIZES", envir = globalenv())
-    } else NULL
-
-    message("[BOOTSTRAP] Classification uncertainty enabled; precomputing B Dirichlet draws per location-year.")
-    dirichlet_draws <- precompute_dirichlet_draws(all_coefs, B, conf_matrix, sample_sizes)
-    message(sprintf("[BOOTSTRAP] Precomputed Dirichlet draws for %d location-years", length(dirichlet_draws)))
-  } else if (isTRUE(ENABLE_CLASSIFICATION_UNCERTAINTY)) {
-    message("[BOOTSTRAP] Classification uncertainty enabled but no confusion matrix available; skipping.")
-  }
-
-  veg_types <- unique(all_coefs$Veg[!is.na(all_coefs$Veg)])
-  years <- sort(unique(all_coefs$pheno_year[!is.na(all_coefs$pheno_year)]))
+  
+  # Prepare Data: Pivot to Wide Format (Location x Class)
+  clean_coefs <- all_coefs[!is.na(all_coefs$coef), ]
+  years <- sort(unique(clean_coefs$pheno_year))
+  all_veg <- unique(clean_coefs$Veg)
+  
   results_list <- list()
-
-  # Guard against empty data
-  if (length(years) == 0 || length(veg_types) == 0) {
-    warning("[BOOTSTRAP] No valid years or veg types - returning empty results")
-    return(data.frame())
-  }
-
-  for (veg in veg_types) {
-    # Filter data for this veg
-    veg_data <- all_coefs[all_coefs$Veg == veg & !is.na(all_coefs$coef), ]
-    if (nrow(veg_data) == 0) next
-
-    # --- POOLED VARIANCE CALCULATION ---
-    # Calculate robust SD of the coefficients across the entire time series (or per year)
-    # to use as a fallback proxy for spatial variability when N is small.
-
-    # Calculate SD per year where we have at least 3 points
-    sd_by_year <- tapply(veg_data$coef, veg_data$pheno_year, function(x) {
-      if (length(x) >= 3) sd(x, na.rm = TRUE) else NA_real_
-    })
-
-    # Use median of yearly SDs as the "typical spatial variability" for this class
-    pooled_sd <- median(sd_by_year, na.rm = TRUE)
-
-    cat(sprintf("[BOOTSTRAP] Veg '%s': Pooled Spatial SD = %.4f (used for N < 8)\n", veg, pooled_sd))
-
-    boot_means <- matrix(NA_real_, nrow = B, ncol = length(years))
-    if (length(years) > 0) {
-      colnames(boot_means) <- as.character(years)
+  
+  for (yr in years) {
+    yr_data <- clean_coefs[clean_coefs$pheno_year == yr, ]
+    if (nrow(yr_data) == 0) next
+    
+    # Pivot Wide
+    locs <- unique(yr_data$location_id)
+    n_locs <- length(locs)
+    
+    # Create matrix F [n_locs x n_veg]
+    F_mat <- matrix(0, nrow = n_locs, ncol = length(all_veg))
+    colnames(F_mat) <- all_veg
+    rownames(F_mat) <- locs
+    
+    # Fill matrix
+    m_loc <- match(yr_data$location_id, locs)
+    m_veg <- match(yr_data$Veg, all_veg)
+    flat_idx <- (m_veg - 1) * n_locs + m_loc
+    F_mat[flat_idx] <- yr_data$coef
+    
+    # Spatial Blocking
+    first_idx <- match(locs, yr_data$location_id)
+    lat_vec <- if ("lat" %in% names(yr_data)) yr_data$lat[first_idx] else rep(NA, n_locs)
+    lon_vec <- if ("lon" %in% names(yr_data)) yr_data$lon[first_idx] else rep(NA, n_locs)
+    
+    block_ids <- rep(1:n_locs)
+    use_blocking <- FALSE
+    
+    if (sum(!is.na(lat_vec) & !is.na(lon_vec)) >= 3) {
+      block_width_km <- 5
+      lat_scale <- 111
+      lon_scale <- 111 * cos(median(lat_vec, na.rm=TRUE) * pi/180)
+      grid_lat <- floor(lat_vec * lat_scale / block_width_km)
+      grid_lon <- floor(lon_vec * lon_scale / block_width_km)
+      block_ids <- paste(grid_lat, grid_lon, sep="_")
+      use_blocking <- TRUE
     }
     
-    n_eff_vec <- numeric(length(years))
-
-    for (i in seq_along(years)) {
-      yr <- years[i]
-      yr_data <- veg_data[veg_data$pheno_year == yr, ]
-      n_obs <- nrow(yr_data)
-
-      # Estimate effective sample size using pairwise spatial correlation
-      # Default: n_eff = n_obs (assume independence if no spatial info)
-      n_eff_est <- n_obs
-      if (n_obs >= 3) {
-        # Check for pre-existing coordinates
-        if (all(c("lat", "lon") %in% names(yr_data))) {
-          lat <- yr_data$lat
-          lon <- yr_data$lon
-        } else if (all(c("latitude", "longitude") %in% names(yr_data))) {
-          lat <- yr_data$latitude
-          lon <- yr_data$longitude
-        } else {
-          # Fallback to parsing location_id
-          parts <- strsplit(as.character(yr_data$location_id), "_")
-          lon_str <- sapply(parts, function(x) if (length(x) >= 2) x[length(x)-1] else NA_character_)
-          lat_str <- sapply(parts, function(x) if (length(x) >= 1) x[length(x)] else NA_character_)
-          lon <- suppressWarnings(as.numeric(lon_str))
-          lat <- suppressWarnings(as.numeric(lat_str))
-        }
-
-        # If we have NAs, try to fill them from gpts_map global if available
-        if ((any(is.na(lon)) || any(is.na(lat))) && exists("gpts_map", envir = globalenv())) {
-           gpts <- get("gpts_map", envir = globalenv())
-           if (all(c("location_id", "lat", "lon") %in% names(gpts))) {
-             missing_idx <- which(is.na(lon) | is.na(lat))
-             m_ids <- as.character(yr_data$location_id[missing_idx])
-             match_idx <- match(m_ids, as.character(gpts$location_id))
-             lon[missing_idx] <- ifelse(is.na(match_idx), lon[missing_idx], gpts$lon[match_idx])
-             lat[missing_idx] <- ifelse(is.na(match_idx), lat[missing_idx], gpts$lat[match_idx])
-           }
-        }
-
-        if (all(is.na(lon)) || all(is.na(lat))) {
-          n_eff_est <- n_obs  # No spatial info: assume independence
-        } else {
-          # Compute pairwise great-circle distances (km) using Haversine
-          valid <- which(!is.na(lon) & !is.na(lat))
-          if (length(valid) >= 3) {
-            coords <- cbind(lon[valid], lat[valid])
-            coefs_valid <- yr_data$coef[valid]
-
-            # Distance matrix in km (Haversine approximation)
-            dist_mat <- compute_haversine_distance_matrix(coords)
-
-            # Estimate spatial correlation range via empirical variogram
-            # Fit exponential model: C(d) = exp(-d / range)
-            # Use Moran-style approach: mean pairwise correlation as function of distance
-            dists <- dist_mat[upper.tri(dist_mat)]
-            coef_diffs_sq <- outer(coefs_valid, coefs_valid, function(a, b) (a - b)^2)
-            gamma_vals <- coef_diffs_sq[upper.tri(coef_diffs_sq)] / 2  # semivariance
-
-            if (length(dists) > 0 && var(coefs_valid, na.rm = TRUE) > 0) {
-              total_var <- var(coefs_valid, na.rm = TRUE)
-              # Estimate range by finding distance at which semivariance reaches ~63% of sill
-              # Simple robust estimate: fit exponential variogram gamma(d) = sill * (1 - exp(-d/range))
-              # Use median-based bins for robustness
-              n_bins <- min(10, max(3, length(dists) %/% 5))
-              bin_breaks <- unique(quantile(dists, probs = seq(0, 1, length.out = n_bins + 1)))
-              if (length(bin_breaks) >= 3) {
-                bin_mid <- (bin_breaks[-length(bin_breaks)] + bin_breaks[-1]) / 2
-                bin_gamma <- numeric(length(bin_mid))
-                for (bb in seq_along(bin_mid)) {
-                  in_bin <- dists >= bin_breaks[bb] & dists < bin_breaks[bb + 1]
-                  bin_gamma[bb] <- if (sum(in_bin) > 0) median(gamma_vals[in_bin]) else NA
-                }
-
-                range_est <- fit_exponential_variogram(bin_mid, bin_gamma, total_var, dists)
-                if (!is.null(range_est)) {
-                  # Compute mean pairwise correlation: C(d) = exp(-d / range)
-                  # Effective n = n / (1 + (n-1) * mean_corr)  [Kish formula]
-                  mean_corr <- mean(exp(-dists / range_est))
-                  n_eff_est <- max(1, n_obs / (1 + (n_obs - 1) * mean_corr))
-                } else {
-                  n_eff_est <- n_obs
-                }
-              } else {
-                n_eff_est <- n_obs
-              }
-            } else {
-              n_eff_est <- n_obs
-            }
-          } else {
-            n_eff_est <- n_obs
-          }
-        }
-      }
-      n_eff_vec[i] <- n_eff_est
-
-      if (n_obs > 0) {
-        # Build per-replicate Dirichlet-perturbed coefficients if available.
-        # perturbed_coef_mat is [B x n_obs]: each row b gives Dirichlet draw b
-        # for each location's coefficient of this veg type.
-        perturbed_coef_mat <- NULL
-        if (!is.null(dirichlet_draws) && n_obs > 0) {
-          loc_keys <- paste(yr_data$location_id, yr_data$pheno_year, sep = "___")
-          veg_lower <- tolower(as.character(veg))
-          perturbed_coef_mat <- matrix(NA_real_, nrow = B, ncol = n_obs)
-          for (j in seq_len(n_obs)) {
-            draw_mat <- dirichlet_draws[[loc_keys[j]]]
-            if (!is.null(draw_mat)) {
-              col_idx <- match(veg_lower, colnames(draw_mat))
-              if (!is.na(col_idx)) {
-                perturbed_coef_mat[, j] <- draw_mat[, col_idx]
-                next
-              }
-            }
-            perturbed_coef_mat[, j] <- yr_data$coef[j]
-          }
-        }
-
-        # DECISION: Small Sample Size vs Large Sample Size
-        if (n_obs < 15) {
-             # --- SMALL SAMPLE: USE POOLED VARIANCE ---
-             mu <- mean(yr_data$coef, na.rm = TRUE)
-             n_eff_i <- n_eff_vec[i]
-
-             if (n_obs >= 2) {
-               sample_sd <- sd(yr_data$coef, na.rm = TRUE)
-               if (is.na(sample_sd) || sample_sd == 0) sample_sd <- pooled_sd
-               se_mean <- sample_sd / sqrt(n_eff_i)
-             } else {
-               se_mean <- pooled_sd / sqrt(n_eff_i)
-             }
-
-             if (!is.null(perturbed_coef_mat)) {
-               # Each replicate gets a Dirichlet-perturbed mean + parametric noise
-               for (b in 1:B) {
-                 perturbed_mu <- mean(perturbed_coef_mat[b, ], na.rm = TRUE)
-                 boot_means[b, i] <- rnorm(1, mean = perturbed_mu, sd = se_mean)
-               }
-             } else {
-               boot_means[, i] <- rnorm(B, mean = mu, sd = se_mean)
-             }
-
-        } else {
-             # --- SUFFICIENT SAMPLE: USE RESAMPLING ---
-             if (!is.null(perturbed_coef_mat)) {
-               for (b in 1:B) {
-                 idx <- sample(seq_len(n_obs), n_obs, replace = TRUE)
-                 boot_means[b, i] <- mean(perturbed_coef_mat[b, idx], na.rm = TRUE)
-               }
-             } else {
-               for (b in 1:B) {
-                 boot_sample <- sample(yr_data$coef, n_obs, replace = TRUE)
-                 boot_means[b, i] <- mean(boot_sample, na.rm = TRUE)
-               }
-             }
-        }
-      }
+    unique_blocks <- unique(block_ids)
+    n_blocks <- length(unique_blocks)
+    block_map <- split(1:n_locs, block_ids)
+    
+    # Bootstrap Loop
+    boot_means <- matrix(NA, nrow=B, ncol=length(all_veg))
+    colnames(boot_means) <- all_veg
+    
+    for (b in 1:B) {
+      # A. Block Resample
+      sampled_blks <- sample(unique_blocks, n_blocks, replace = TRUE)
+      b_idx <- unlist(block_map[sampled_blks])
+      F_b <- F_mat[b_idx, , drop = FALSE]
+      
+      # (classification-matrix adjustment removed)
+      # C. Means
+      boot_means[b, ] <- colMeans(F_b, na.rm=TRUE)
     }
     
-    boot_result <- data.frame(
-      year = years,
-      Veg = veg,
-      n_locations = sapply(years, function(y) sum(veg_data$pheno_year == y & !is.na(veg_data$coef))),
-      global_coef = apply(boot_means, 2, mean, na.rm = TRUE),
-      se = apply(boot_means, 2, sd, na.rm = TRUE),
-      coef_025 = apply(boot_means, 2, quantile, 0.025, na.rm = TRUE),
-      coef_975 = apply(boot_means, 2, quantile, 0.975, na.rm = TRUE),
-      n_eff = n_eff_vec,
-      method = "robust_location_bootstrap"
-    )
-
-    # Print spatial effective sample size diagnostics
-    cat(sprintf("[BOOTSTRAP] Veg '%s': effective sample size (n_eff) across years — mean=%.1f, median=%.1f, min=%.1f, max=%.1f (of n_obs mean=%.1f)\n",
-        veg,
-        mean(n_eff_vec, na.rm = TRUE), median(n_eff_vec, na.rm = TRUE),
-        min(n_eff_vec, na.rm = TRUE), max(n_eff_vec, na.rm = TRUE),
-        mean(sapply(years, function(y) sum(veg_data$pheno_year == y & !is.na(veg_data$coef)))))
-    )
-
-    # NOTE: No post-hoc autocorrelation inflation applied.
-    # For the large-N path (n>=15), the bootstrap already captures between-location variance.
-    # For the small-N path (n<15), spatial autocorrelation is accounted for via n_eff
-    # in the SE calculation above (dividing by sqrt(n_eff) instead of sqrt(n_obs)).
-
-    boot_result$coef_025 <- pmax(0, boot_result$coef_025)
-    boot_result$coef_975 <- pmin(1, boot_result$coef_975)
-    
-    # Clamp the median to prevent negative coverages
-    boot_result$global_coef <- pmax(0, boot_result$global_coef)
-    
-    results_list[[veg]] <- boot_result
+    # Summarize
+    for (v in all_veg) {
+      vals <- boot_means[, v]
+      res_row <- data.frame(
+        year = yr,
+        Veg = v,
+        n_locations = n_locs,
+        global_coef = mean(vals, na.rm=TRUE),
+        se = sd(vals, na.rm=TRUE),
+        coef_025 = quantile(vals, 0.025, na.rm=TRUE),
+        coef_975 = quantile(vals, 0.975, na.rm=TRUE),
+        n_eff = if (use_blocking && n_locs > 0) n_blocks else n_locs,
+        method = "block_bootstrap_confusion_matrix"
+      )
+      res_row$global_coef <- pmax(0, res_row$global_coef)
+      res_row$coef_025 <- pmax(0, res_row$coef_025)
+      res_row$coef_975 <- pmin(1, res_row$coef_975)
+      results_list[[length(results_list) + 1]] <- res_row
+    }
   }
   
   dplyr::bind_rows(results_list)
@@ -3343,11 +3506,15 @@ load_and_prepare_inference_data <- function() {
 
 
   # =============================================================================
-  # FCLS: Fully Constrained Least Squares Solver
-  # Enforces BOTH non-negativity AND sum-to-one constraints simultaneously
-  # Uses iterative active-set method (Heinz & Chang, 2001)
+  # FCLS: Fully Constrained Least Squares Solver (with optional L1 sparsity)
+  # Standard mode: min ||Ef-y||²  s.t. sum(f)=1, f>=0
+  # Sparse mode:   min ||Ef-y||² + λ·sum(f)  s.t. sum(f)<=1, f>=0
+  #   When USE_SPARSE_UNMIXING is TRUE, the sum-to-one equality is relaxed to
+  #   sum-to-at-most-one, and an L1 penalty λ·||f||₁ = λ·sum(f) (since f>=0)
+  #   drives irrelevant endmembers to exactly 0. The solution is NOT renormalized,
+  #   so sum(f) < 1 is possible (residual = unexplained fraction).
   # =============================================================================
-  
+
   solve_weights_fcls <- function(E, y, feature_weights = NULL, max_iter = 500, tol = 1e-8) {
     if (is.null(E) || ncol(E) < 1) return(NULL)
 
@@ -3375,162 +3542,266 @@ load_and_prepare_inference_data <- function() {
       base_weights <- rep(1, n_bands)
     }
 
-    # Check if Huber loss is enabled
-    use_huber <- exists("USE_HUBER_LOSS") && isTRUE(USE_HUBER_LOSS)
+    # Determine sparse unmixing mode
+    sparse_mode <- exists("USE_SPARSE_UNMIXING") && isTRUE(USE_SPARSE_UNMIXING)
+    lambda_l1 <- if (sparse_mode && exists("SPARSE_LAMBDA")) SPARSE_LAMBDA else 0
 
-    if (use_huber) {
-      # === HUBER LOSS via IRLS (Iteratively Reweighted Least Squares) ===
-      # Huber loss: L(r) = 0.5*r^2 if |r| <= delta, else delta*(|r| - 0.5*delta)
-      # IRLS weights: w_i = 1 if |r_i| <= delta, else delta/|r_i|
+    E_w <- E_fit * base_weights
+    y_w <- y_fit * base_weights
 
-      huber_delta <- if (exists("HUBER_DELTA")) HUBER_DELTA else 1.345
-      huber_max_iter <- if (exists("HUBER_MAX_ITER")) HUBER_MAX_ITER else 20
-      huber_tol <- if (exists("HUBER_TOL")) HUBER_TOL else 1e-4
+    # quadprog solves: min 1/2 b^T Dmat b - dvec^T b
+    # Quadratic term: Dmat = 2 * E'E
+    # Linear term:    dvec = 2 * E'y  (standard)  or  2*E'y - λ (sparse)
+    Dmat <- 2 * crossprod(E_w)
+    dvec <- 2 * as.numeric(crossprod(E_w, y_w))
 
-      # Initialize with uniform weights for IRLS
-      irls_weights <- rep(1, n_bands)
-      w_qp_prev <- rep(1/n_endmembers, n_endmembers)
+    # Scale QP to prevent inconsistent constraints
+    qp_scale <- mean(diag(Dmat))
+    if(is.na(qp_scale) || qp_scale < 1e-12) qp_scale <- 1.0
 
-      for (irls_iter in 1:huber_max_iter) {
-        # Combine base weights with IRLS weights
-        combined_weights <- base_weights * irls_weights
-        E_w <- E_fit * combined_weights
-        y_w <- y_fit * combined_weights
+    Dmat <- Dmat / qp_scale
+    dvec <- dvec / qp_scale
 
-        # Solve weighted QP
-        Dmat <- 2 * crossprod(E_w)
-        dvec <- 2 * crossprod(E_w, y_w)
+    # L1 penalty: subtract λ/qp_scale from dvec (equivalent to adding λ·sum(f) to objective)
+    if (sparse_mode && lambda_l1 > 0) {
+      dvec <- dvec - lambda_l1 / qp_scale
+    }
 
-        qp_scale <- mean(diag(Dmat))
-        if(is.na(qp_scale) || qp_scale < 1e-12) qp_scale <- 1.0
+    # Add ridge to diagonal for numerical stability (PD requirement)
+    ridge <- 1e-6
+    Dmat <- Dmat + diag(n_endmembers) * ridge
+    Dmat <- (Dmat + t(Dmat)) / 2
 
-        Dmat <- Dmat / qp_scale
-        dvec <- dvec / qp_scale
+    # Constraints: A^T b >= b_0
+    if (sparse_mode && lambda_l1 > 0) {
+      # Sparse: sum(f) <= 1, f >= 0
+      # -sum(f) >= -1  =>  A^T row = [-1,...,-1], b_0 = -1
+      # f >= 0         =>  I rows
+      Amat <- cbind(-rep(1, n_endmembers), diag(n_endmembers))
+      bvec <- c(-1, rep(0, n_endmembers))
+      meq <- 0  # all inequality constraints
+    } else {
+      # Standard FCLS: sum(f) = 1, f >= 0
+      Amat <- cbind(rep(1, n_endmembers), diag(n_endmembers))
+      bvec <- c(1, rep(0, n_endmembers))
+      meq <- 1  # first constraint is equality
+    }
 
-        ridge <- 1e-6
-        Dmat <- Dmat + diag(n_endmembers) * ridge
-        Dmat <- (Dmat + t(Dmat)) / 2
+    res_qp <- tryCatch({
+      quadprog::solve.QP(Dmat, dvec, Amat, bvec, meq = meq)
+    }, error = function(e) {
+      if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG] Quadprog failed in solve_weights_fcls: %s\n", e$message))
+      if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG] Dmat dim: %s, dvec length: %d, Amat dim: %s, bvec length: %d\n",
+                  paste(dim(Dmat), collapse="x"), length(dvec), paste(dim(Amat), collapse="x"), length(bvec)))
+      e
+    })
 
-        Amat <- cbind(rep(1, n_endmembers), diag(n_endmembers))
-        bvec <- c(1, rep(0, n_endmembers))
+    if (!inherits(res_qp, "error")) {
+      w_qp <- res_qp$solution
+      w_qp[!is.finite(w_qp)] <- 0
+      w_qp[w_qp < 0] <- 0
 
-        res_qp <- tryCatch({
-          quadprog::solve.QP(Dmat, dvec, Amat, bvec, meq = 1)
-        }, error = function(e) e)
-
-        if (inherits(res_qp, "error")) {
-          stop(sprintf("[QP] quadprog::solve.QP failed in solve_weights_fcls (Huber IRLS): %s", res_qp$message))
-        }
-
-        w_qp <- res_qp$solution
-        w_qp[!is.finite(w_qp)] <- 0
-        w_qp[w_qp < 0] <- 0
+      if (!sparse_mode || lambda_l1 == 0) {
+        # Standard FCLS: renormalize to sum-to-one
         w_sum <- sum(w_qp, na.rm = TRUE)
         if(w_sum > 0) w_qp <- w_qp / w_sum else w_qp <- rep(1/n_endmembers, n_endmembers)
-
-        # Calculate residuals
-        pred <- as.numeric(E_fit %*% w_qp)
-        resid <- y_fit - pred
-
-        # Check convergence
-        if (max(abs(w_qp - w_qp_prev)) < huber_tol) {
-          break
-        }
-        w_qp_prev <- w_qp
-
-        # Update IRLS weights based on Huber loss
-        # Scale residuals by MAD for robust delta scaling
-        mad_resid <- mad(resid, na.rm = TRUE)
-        if (!is.finite(mad_resid) || mad_resid < 1e-10) mad_resid <- 1
-        scaled_resid <- abs(resid) / mad_resid
-
-        # Huber weights: 1 for small residuals, delta/|r| for large ones
-        irls_weights <- ifelse(scaled_resid <= huber_delta,
-                               1,
-                               huber_delta / pmax(scaled_resid, 1e-10))
-        irls_weights[!is.finite(irls_weights)] <- 1
       }
+      # Sparse mode: do NOT renormalize — sum(f) < 1 is intentional
 
-      # Final solution
+      # Calculate RMSE
       pred <- as.numeric(E_fit %*% w_qp)
       resid <- y_fit - pred
+      rmse <- sqrt(mean(resid^2))
 
-      # Compute Huber loss instead of RMSE
-      mad_resid <- mad(resid, na.rm = TRUE)
-      if (!is.finite(mad_resid) || mad_resid < 1e-10) mad_resid <- 1
-      scaled_resid <- abs(resid) / mad_resid
-      huber_losses <- ifelse(scaled_resid <= huber_delta,
-                             0.5 * (resid/mad_resid)^2,
-                             huber_delta * (scaled_resid - 0.5 * huber_delta))
-      loss <- sqrt(mean(huber_losses))  # Return sqrt for consistency with RMSE scale
+      return(list(w = w_qp, rmse = rmse, residuals = resid,
+                  loss_type = if (sparse_mode && lambda_l1 > 0) "sparse_fcls" else "rmse"))
+    }
 
-      return(list(w = w_qp, rmse = loss, residuals = resid, loss_type = "huber"))
+    stop(sprintf("[QP] quadprog::solve.QP failed in solve_weights_fcls: %s", res_qp$message))
+  }
 
+  # =============================================================================
+  # IWLMM Solver — Inequality-constrained Weighted Linear Mixture Model
+  # (Li et al. 2021)
+  #
+  # Extends FCLS by allowing bounded perturbations ΔM to each endmember:
+  #   min_{f, ΔM}  Σ_i w_i * (y_i - (M_i + ΔM_i) f)^2  + λ_δ * ||ΔM||^2
+  #   s.t.  sum(f) = 1,  f >= 0,  -b_{i,j} <= ΔM_{i,j} <= b_{i,j}
+  #
+  # Solved via alternating optimization:
+  #   Step A: fix ΔM, solve for f  (standard FCLS QP)
+  #   Step B: fix f,  solve for ΔM (bounded least squares, closed-form per feature)
+  #
+  # E:       Features x Endmembers endmember matrix (columns = endmember spectra)
+  # y:       Features-length observation vector
+  # bounds:  Features x Endmembers matrix of perturbation bounds (>= 0)
+  #          Derived as IWLMM_BOUND_SIGMA * within-class SD per feature per endmember.
+  #          If NULL, falls back to standard FCLS (no perturbation).
+  # feature_weights: optional PCA-LDA weights (length = n_features)
+  # =============================================================================
+  solve_weights_iwlmm <- function(E, y, bounds = NULL, feature_weights = NULL) {
+    if (is.null(E) || ncol(E) < 1) return(NULL)
+
+    # Fall back to FCLS if no bounds provided or IWLMM disabled
+    if (is.null(bounds) || !exists("USE_IWLMM") || !isTRUE(USE_IWLMM)) {
+      return(solve_weights_fcls(E, y, feature_weights = feature_weights))
+    }
+
+    E_fit <- as.matrix(E)
+    y_fit <- as.numeric(y)
+    n_bands <- nrow(E_fit)
+    n_em <- ncol(E_fit)
+
+    if (length(y_fit) != n_bands) {
+      if (length(y_fit) > n_bands) y_fit <- y_fit[1:n_bands] else y_fit <- c(y_fit, rep(0, n_bands - length(y_fit)))
+    }
+    y_fit[!is.finite(y_fit)] <- 0
+    E_fit[!is.finite(E_fit)] <- 0
+
+    # Ensure bounds matrix matches dimensions
+    bounds <- as.matrix(bounds)
+    if (nrow(bounds) != n_bands || ncol(bounds) != n_em) {
+      return(solve_weights_fcls(E, y, feature_weights = feature_weights))
+    }
+    bounds[!is.finite(bounds) | bounds < 0] <- 0
+
+    # Base feature weights
+    if (!is.null(feature_weights) && length(feature_weights) == n_bands) {
+      feature_weights <- as.numeric(feature_weights)
+      feature_weights[!is.finite(feature_weights)] <- 0
+      base_w <- pmax(feature_weights, 0)
     } else {
-      # === STANDARD RMSE (Original behavior) ===
-      E_w <- E_fit * base_weights
-      y_w <- y_fit * base_weights
+      base_w <- rep(1, n_bands)
+    }
 
-      # --- DEDICATED QP SOLVER (ALWAYS used) ---
-      # Problem: min ||Ex - y||^2  s.t. sum(x)=1, x>=0
-      # ||Ex - y||^2 = x'E'Ex - 2y'Ex + y'y
-      # quadprog solves: min 1/2 b^T Dmat b - dvec^T b
-      # Dmat = 2 * E'E, dvec = 2 * E'y
+    # Config
+    max_iter <- if (exists("IWLMM_MAX_ITER")) IWLMM_MAX_ITER else 15L
+    conv_tol <- if (exists("IWLMM_TOL")) IWLMM_TOL else 1e-4
+    lambda_delta <- if (exists("IWLMM_REGULARIZE_DELTA")) IWLMM_REGULARIZE_DELTA else 0.01
 
-      Dmat <- 2 * crossprod(E_w)
-      dvec <- 2 * crossprod(E_w, y_w)
+    # L1 sparsity config (consistent with solve_weights_fcls)
+    sparse_mode <- exists("USE_SPARSE_UNMIXING") && isTRUE(USE_SPARSE_UNMIXING)
+    lambda_l1 <- if (sparse_mode && exists("SPARSE_LAMBDA")) SPARSE_LAMBDA else 0
 
-      # Scale QP to prevent inconsistent constraints
+    # Initialize: ΔM = 0, solve for f using standard FCLS
+    delta_M <- matrix(0, nrow = n_bands, ncol = n_em)
+    f_prev <- rep(1 / n_em, n_em)
+
+    for (iter in seq_len(max_iter)) {
+      # --- Step A: fix ΔM, solve for f (FCLS on perturbed endmembers) ---
+      E_perturbed <- E_fit + delta_M
+      E_pw <- E_perturbed * base_w
+      y_pw <- y_fit * base_w
+
+      Dmat <- 2 * crossprod(E_pw)
+      dvec <- 2 * as.numeric(crossprod(E_pw, y_pw))
+
       qp_scale <- mean(diag(Dmat))
-      if(is.na(qp_scale) || qp_scale < 1e-12) qp_scale <- 1.0
-
+      if (is.na(qp_scale) || qp_scale < 1e-12) qp_scale <- 1.0
       Dmat <- Dmat / qp_scale
       dvec <- dvec / qp_scale
 
-      # Add stronger ridge to diagonal for numerical stability (PD requirement)
-      ridge <- 1e-6
-      Dmat <- Dmat + diag(n_endmembers) * ridge
-
-      # Ensure Dmat is symmetric
-      Dmat <- (Dmat + t(Dmat)) / 2
-
-      # Constraints: A^T b >= b_0
-      # 1. sum(x) = 1  => use meq=1. Row 1 of A^T is [1, 1, ..., 1].
-      # 2. x >= 0      => I * x >= 0. Rows 2..N+1 of A^T are I.
-
-      Amat <- cbind(rep(1, n_endmembers), diag(n_endmembers))
-      bvec <- c(1, rep(0, n_endmembers))
-
-      res_qp <- tryCatch({
-        quadprog::solve.QP(Dmat, dvec, Amat, bvec, meq = 1)
-      }, error = function(e) {
-        if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG] Quadprog failed in solve_weights_fcls: %s\n", e$message))
-        if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG] Dmat dim: %s, dvec length: %d, Amat dim: %s, bvec length: %d\n",
-                    paste(dim(Dmat), collapse="x"), length(dvec), paste(dim(Amat), collapse="x"), length(bvec)))
-        if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG] Dmat eigenvalues: %s\n", paste(eigen(Dmat)$values[1:5], collapse=", ")))
-        e
-      })
-
-      if (!inherits(res_qp, "error")) {
-        w_qp <- res_qp$solution
-        w_qp[!is.finite(w_qp)] <- 0
-        w_qp[w_qp < 0] <- 0
-        w_sum <- sum(w_qp, na.rm = TRUE)
-        if(w_sum > 0) w_qp <- w_qp / w_sum else w_qp <- rep(1/n_endmembers, n_endmembers)
-
-        # Calculate RMSE for consistency
-        pred <- as.numeric(E_fit %*% w_qp)
-        resid <- y_fit - pred
-        rmse <- sqrt(mean(resid^2))
-
-        return(list(w = w_qp, rmse = rmse, residuals = resid, loss_type = "rmse"))
+      # L1 penalty on fractions
+      if (sparse_mode && lambda_l1 > 0) {
+        dvec <- dvec - lambda_l1 / qp_scale
       }
 
-      stop(sprintf("[QP] quadprog::solve.QP failed in solve_weights_fcls: %s", res_qp$message))
+      Dmat <- Dmat + diag(n_em) * 1e-6
+      Dmat <- (Dmat + t(Dmat)) / 2
+
+      if (sparse_mode && lambda_l1 > 0) {
+        # Sparse: sum(f) <= 1, f >= 0
+        Amat <- cbind(-rep(1, n_em), diag(n_em))
+        bvec <- c(-1, rep(0, n_em))
+        meq <- 0
+      } else {
+        Amat <- cbind(rep(1, n_em), diag(n_em))
+        bvec <- c(1, rep(0, n_em))
+        meq <- 1
+      }
+
+      res_qp <- tryCatch(
+        quadprog::solve.QP(Dmat, dvec, Amat, bvec, meq = meq),
+        error = function(e) e
+      )
+
+      if (inherits(res_qp, "error")) {
+        return(solve_weights_fcls(E, y, feature_weights = feature_weights))
+      }
+
+      f_new <- res_qp$solution
+      f_new[!is.finite(f_new)] <- 0
+      f_new[f_new < 0] <- 0
+      if (!sparse_mode || lambda_l1 == 0) {
+        f_sum <- sum(f_new)
+        if (f_sum > 0) f_new <- f_new / f_sum else f_new <- rep(1 / n_em, n_em)
+      }
+
+      # --- Step B: fix f, solve for ΔM (bounded per feature) ---
+      # For each feature i:  min_δ  w_i * (r_i - Σ_j δ_{i,j} * f_j)^2 + λ_δ * Σ_j δ_{i,j}^2
+      #   s.t.  -b_{i,j} <= δ_{i,j} <= b_{i,j}
+      # Residual with current endmembers (no perturbation):
+      #   r_i = y_i - Σ_j M_{i,j} * f_j
+      r_base <- y_fit - E_fit %*% f_new  # residual from original endmembers
+
+      # Iterative coordinate-descent over endmembers for each feature.
+      # For feature i, the residual to explain is r_i = y_i - M_i * f.
+      # We distribute it across endmembers via coordinate descent:
+      #   for each j: δ_{i,j} = clip( f_j * r_remaining / (f_j^2 + λ_δ/w_i), -b, b )
+      # This lets bounds on one endmember redirect residual to others.
+      cd_passes <- 3L  # coordinate descent passes per feature
+      for (i in seq_len(n_bands)) {
+        wi <- base_w[i]
+        if (wi < 1e-12) {
+          delta_M[i, ] <- 0
+          next
+        }
+        ri <- as.numeric(r_base[i])
+        delta_row <- delta_M[i, ]  # warm-start from previous outer iteration
+        reg <- lambda_delta / wi
+
+        for (pass in seq_len(cd_passes)) {
+          for (j in seq_len(n_em)) {
+            fj <- f_new[j]
+            if (abs(fj) < 1e-12) { delta_row[j] <- 0; next }
+            # Partial residual: undo contribution of current δ_j
+            r_partial <- ri - sum(delta_row * f_new) + delta_row[j] * fj
+            # Optimal unconstrained update for j alone
+            delta_j <- fj * r_partial / (fj^2 + reg)
+            # Clip to bounds
+            delta_row[j] <- max(-bounds[i, j], min(bounds[i, j], delta_j))
+          }
+        }
+        delta_M[i, ] <- delta_row
+      }
+
+      # Check convergence
+      if (max(abs(f_new - f_prev)) < conv_tol) break
+      f_prev <- f_new
     }
+
+    # Final prediction and residuals
+    E_final <- E_fit + delta_M
+    pred <- as.numeric(E_final %*% f_new)
+    resid <- y_fit - pred
+    rmse <- sqrt(mean(resid^2))
+
+    # Also compute how much perturbation was used (diagnostic)
+    delta_norm <- sqrt(mean(delta_M^2))
+
+    return(list(
+      w = f_new,
+      rmse = rmse,
+      residuals = resid,
+      loss_type = "iwlmm",
+      delta_M = delta_M,
+      delta_norm = delta_norm,
+      n_iter = iter
+    ))
   }
 
   # Batch FCLS Solver using Quadprog (Optimization for GA/Grid Search)
+  # Supports L1 sparsity when USE_SPARSE_UNMIXING is TRUE.
   # E: Features x Endmembers matrix
   # Y: Samples x Features matrix
   # Returns: Samples x Endmembers weight matrix
@@ -3540,6 +3811,9 @@ load_and_prepare_inference_data <- function() {
     n_samples <- nrow(Y)
     if (n_samples == 0) return(matrix(0, 0, n_endmembers))
 
+    sparse_mode <- exists("USE_SPARSE_UNMIXING") && isTRUE(USE_SPARSE_UNMIXING)
+    lambda_l1 <- if (sparse_mode && exists("SPARSE_LAMBDA")) SPARSE_LAMBDA else 0
+
     # Convert Y to Features x Samples for matrix math
     Y_t <- t(Y)
 
@@ -3547,9 +3821,6 @@ load_and_prepare_inference_data <- function() {
     if (!is.null(feature_weights) && length(feature_weights) == nrow(E)) {
       w <- pmax(feature_weights, 0)
       w[!is.finite(w)] <- 0
-
-      # Apply weights directly: E_w = W * E, Y_w = W * Y
-      # Since W is diagonal, just multiply rows
       E_fit <- E * w
       Y_fit <- Y_t * w
     } else {
@@ -3558,38 +3829,43 @@ load_and_prepare_inference_data <- function() {
     }
 
     # Precompute constant QP matrices
-    # Dmat = 2 * E'E
     Dmat <- 2 * crossprod(E_fit)
 
-    # Scale QP problem to improve numerical stability for quadprog
     qp_scale <- mean(diag(Dmat))
     if(is.na(qp_scale) || qp_scale < 1e-12) qp_scale <- 1.0
 
     Dmat <- Dmat / qp_scale
 
-    # Add stronger ridge
-    ridge <- 1e-6 # Relative to scaled matrix
+    ridge <- 1e-6
     Dmat <- Dmat + diag(n_endmembers) * ridge
-    # Ensure symmetric
     Dmat <- (Dmat + t(Dmat)) / 2
 
-    # Amat: [1s; I]
-    Amat <- cbind(rep(1, n_endmembers), diag(n_endmembers))
-    bvec <- c(1, rep(0, n_endmembers))
+    # Constraints depend on sparse mode
+    if (sparse_mode && lambda_l1 > 0) {
+      # Sparse: sum(f) <= 1, f >= 0
+      Amat <- cbind(-rep(1, n_endmembers), diag(n_endmembers))
+      bvec <- c(-1, rep(0, n_endmembers))
+      meq <- 0
+    } else {
+      # Standard: sum(f) = 1, f >= 0
+      Amat <- cbind(rep(1, n_endmembers), diag(n_endmembers))
+      bvec <- c(1, rep(0, n_endmembers))
+      meq <- 1
+    }
 
-    # Precompute all linear terms: dvec = 2 * E'y
-    # Dvecs: Endmembers x Samples
-    # Must also be scaled by same factor
+    # Precompute all linear terms: dvec = 2 * E'y / qp_scale
     Dvecs <- (2 * crossprod(E_fit, Y_fit)) / qp_scale
+
+    # L1 penalty offset (applied uniformly to all samples)
+    l1_offset <- if (sparse_mode && lambda_l1 > 0) lambda_l1 / qp_scale else 0
 
     w_out <- matrix(0, nrow=n_samples, ncol=n_endmembers)
 
-    # Loop over samples - solve.QP is fast when Dmat is precomputed
     for(i in 1:n_samples) {
-      dvec <- Dvecs[, i]
+      dvec <- Dvecs[, i] - l1_offset
 
       res <- tryCatch({
-        quadprog::solve.QP(Dmat, dvec, Amat, bvec, meq=1)
+        quadprog::solve.QP(Dmat, dvec, Amat, bvec, meq=meq)
       }, error = function(e) {
         e
       })
@@ -3598,8 +3874,10 @@ load_and_prepare_inference_data <- function() {
         w <- res$solution
         w[!is.finite(w)] <- 0
         w[w < 0] <- 0
-        s <- sum(w)
-        if(s > 0) w <- w / s else w <- rep(1/n_endmembers, n_endmembers)
+        if (!sparse_mode || lambda_l1 == 0) {
+          s <- sum(w)
+          if(s > 0) w <- w / s else w <- rep(1/n_endmembers, n_endmembers)
+        }
         w_out[i, ] <- w
       } else {
         stop(sprintf("[QP] quadprog::solve.QP failed in solve_batch_fcls (sample %d/%d): %s", i, n_samples, res$message))
@@ -3744,6 +4022,29 @@ load_and_prepare_inference_data <- function() {
     # Solve a combination of variant indices for a SUBSET of vegetation types
     # veg_subset: character vector of vegetation type names to include
     # variant_indices: integer vector of variant indices (one per veg type in subset)
+    # Precompute per-class within-class SD for IWLMM perturbation bounds
+    # Each entry is a numeric vector of length n_features (SD across all variant vecs)
+    iwlmm_active <- exists("USE_IWLMM") && isTRUE(USE_IWLMM)
+    iwlmm_class_sd <- list()
+    if (iwlmm_active) {
+      bound_sigma <- if (exists("IWLMM_BOUND_SIGMA")) IWLMM_BOUND_SIGMA else 2.0
+      for (v in full_veg_names) {
+        cands <- top_variants[[v]]
+        if (is.null(cands) || length(cands) < 2) {
+          iwlmm_class_sd[[v]] <- NULL
+          next
+        }
+        Mv <- do.call(rbind, lapply(cands, function(z) as.numeric(z$vec)))
+        if (is.null(Mv) || nrow(Mv) < 2) {
+          iwlmm_class_sd[[v]] <- NULL
+          next
+        }
+        sds <- apply(Mv, 2, sd, na.rm = TRUE)
+        sds[!is.finite(sds)] <- 0
+        iwlmm_class_sd[[v]] <- sds
+      }
+    }
+
     solve_combo_subset <- function(veg_subset, variant_indices) {
       cols <- list()
       ids <- character(length(veg_subset))
@@ -3762,7 +4063,28 @@ load_and_prepare_inference_data <- function() {
       E <- do.call(cbind, cols)
       if (is.null(E) || ncol(E) < 1) return(NULL)
 
-      res <- solve_weights_fcls(E, y_target, feature_weights = if (!is.null(feature_weights) && length(feature_weights) == nrow(E)) feature_weights else NULL)
+      fw <- if (!is.null(feature_weights) && length(feature_weights) == nrow(E)) feature_weights else NULL
+
+      # Use IWLMM if active and we have bounds for at least one class
+      if (iwlmm_active) {
+        # Build bounds matrix: n_features x n_endmembers
+        bounds_mat <- matrix(0, nrow = nrow(E), ncol = ncol(E))
+        for (v_idx in seq_along(veg_subset)) {
+          v <- veg_subset[v_idx]
+          cls_sd <- iwlmm_class_sd[[v]]
+          if (!is.null(cls_sd) && length(cls_sd) == nrow(E)) {
+            bounds_mat[, v_idx] <- bound_sigma * cls_sd
+          }
+        }
+        # Only use IWLMM if at least some bounds are nonzero
+        if (any(bounds_mat > 0)) {
+          res <- solve_weights_iwlmm(E, y_target, bounds = bounds_mat, feature_weights = fw)
+        } else {
+          res <- solve_weights_fcls(E, y_target, feature_weights = fw)
+        }
+      } else {
+        res <- solve_weights_fcls(E, y_target, feature_weights = fw)
+      }
       if (is.null(res)) return(NULL)
 
       # Expand weights to full veg list (zeros for excluded types)
@@ -3782,67 +4104,26 @@ load_and_prepare_inference_data <- function() {
       return(res)
     }
 
-    # --- Always use ALL vegetation types, one prototype per class ---
-    # Try all prototype combinations across classes to find the best fit.
+    # --- All vegetation types, one prototype per class ---
+    # Sparsity is handled inside the solver (L1 penalty drives irrelevant weights to 0).
+    # Here we just search over prototype combinations.
     n_variants_per_veg <- sapply(top_variants, length)
 
     global_best_res <- NULL
     global_best_score <- Inf
 
-    # Single fixed subset: all classes must participate
     veg_subset <- full_veg_names
-    n_in_subset <- length(veg_subset)
     n_variants_subset <- n_variants_per_veg[veg_subset]
-    total_combos <- as.numeric(prod(n_variants_subset))
 
-    if (total_combos <= 500) {
-      # Full exhaustive search (typical: max 4^4 = 256 with MAX_K_EAR=4)
-      combos <- expand.grid(lapply(n_variants_subset, seq_len), KEEP.OUT.ATTRS = FALSE)
-      for (i in seq_len(nrow(combos))) {
-        r <- solve_combo_subset(veg_subset, as.integer(combos[i, ]))
-        if (!is.null(r) && r$score < global_best_score) {
-          global_best_score <- r$score
-          global_best_res <- r
-        }
-      }
-    } else {
-      # Coarse search + coordinate descent for large search spaces
-      TOPK_COARSE <- 3
-      coarse_idx <- lapply(n_variants_subset, function(n) seq_len(min(TOPK_COARSE, n)))
-      combos <- expand.grid(coarse_idx, KEEP.OUT.ATTRS = FALSE)
-      best_idx <- rep(1, n_in_subset)
-
-      for (i in seq_len(nrow(combos))) {
-        r <- solve_combo_subset(veg_subset, as.integer(combos[i, ]))
-        if (!is.null(r) && r$score < global_best_score) {
-          global_best_score <- r$score
-          global_best_res <- r
-          best_idx <- as.integer(combos[i, ])
-        }
-      }
-
-      # Coordinate descent refinement
-      curr_idx <- best_idx
-      improved <- TRUE
-      while (improved) {
-        improved <- FALSE
-        for (k in seq_len(n_in_subset)) {
-          for (v_opt in seq_len(n_variants_subset[k])) {
-            if (v_opt == curr_idx[k]) next
-            t_idx <- curr_idx
-            t_idx[k] <- v_opt
-            r <- solve_combo_subset(veg_subset, t_idx)
-            if (!is.null(r) && r$score < global_best_score) {
-              global_best_score <- r$score
-              global_best_res <- r
-              curr_idx <- t_idx
-              improved <- TRUE
-            }
-          }
-        }
+    combos <- expand.grid(lapply(n_variants_subset, seq_len), KEEP.OUT.ATTRS = FALSE)
+    for (i in seq_len(nrow(combos))) {
+      r <- solve_combo_subset(veg_subset, as.integer(combos[i, ]))
+      if (!is.null(r) && r$score < global_best_score) {
+        global_best_score <- r$score
+        global_best_res <- r
       }
     }
-    
+
     if (is.null(global_best_res)) return(NULL)
 
     # [MODIFIED] Return only the single best model as top_models per request
@@ -3856,7 +4137,10 @@ load_and_prepare_inference_data <- function() {
       ids = global_best_res$ids,
       residuals = global_best_res$residuals,
       E_best = global_best_res$E,
-      top_models = top_models
+      top_models = top_models,
+      loss_type = if (!is.null(global_best_res$loss_type)) global_best_res$loss_type else "rmse",
+      delta_norm = global_best_res$delta_norm,
+      veg_subset = global_best_res$veg_subset
     ))
   }
 
@@ -4206,8 +4490,23 @@ load_and_prepare_inference_data <- function() {
           labels_test <- target_set$labels
           n_test <- nrow(Y_test)
 
+          # Unmixing always happens in PCA→LDA feature space.
+          if (is.null(params$pca_lda) || is.null(params$pca_lda$std_to_lda) || !is.matrix(params$pca_lda$std_to_lda)) {
+            stop("[PCA/LDA] Missing std_to_lda transform; PCA→LDA unmixing is required for optimization scoring")
+          }
+          A <- params$pca_lda$std_to_lda
+          if (nrow(A) != nrow(M) || nrow(A) != ncol(Y_test)) {
+            stop(sprintf("[PCA/LDA] Dimension mismatch in scoring projection: nrow(A)=%d, nrow(M)=%d, ncol(Y_test)=%d",
+                         nrow(A), nrow(M), ncol(Y_test)))
+          }
+
+          # Project both templates and samples into PCA→LDA space.
+          M_lda <- t(t(M) %*% A)         # [n_lda x n_endmembers]
+          Y_lda <- Y_test %*% A          # [n_samples x n_lda]
+          w_lda <- rep(1, ncol(A))
+
           # Batch process using solve_batch_fcls for speed
-          all_coefs <- solve_batch_fcls(M, Y_test, params$weights)
+          all_coefs <- solve_batch_fcls(M_lda, Y_lda, w_lda)
 
           # Compute average correctly predicted fraction for vegetation classes
           # Row-normalized after barren subtraction: veg_frac_true / sum(veg_fracs)
@@ -4332,7 +4631,6 @@ load_and_prepare_inference_data <- function() {
 
       # NOTE: Confusion matrix is computed AFTER threshold optimization (Step 3)
       # to use the final optimized weights. Skipping here.
-      cat("\n    [CLUSTER] Confusion matrix will be computed after threshold optimization (Step 3)\n")
 
       # Return best combination (or NULL if none found)
       return(best_combo)
@@ -4446,23 +4744,27 @@ load_and_prepare_inference_data <- function() {
       month_breaks_pentad <- month_breaks_pentad[keep]
       month_labels <- pheno_month_labels[keep]
 
-      # Build per-index significance mask from feature_weights (0 = pruned / non-significant)
-      sig_mask <- NULL
+      # Per-index backpropagated timestep weights (feature_weights). These are used to
+      # render a weight backdrop and to optionally skip fully-zero indices.
+      weights_by_index <- NULL
       if (!is.null(feature_weights) && length(feature_weights) == length(indices) * TEMPORAL_BUDGET) {
-        sig_mask <- list()
+        weights_by_index <- list()
         for (k in seq_len(length(indices))) {
           w_start <- (k - 1) * TEMPORAL_BUDGET + 1
           w_end <- k * TEMPORAL_BUDGET
-          sig_mask[[indices[k]]] <- feature_weights[w_start:w_end] > 0
+          wv <- as.numeric(feature_weights[w_start:w_end])
+          wv[!is.finite(wv)] <- 0
+          weights_by_index[[indices[k]]] <- pmax(wv, 0)
         }
-        # Drop fully-excluded indices (all pentad weights zero)
-        excluded <- names(sig_mask)[vapply(sig_mask, function(m) !any(m), logical(1))]
+        excluded <- names(weights_by_index)[vapply(weights_by_index, function(w) !any(w > 0), logical(1))]
         if (length(excluded) > 0) {
-          cat(sprintf("[PROTO PLOT] Skipping %d fully-excluded indices: %s\n", length(excluded), paste(excluded, collapse = ", ")))
+          cat(sprintf("[PROTO PLOT] Skipping %d fully-zero weight indices: %s\n", length(excluded), paste(excluded, collapse = ", ")))
           indices <- setdiff(indices, excluded)
-          sig_mask <- sig_mask[indices]
+          weights_by_index <- weights_by_index[indices]
         }
       }
+
+      # Significance masking removed from pipeline — all timesteps are treated equally now.
 
       # Build long dataframe for plotting
       rows <- list()
@@ -4483,8 +4785,7 @@ load_and_prepare_inference_data <- function() {
             start <- (k-1) * TEMPORAL_BUDGET + 1
             end <- k * TEMPORAL_BUDGET
             vals <- vec[start:end]
-            sig <- if (!is.null(sig_mask) && idx_name %in% names(sig_mask)) sig_mask[[idx_name]] else rep(TRUE, TEMPORAL_BUDGET)
-            df_tmp <- data.frame(pentad = seq_len(TEMPORAL_BUDGET), value = vals, Veg = v, variant_id = vid, index = idx_name, significant = sig, stringsAsFactors = FALSE)
+            df_tmp <- data.frame(pentad = seq_len(TEMPORAL_BUDGET), value = vals, Veg = v, variant_id = vid, index = idx_name, stringsAsFactors = FALSE)
             rows[[length(rows) + 1]] <- df_tmp
           }
         }
@@ -4536,20 +4837,27 @@ load_and_prepare_inference_data <- function() {
         y_range <- y_max - y_min
         y_pad <- if (y_range > 0) y_range * 0.05 else 0.1
 
-        # Determine which pentads are non-significant for this index
-        has_nonsig <- "significant" %in% names(df_idx) && any(!df_idx$significant)
-
         p <- ggplot2::ggplot(df_idx, ggplot2::aes(x = pentad, y = value, group = variant_id))
         p <- p + ggplot2::geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", size = 0.4)
 
-        if (has_nonsig) {
-          # Add grey shading behind non-significant pentads
-          nonsig_pentads <- unique(df_idx$pentad[!df_idx$significant])
-          shade_df <- data.frame(xmin = nonsig_pentads - 0.5, xmax = nonsig_pentads + 0.5,
-                                 ymin = y_min - y_pad, ymax = y_max + y_pad)
-          p <- p + ggplot2::geom_rect(data = shade_df, inherit.aes = FALSE,
-                                      ggplot2::aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
-                                      fill = "grey90", alpha = 0.5)
+        # Weight backdrop: show backpropagated weight per pentad as a grey-scale band
+        # with a legend (scale). This makes the timestep weighting visually explicit.
+        if (!is.null(weights_by_index) && idx %in% names(weights_by_index)) {
+          wv <- weights_by_index[[idx]]
+          w_df <- data.frame(
+            pentad = seq_len(TEMPORAL_BUDGET),
+            w = wv,
+            xmin = seq_len(TEMPORAL_BUDGET) - 0.5,
+            xmax = seq_len(TEMPORAL_BUDGET) + 0.5,
+            ymin = y_min - y_pad,
+            ymax = y_max + y_pad
+          )
+          p <- p + ggplot2::geom_rect(
+            data = w_df,
+            inherit.aes = FALSE,
+            ggplot2::aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = w),
+            alpha = 0.25
+          )
         }
 
         if (is.null(variant_alpha)) {
@@ -4597,6 +4905,17 @@ load_and_prepare_inference_data <- function() {
                             plot.subtitle = ggplot2::element_text(hjust = 0.5, size = 9)) +
              ggplot2::scale_color_manual(values = veg_palette) +
              ggplot2::coord_cartesian(ylim = c(y_min - y_pad, y_max + y_pad))
+
+        # Add fill scale for weight backdrop (if used)
+        if (!is.null(weights_by_index) && idx %in% names(weights_by_index)) {
+          p <- p + ggplot2::scale_fill_gradient(
+            name = "Backprop weight",
+            low = "grey95",
+            high = "grey45"
+          )
+        } else {
+          p <- p + ggplot2::guides(fill = "none")
+        }
         plots[[idx]] <- p
         if (save_png) {
           fn <- file.path(out_dir, sprintf("%s_%s.png", prefix, idx))
@@ -4633,44 +4952,8 @@ load_and_prepare_inference_data <- function() {
   }
 
 
-  precompute_optimized_library_weighted <- function(mesma_lib, grid_type = "full", feature_weights = NULL) {
+  precompute_optimized_library_weighted <- function(mesma_lib, grid_type = "full", params = NULL) {
     opt_lib <- list()
-
-    # Determine pruning indices if requested
-    keep_idx_global_w <- NULL
-    if (!is.null(feature_weights) && exists("PRUNE_ZERO_WEIGHT_FEATURES") && isTRUE(PRUNE_ZERO_WEIGHT_FEATURES)) {
-      zero_mask_glob <- feature_weights == 0
-      n_zero_glob <- sum(zero_mask_glob, na.rm = TRUE)
-      frac_zero_glob <- n_zero_glob / length(feature_weights)
-      if (n_zero_glob > 0) {
-        cat(sprintf("[INFO] MESMA pruning requested: %d/%d features zeroed (%.1f%%)\n", n_zero_glob, length(feature_weights), 100*frac_zero_glob))
-
-        # Helpful diagnostics: summarize which indices were effectively ignored (all pentads zero-weighted)
-        if (exists("MESMA_PARAMS") && !is.null(MESMA_PARAMS) &&
-            !is.null(MESMA_PARAMS$indices) &&
-            length(feature_weights) == (TEMPORAL_BUDGET * length(MESMA_PARAMS$indices))) {
-          idxs <- MESMA_PARAMS$indices
-          bins <- TEMPORAL_BUDGET
-          zero_by_idx <- vapply(seq_along(idxs), function(k) {
-            rng <- ((k - 1) * bins + 1):(k * bins)
-            sum(feature_weights[rng] == 0, na.rm = TRUE)
-          }, numeric(1))
-          names(zero_by_idx) <- idxs
-
-          all_zero <- names(zero_by_idx)[zero_by_idx >= bins]
-          if (length(all_zero) > 0) {
-            cat(sprintf("[INFO] Indices with ALL %d pentads zero-weighted: %s\n", bins, paste(all_zero, collapse = ", ")))
-          }
-        }
-
-        if (frac_zero_glob <= PRUNE_ZERO_WEIGHT_MAX_FRAC && (length(feature_weights) - n_zero_glob) >= PRUNE_ZERO_MIN_FEATURES) {
-          keep_idx_global_w <- which(!zero_mask_glob)
-          cat(sprintf("[INFO] Will prune %d features for MESMA, keeping %d features\n", n_zero_glob, length(keep_idx_global_w)))
-        } else {
-          cat(sprintf("[WARN] Skipping MESMA pruning: zero fraction %.2f exceeds max allowed %.2f or resulting features < %d\n", frac_zero_glob, PRUNE_ZERO_WEIGHT_MAX_FRAC, PRUNE_ZERO_MIN_FEATURES))
-        }
-      }
-    }
 
     for(v in names(mesma_lib)) {
         if(is.null(mesma_lib[[v]])) next
@@ -4690,18 +4973,19 @@ load_and_prepare_inference_data <- function() {
 
         M <- do.call(rbind, vecs)
 
-        pruned_info <- NULL
-        if (!is.null(keep_idx_global_w) && length(keep_idx_global_w) > 0) {
-          if (max(keep_idx_global_w) <= ncol(M)) {
-            kept_names <- NULL
-            if (!is.null(colnames(M))) kept_names <- colnames(M)[keep_idx_global_w]
-            M <- M[, keep_idx_global_w, drop = FALSE]
-            pruned_info <- list(kept_idx = keep_idx_global_w, kept_names = kept_names, n_kept = ncol(M))
-            cat(sprintf("[INFO] Pruned MESMA features for veg '%s': kept %d columns\n", v, ncol(M)))
-          } else {
-            cat(sprintf("[WARN] MESMA prune requested but index mismatch for veg '%s'; skipping prune\n", v))
-          }
+        # Always project templates into PCA→LDA feature space for unmixing.
+        # Keep the original (index/pentad) vectors in `mesma_lib` for diagnostics/plots.
+        if (is.null(params) || is.null(params$pca_lda) || is.null(params$pca_lda$std_to_lda) || !is.matrix(params$pca_lda$std_to_lda)) {
+          stop("[PCA/LDA] Missing std_to_lda transform; cannot build optimized library in PCA→LDA space")
         }
+        A <- params$pca_lda$std_to_lda
+        if (nrow(A) != ncol(M)) {
+          stop(sprintf("[PCA/LDA] std_to_lda dimension mismatch: nrow(A)=%d != ncol(M)=%d", nrow(A), ncol(M)))
+        }
+        M <- M %*% A
+        feature_space <- "pca_lda"
+
+        pruned_info <- NULL
 
         M_norm <- t(apply(M, 1, function(r) {
           nrm <- sqrt(sum(r^2))
@@ -4715,7 +4999,8 @@ load_and_prepare_inference_data <- function() {
           M = M,
           M_norm = M_norm,
           ids = ids,
-          pruned_info = pruned_info
+          pruned_info = pruned_info,
+          feature_space = feature_space
         )
     }
     
@@ -4841,6 +5126,18 @@ print_weights_summary <- function(stage_name, params) {
     MESMA_PARAMS_INITIAL$weights[is.na(MESMA_PARAMS_INITIAL$weights)] <- 0
     MESMA_PARAMS_INITIAL$weights[!is.finite(MESMA_PARAMS_INITIAL$weights)] <- 0
     print_weights_summary("INITIAL_PCA_LDA", MESMA_PARAMS_INITIAL)
+
+    # Informative notification about PCA->LDA PC pruning/refit
+    if (!is.null(MESMA_PARAMS_INITIAL$pca_lda)) {
+      pa <- MESMA_PARAMS_INITIAL$pca_lda
+      cat(sprintf("[NOTICE] PCA->LDA: PCs original=%d, retained=%d, pruned=%d\n",
+                  ifelse(!is.null(pa$n_pcs_original), pa$n_pcs_original, NA),
+                  ifelse(!is.null(pa$n_pcs_kept), pa$n_pcs_kept, NA),
+                  ifelse(!is.null(pa$n_pcs_pruned), pa$n_pcs_pruned, NA)))
+      if (!is.null(pa$pruned_pc_indices) && length(pa$pruned_pc_indices) > 0) {
+        cat(sprintf("         Pruned PC indices: %s\n", paste(pa$pruned_pc_indices, collapse = ", ")))
+      }
+    }
   }
 
   # Step 2: Optimal cluster sizing FIRST (before threshold optimization)
@@ -4859,294 +5156,11 @@ print_weights_summary <- function(stage_name, params) {
     cat("[CLUSTER] Optimal cluster counts determined from full-feature optimization\n")
   }
 
-  # Step 3: Alpha-grid pruning using precomputed permutation p-values.
-  # IMPORTANT: This step does NOT run permutation tests anymore.
-  # It only loads p-values from permutation_importance_results.csv and optimizes
-  # (index_alpha, pentad_alpha) via grid search on OOB + training evaluation.
+  # Step 3 (REMOVED): Feature-weight pruning / alpha-grid pruning.
+  # The pipeline now always uses the full feature set. Any zeros in weights are
+  # treated as down-weighting only; no features/indices are dropped.
   pruned_indices <- avail
   MESMA_PARAMS <- MESMA_PARAMS_INITIAL
-
-  if (exists("df_train_oob") && !is.null(df_train_oob) && nrow(df_train_oob) > 0 &&
-      !is.null(MESMA_PARAMS_INITIAL) && !is.null(MESMA_PARAMS_INITIAL$weights)) {
-    perm_path <- "permutation_importance_results.csv"
-    if (!file.exists(perm_path)) {
-      stop(sprintf("Missing '%s'. Alpha-grid pruning requires precomputed permutation p-values.", perm_path))
-    }
-
-    perm_results <- tryCatch({
-      read.csv(perm_path, stringsAsFactors = FALSE)
-    }, error = function(e) {
-      stop(sprintf("Failed to read '%s': %s", perm_path, e$message))
-    })
-
-    if (!"p_value" %in% names(perm_results) || !"index" %in% names(perm_results)) {
-      stop(sprintf("'%s' must contain columns: index, p_value (and ideally stage, pentad)", perm_path))
-    }
-
-    # Use feature list from params for pruning
-    perm_indices <- if (!is.null(MESMA_PARAMS_INITIAL$indices)) MESMA_PARAMS_INITIAL$indices else avail
-
-    # Split permutation results into index-level and pentad-level tables
-    if (!"stage" %in% names(perm_results)) {
-      perm_results$stage <- if ("pentad" %in% names(perm_results) && any(is.finite(suppressWarnings(as.numeric(perm_results$pentad))))) "pentad" else "index"
-    }
-
-    index_results <- perm_results[tolower(perm_results$stage) == "index", , drop = FALSE]
-    if (nrow(index_results) == 0) {
-      # Fallback: treat rows with missing pentad as index-level
-      if ("pentad" %in% names(perm_results)) {
-        idx_mask <- is.na(suppressWarnings(as.numeric(perm_results$pentad)))
-        index_results <- perm_results[idx_mask, , drop = FALSE]
-      }
-    }
-    if (nrow(index_results) == 0) {
-      stop(sprintf("'%s' contains no index-level rows (stage=='index' or pentad missing).", perm_path))
-    }
-
-    # Keep only indices present in current run
-    index_results$index <- as.character(index_results$index)
-    index_results <- index_results[index_results$index %in% perm_indices & is.finite(as.numeric(index_results$p_value)), , drop = FALSE]
-
-    # Pentad-level results
-    pentad_results <- perm_results[tolower(perm_results$stage) == "pentad", , drop = FALSE]
-    if (nrow(pentad_results) == 0 && "pentad" %in% names(perm_results)) {
-      # Fallback: any finite pentad is treated as pentad-level
-      pj <- suppressWarnings(as.integer(perm_results$pentad))
-      pentad_results <- perm_results[is.finite(pj), , drop = FALSE]
-      pentad_results$pentad <- pj[is.finite(pj)]
-    }
-    if (nrow(pentad_results) > 0) {
-      pentad_results$index <- as.character(pentad_results$index)
-      pentad_results$pentad <- suppressWarnings(as.integer(pentad_results$pentad))
-      pentad_results$p_value <- suppressWarnings(as.numeric(pentad_results$p_value))
-      pentad_results <- pentad_results[pentad_results$index %in% perm_indices & is.finite(pentad_results$pentad) & is.finite(pentad_results$p_value), , drop = FALSE]
-    }
-
-    # Prepare OOB data
-    oob_for_eval <- dplyr::mutate(df_train_oob, target_class = tolower(as.character(Veg)))
-    oob_for_eval <- dplyr::filter(oob_for_eval, !is.na(target_class) & target_class != "")
-
-    n_oob_samples <- nrow(unique(oob_for_eval[, c("location_id", "pheno_year")]))
-    if (n_oob_samples < PERMUTATION_MIN_SAMPLES) {
-      stop(sprintf("Only %d OOB samples (< min=%d). Need more OOB for alpha-grid scoring.", n_oob_samples, PERMUTATION_MIN_SAMPLES))
-    }
-
-    # Helper: build endmember matrix from initial library
-    build_endmember_matrix <- function(mesma_library, unique_classes) {
-      cols <- list(); col_names <- character(0)
-      for (cls in names(mesma_library)) {
-        if (!(cls %in% unique_classes)) next
-        cls_variants <- mesma_library[[cls]]
-        if (is.null(cls_variants) || length(cls_variants) == 0) next
-        for (variant in cls_variants) {
-          vec <- variant$vec
-          if (!is.null(vec) && length(vec) > 0) {
-            cols[[length(cols) + 1]] <- vec
-            col_names <- c(col_names, cls)
-          }
-        }
-      }
-      if (length(cols) < 2) stop("[ALPHA OPT] Insufficient endmembers in initial library")
-      list(E = do.call(cbind, cols), col_names = col_names)
-    }
-
-    build_Y_from_df <- function(df_in, params, n_bins) {
-      traces <- unique(df_in[, c("location_id", "pheno_year", "target_class")])
-      if (nrow(traces) == 0) stop("[ALPHA OPT] No traces found")
-
-      indices <- params$indices
-      base_indices <- if (!is.null(params$base_indices)) params$base_indices else indices
-      n_base_idx <- length(base_indices)
-      l2_normalize <- isTRUE(params$l2_normalize)
-
-      vecs <- vector("list", nrow(traces))
-      labels <- as.character(traces$target_class)
-      for (j in seq_len(nrow(traces))) {
-        lid <- traces$location_id[j]
-        pyr <- traces$pheno_year[j]
-        sub <- df_in[df_in$location_id == lid & df_in$pheno_year == pyr, ]
-        mat <- build_pentad_matrix(sub, base_indices)
-        if (is.null(mat)) { vecs[[j]] <- NULL; next }
-        vec_raw <- as.numeric(mat)
-        vec <- mesma_apply_representation_vec(vec_raw, n_base_idx, n_bins, l2_normalize)
-        vec <- mesma_zscore_vec_by_index(vec, indices, params$means, params$sds, n_bins)
-        vecs[[j]] <- vec
-      }
-      keep <- vapply(vecs, function(x) !is.null(x) && length(x) > 0, logical(1))
-      vecs <- vecs[keep]; labels <- labels[keep]
-      if (length(vecs) == 0) stop("[ALPHA OPT] No vectors built")
-      list(Y = do.call(rbind, vecs), labels = labels)
-    }
-
-    compute_score_from_Y <- function(E, col_names, Y, labels, unique_classes, weights) {
-      all_coefs <- solve_batch_fcls(E, Y, weights)
-      if (is.null(all_coefs)) stop("[ALPHA OPT] FCLS solver returned NULL")
-
-      veg_classes <- setdiff(unique_classes, "barren")
-      veg_norm_frac_sums <- setNames(rep(0, length(veg_classes)), veg_classes)
-      veg_counts <- setNames(rep(0L, length(veg_classes)), veg_classes)
-
-      total <- nrow(Y)
-      for (j in seq_len(total)) {
-        true_cls <- labels[j]
-        if (!(true_cls %in% veg_classes)) next
-        coefs <- all_coefs[j, ]
-        class_sums <- tapply(coefs, col_names, sum)
-        for (uc in unique_classes) if (!(uc %in% names(class_sums))) class_sums[[uc]] <- 0
-        veg_total <- sum(sapply(veg_classes, function(vc) class_sums[[vc]]), na.rm = TRUE)
-        norm_frac <- if (veg_total > 1e-10) class_sums[[true_cls]] / veg_total else 0
-        veg_norm_frac_sums[true_cls] <- veg_norm_frac_sums[true_cls] + norm_frac
-        veg_counts[true_cls] <- veg_counts[true_cls] + 1L
-      }
-
-      veg_diag_fracs <- ifelse(veg_counts > 0, veg_norm_frac_sums / veg_counts, NA)
-      mean(veg_diag_fracs, na.rm = TRUE)
-    }
-
-    apply_pruning_rules <- function(weights, index_names, n_bins, idx_prune, pent_prune_df) {
-      if (is.null(weights) || length(weights) == 0) return(weights)
-
-      # Stage 1: prune entire indices
-      if (!is.null(idx_prune) && length(idx_prune) > 0) {
-        for (idx_name in idx_prune) {
-          idx_i <- which(index_names == idx_name)
-          if (length(idx_i) == 1) {
-            s <- (idx_i - 1) * n_bins + 1
-            e <- idx_i * n_bins
-            weights[s:e] <- 0
-          }
-        }
-      }
-
-      # Stage 2: prune specific pentads (only those explicitly listed)
-      if (!is.null(pent_prune_df) && nrow(pent_prune_df) > 0) {
-        for (i in seq_len(nrow(pent_prune_df))) {
-          idx_name <- as.character(pent_prune_df$index[i])
-          pentad_j <- as.integer(pent_prune_df$pentad[i])
-          idx_i <- which(index_names == idx_name)
-          if (length(idx_i) == 1 && is.finite(pentad_j)) {
-            pos <- (idx_i - 1) * n_bins + pentad_j
-            if (pos >= 1 && pos <= length(weights)) weights[pos] <- 0
-          }
-        }
-      }
-
-      weights
-    }
-
-    unique_classes <- unique(oob_for_eval$target_class)
-    if (length(unique_classes) < 2) stop("[ALPHA OPT] Need >=2 classes in OOB")
-
-    endm <- build_endmember_matrix(mesma_lib_initial, unique_classes)
-    oob_built <- build_Y_from_df(oob_for_eval, MESMA_PARAMS_INITIAL, TEMPORAL_BUDGET)
-    Y_base <- oob_built$Y
-    oob_labels <- oob_built$labels
-
-    # Training evaluation set (exclude OOB locations)
-    train_eval_df <- dplyr::mutate(
-      dplyr::filter(multi_class_data, !location_id %in% unique(oob_for_eval$location_id)),
-      target_class = tolower(as.character(Veg))
-    )
-    train_eval_df <- dplyr::filter(train_eval_df, !is.na(target_class) & target_class != "")
-    train_built <- build_Y_from_df(train_eval_df, MESMA_PARAMS_INITIAL, TEMPORAL_BUDGET)
-    Y_train_eval <- train_built$Y
-    train_eval_labels <- train_built$labels
-
-    # Alpha grid search
-    index_alphas <- seq(0.01, 0.5, by = 0.01)
-    pentad_alphas <- seq(0.01, 0.5, by = 0.01)
-
-    alpha_grid_results <- data.frame(
-      idx_alpha = numeric(), pent_alpha = numeric(),
-      oob_score = numeric(), train_score = numeric(),
-      combined_score = numeric(), n_features = integer(),
-      n_indices = integer(),
-      stringsAsFactors = FALSE
-    )
-
-    # Make sure missing p-values never cause accidental pruning.
-    # Indices missing from index_results are treated as p=0 (always eligible to keep).
-    p_by_index <- setNames(rep(0, length(perm_indices)), perm_indices)
-    if (nrow(index_results) > 0) {
-      tmp <- tapply(as.numeric(index_results$p_value), index_results$index, function(x) suppressWarnings(min(x, na.rm = TRUE)))
-      tmp <- tmp[names(tmp) %in% names(p_by_index)]
-      p_by_index[names(tmp)] <- tmp
-    }
-
-    for (ia in index_alphas) {
-      idx_keep <- names(p_by_index)[is.finite(p_by_index) & p_by_index < ia]
-      idx_prune <- setdiff(perm_indices, idx_keep)
-
-      for (pa in pentad_alphas) {
-        pent_prune <- if (nrow(pentad_results) > 0) {
-          pentad_results[pentad_results$p_value >= pa, c("index", "pentad"), drop = FALSE]
-        } else {
-          data.frame(index = character(), pentad = integer(), stringsAsFactors = FALSE)
-        }
-
-        w <- apply_pruning_rules(MESMA_PARAMS_INITIAL$weights, perm_indices, TEMPORAL_BUDGET, idx_prune, pent_prune)
-        n_feat <- sum(w > 0)
-        n_idx <- sum(sapply(seq_along(perm_indices), function(k) {
-          any(w[((k - 1) * TEMPORAL_BUDGET + 1):(k * TEMPORAL_BUDGET)] > 0)
-        }))
-
-        if (n_idx < 2) next
-
-        oob_score <- compute_score_from_Y(endm$E, endm$col_names, Y_base, oob_labels, unique_classes, w)
-        train_score <- compute_score_from_Y(endm$E, endm$col_names, Y_train_eval, train_eval_labels, unique_classes, w)
-        combined <- min(oob_score, train_score)
-
-        alpha_grid_results <- rbind(alpha_grid_results, data.frame(
-          idx_alpha = ia, pent_alpha = pa,
-          oob_score = oob_score, train_score = train_score,
-          combined_score = combined, n_features = n_feat,
-          n_indices = n_idx,
-          stringsAsFactors = FALSE
-        ))
-      }
-    }
-
-    if (nrow(alpha_grid_results) == 0) stop("[ALPHA OPT] No alpha combinations evaluated")
-    best_row <- which.max(alpha_grid_results$combined_score)
-    best_idx_alpha <- alpha_grid_results$idx_alpha[best_row]
-    best_pent_alpha <- alpha_grid_results$pent_alpha[best_row]
-
-    # Apply optimized alphas
-    PERMUTATION_ALPHA <- best_idx_alpha
-    PERMUTATION_PENTAD_ALPHA <- best_pent_alpha
-
-    idx_keep_final <- names(p_by_index)[is.finite(p_by_index) & p_by_index < PERMUTATION_ALPHA]
-    idx_prune_final <- setdiff(perm_indices, idx_keep_final)
-    pent_prune_final <- if (nrow(pentad_results) > 0) {
-      pentad_results[pentad_results$p_value >= PERMUTATION_PENTAD_ALPHA, c("index", "pentad"), drop = FALSE]
-    } else {
-      data.frame(index = character(), pentad = integer(), stringsAsFactors = FALSE)
-    }
-
-    pruned_weights <- apply_pruning_rules(MESMA_PARAMS_INITIAL$weights, perm_indices, TEMPORAL_BUDGET, idx_prune_final, pent_prune_final)
-
-    # Determine kept indices (any non-zero weight)
-    indices_to_keep <- character(0)
-    for (k in seq_along(perm_indices)) {
-      s <- (k - 1) * TEMPORAL_BUDGET + 1
-      e <- k * TEMPORAL_BUDGET
-      if (any(pruned_weights[s:e] > 0)) indices_to_keep <- c(indices_to_keep, perm_indices[k])
-    }
-    indices_to_keep <- unique(indices_to_keep)
-
-    if (length(indices_to_keep) >= PRUNE_ZERO_MIN_FEATURES) {
-      pruned_indices <- indices_to_keep
-      MESMA_PARAMS <- MESMA_PARAMS_INITIAL
-      MESMA_PARAMS$weights <- pruned_weights
-      avail <- pruned_indices
-    } else {
-      # Keep full feature set if pruning is too aggressive
-      pruned_indices <- avail
-      MESMA_PARAMS <- MESMA_PARAMS_INITIAL
-    }
-
-    write.csv(alpha_grid_results, file = "alpha_grid_results.csv", row.names = FALSE)
-  }
 
   if (!is.null(MESMA_PARAMS) && !is.null(MESMA_PARAMS$weights)) {
     print_weights_summary("MESMA_FINAL", MESMA_PARAMS)
@@ -5161,10 +5175,12 @@ print_weights_summary <- function(stage_name, params) {
   # MESMA UNMIXING: All endmembers (barren + veg types) treated equally
   cat("[MODE] MESMA unmixing ENABLED (barren and vegetation types treated as equals)\n")
 
-  # Log loss function choice
-  if (exists("USE_HUBER_LOSS") && isTRUE(USE_HUBER_LOSS)) {
-    cat(sprintf("[MODE] Using HUBER LOSS for FCLS (delta=%.3f, robust to outliers)\n",
-                if (exists("HUBER_DELTA")) HUBER_DELTA else 1.345))
+  # Log solver choice
+  if (exists("USE_IWLMM") && isTRUE(USE_IWLMM)) {
+    cat(sprintf("[MODE] Using IWLMM solver (bound=\u00b1%.1f\u03c3, \u03bb_\u03b4=%.4f, max_iter=%d)\n",
+                if (exists("IWLMM_BOUND_SIGMA")) IWLMM_BOUND_SIGMA else 2.0,
+                if (exists("IWLMM_REGULARIZE_DELTA")) IWLMM_REGULARIZE_DELTA else 0.01,
+                if (exists("IWLMM_MAX_ITER")) IWLMM_MAX_ITER else 15L))
   } else {
     cat("[MODE] Using standard RMSE loss for FCLS\n")
   }
@@ -5185,24 +5201,9 @@ print_weights_summary <- function(stage_name, params) {
   mesma_lib <- build_mesma_library_weighted(df_train, indices_for_final_library, MESMA_PARAMS, ALLOWED_VEG, precomputed_clusters = precomputed_clusters)
 
   cat("Pre-computing optimized library for MESMA...\n")
-  OPTIMIZED_LIBRARY <- precompute_optimized_library_weighted(mesma_lib, grid_type = "full", feature_weights = (if (!is.null(MESMA_PARAMS) && !is.null(MESMA_PARAMS$weights)) MESMA_PARAMS$weights else NULL) )
+  OPTIMIZED_LIBRARY <- precompute_optimized_library_weighted(mesma_lib, grid_type = "full", params = MESMA_PARAMS)
 
-  # Summarize pruning if any
-  if (exists("PRUNE_ZERO_WEIGHT_FEATURES") && isTRUE(PRUNE_ZERO_WEIGHT_FEATURES)) {
-    total_pruned <- 0
-    total_kept <- 0
-    vegs_pruned <- 0
-    for (v in names(OPTIMIZED_LIBRARY)) {
-      libv <- OPTIMIZED_LIBRARY[[v]]
-      if (!is.null(libv$pruned_info) && !is.null(libv$pruned_info$n_kept)) {
-        total_kept <- total_kept + libv$pruned_info$n_kept
-        vegs_pruned <- vegs_pruned + 1
-      }
-    }
-    if (vegs_pruned > 0) {
-      cat(sprintf("[INFO] Pruning summary: %d vegetation types pruned; avg kept features per pruned veg: %.1f\n", vegs_pruned, total_kept / vegs_pruned))
-    }
-  }
+
 
   if (isTRUE(TESTING_MODE)) {
     nn <- sapply(names(OPTIMIZED_LIBRARY), function(v) {
@@ -5231,13 +5232,15 @@ print_weights_summary <- function(stage_name, params) {
   assign("compressed_templates_accessor", compressed_templates_accessor, envir = globalenv())
   assign(".COMPRESSED_TEMPLATES_ACCESSOR", compressed_templates_accessor, envir = globalenv())
 
+
+
   # === Shared confusion matrix function (used for both training and validation) ===
   # Pipeline: OPTIMIZED_LIBRARY endmembers -> energy normalization -> batch FCLS
-  # with feature weights. Observations: z-score -> prune to match library.
+  # with feature weights. Observations: z-score.
   compute_confusion_matrix <- function(df_data, label = "Training") {
     if (is.null(df_data) || nrow(df_data) == 0) return(invisible(NULL))
     if (!exists("OPTIMIZED_LIBRARY") || is.null(OPTIMIZED_LIBRARY)) return(invisible(NULL))
-    if (is.null(MESMA_PARAMS) || is.null(MESMA_PARAMS$weights)) return(invisible(NULL))
+    if (is.null(MESMA_PARAMS)) return(invisible(NULL))
 
     tryCatch({
       df_cm <- dplyr::mutate(df_data, target_class = tolower(as.character(Veg)))
@@ -5252,11 +5255,9 @@ print_weights_summary <- function(stage_name, params) {
       # 1. Build endmember matrix E from OPTIMIZED_LIBRARY (multi-prototype per class)
       E_cols <- list()
       col_class_labels <- c()
-      pruned_info <- NULL
       for (cls in unique_classes) {
         lib_cls <- OPTIMIZED_LIBRARY[[cls]]
         if (is.null(lib_cls) || is.null(lib_cls$M)) next
-        if (is.null(pruned_info)) pruned_info <- lib_cls$pruned_info
         M_cls <- lib_cls$M
         if (is.null(dim(M_cls))) M_cls <- matrix(M_cls, nrow = 1)
         for (ri in seq_len(nrow(M_cls))) {
@@ -5267,6 +5268,16 @@ print_weights_summary <- function(stage_name, params) {
       if (length(E_cols) < 2) return(invisible(NULL))
 
       E <- do.call(cbind, E_cols)
+
+      # Unmixing always happens in PCA→LDA feature space.
+      if (is.null(MESMA_PARAMS$pca_lda) || is.null(MESMA_PARAMS$pca_lda$std_to_lda) || !is.matrix(MESMA_PARAMS$pca_lda$std_to_lda)) {
+        stop("[PCA/LDA] Missing std_to_lda transform; cannot compute confusion matrix in PCA→LDA space")
+      }
+      A_cm <- MESMA_PARAMS$pca_lda$std_to_lda
+      w_cm <- rep(1, ncol(A_cm))
+      if (nrow(E) != length(w_cm)) {
+        stop(sprintf("[PCA/LDA] Confusion-matrix library not in PCA→LDA space (n_features(E)=%d, expected=%d)", nrow(E), length(w_cm)))
+      }
 
       # 2. Build observation vectors (z-score + prune)
       base_indices_cm <- if (!is.null(MESMA_PARAMS$base_indices)) MESMA_PARAMS$base_indices else avail
@@ -5289,9 +5300,13 @@ print_weights_summary <- function(stage_name, params) {
           vec <- as.numeric(mat)
           vec <- mesma_apply_representation_vec(vec, n_base_idx_cm, TEMPORAL_BUDGET, l2_normalize_cm)
           vec <- mesma_zscore_vec_by_index(vec, indices_cm, MESMA_PARAMS$means, MESMA_PARAMS$sds, TEMPORAL_BUDGET)
-          if (!is.null(pruned_info) && !is.null(pruned_info$kept_idx)) {
-            vec <- vec[pruned_info$kept_idx]
+
+          vec_feat <- project_vec_to_pca_lda(vec, MESMA_PARAMS$pca_lda)
+          if (is.null(vec_feat)) {
+            stop("[PCA/LDA] Failed to project observation into PCA→LDA space")
           }
+          vec <- vec_feat
+
           obs_vecs[[length(obs_vecs) + 1]] <- vec
           obs_labels <- c(obs_labels, true_cls)
         }
@@ -5300,12 +5315,45 @@ print_weights_summary <- function(stage_name, params) {
 
       Y <- do.call(rbind, obs_vecs)
 
-      # 3. FCLS with pruned weights
-      w <- MESMA_PARAMS$weights
-      if (!is.null(pruned_info) && !is.null(pruned_info$kept_idx)) {
-        w <- w[pruned_info$kept_idx]
+      # 3. Unmixing (IWLMM or FCLS) in PCA→LDA feature space
+      w <- w_cm
+
+      iwlmm_cm <- exists("USE_IWLMM") && isTRUE(USE_IWLMM)
+      if (iwlmm_cm) {
+        # Compute per-column bounds from within-class variant spread
+        cm_bounds <- matrix(0, nrow = nrow(E), ncol = ncol(E))
+        cm_bound_sigma <- if (exists("IWLMM_BOUND_SIGMA")) IWLMM_BOUND_SIGMA else 2.0
+        for (cls in unique_classes) {
+          col_idx <- which(col_class_labels == cls)
+          if (length(col_idx) >= 2) {
+            cls_mat <- E[, col_idx, drop = FALSE]
+            cls_sd <- apply(cls_mat, 1, sd, na.rm = TRUE)
+            cls_sd[!is.finite(cls_sd)] <- 0
+            for (ci in col_idx) {
+              cm_bounds[, ci] <- cm_bound_sigma * cls_sd
+            }
+          }
+        }
+        has_bounds <- any(cm_bounds > 0)
+
+        # Loop per observation using IWLMM
+        n_samples <- nrow(Y)
+        n_cols <- ncol(E)
+        all_coefs <- matrix(0, nrow = n_samples, ncol = n_cols)
+        for (si in seq_len(n_samples)) {
+          y_obs <- as.numeric(Y[si, ])
+          if (has_bounds) {
+            res_i <- solve_weights_iwlmm(E, y_obs, bounds = cm_bounds, feature_weights = w)
+          } else {
+            res_i <- solve_weights_fcls(E, y_obs, feature_weights = w)
+          }
+          if (!is.null(res_i) && !is.null(res_i$w)) {
+            all_coefs[si, ] <- res_i$w
+          }
+        }
+      } else {
+        all_coefs <- solve_batch_fcls(E, Y, w)
       }
-      all_coefs <- solve_batch_fcls(E, Y, w)
       if (is.null(all_coefs)) return(invisible(NULL))
 
       # 4. Aggregate coefficients by class and build confusion matrix
@@ -5366,6 +5414,9 @@ print_weights_summary <- function(stage_name, params) {
       cat(sprintf("\n[CONFUSION MATRIX] %s Avg Row-Normalized Veg Fraction (diagonal): %.1f%%\n", label, 100 * avg_cor_pred_veg_frac))
       cat(sprintf("[CONFUSION MATRIX] %s Veg Classification Accuracy: %.1f%% (%d/%d correct)\n",
                   label, 100 * veg_class_accuracy, correct_veg, total_veg))
+
+
+      cat(sprintf("[CONFUSION MATRIX] %s confusion matrix stored for classification uncertainty propagation\n", label))
     }, error = function(e) {
       cat(sprintf("[CONFUSION MATRIX] Error computing %s confusion matrix: %s\n", label, e$message))
     })
@@ -5466,329 +5517,17 @@ sample_oob_residual <- function(dominant_class) {
   return(residual)
 }
 
-# ============================================================================
-# CLASSIFICATION UNCERTAINTY: DIRICHLET PERTURBATION
-# Propagates classification/misclassification uncertainty through bootstrap by
-# resampling fractional covers from a Dirichlet distribution whose mean is
-# derived from the confusion matrix.
-#
-# IMPORTANT: This implementation is mixture-aware: it does NOT condition on a
-# single dominant/true class. Instead, it uses the current fraction vector as
-# weights over confusion-matrix rows.
-# ============================================================================
+  # ORPHANED_BLOCK_REMOVED: stray legacy fragment deleted - see git history
+  # (original code referenced undefined variables such as `fracs`, `mapped_row`)
+  rows <- character(0)
+  row_idx <- integer(0)
 
-# Global storage for confusion matrix and validation sample sizes
-.CONFUSION_MATRIX <- NULL
-.VALIDATION_SAMPLE_SIZES <- NULL
-
-# Store the confusion matrix for use in Dirichlet perturbation
-# Called after validation accuracy is computed
-store_confusion_matrix <- function(conf_matrix, sample_sizes = NULL) {
-  if (!is.matrix(conf_matrix) || nrow(conf_matrix) != ncol(conf_matrix)) {
-    stop("[DIRICHLET] Invalid confusion matrix - must be square matrix")
-  }
-
-  # Ensure row-normalized (each row sums to 1)
-  row_sums <- rowSums(conf_matrix, na.rm = TRUE)
-  conf_matrix_norm <- conf_matrix
-  for (i in seq_len(nrow(conf_matrix_norm))) {
-    if (row_sums[i] > 1e-9) {
-      conf_matrix_norm[i, ] <- conf_matrix_norm[i, ] / row_sums[i]
-    }
-  }
-
-  assign(".CONFUSION_MATRIX", conf_matrix_norm, envir = globalenv())
-
-  if (!is.null(sample_sizes)) {
-    assign(".VALIDATION_SAMPLE_SIZES", sample_sizes, envir = globalenv())
-  }
-
-  if (isTRUE(DEBUG_UNCERTAINTY)) {
-    cat(sprintf("[DIRICHLET] Stored %dx%d confusion matrix for classification uncertainty\n",
-                nrow(conf_matrix_norm), ncol(conf_matrix_norm)))
-    cat(sprintf("[DIRICHLET] Classes: %s\n", paste(rownames(conf_matrix_norm), collapse = ", ")))
-    if (!is.null(sample_sizes)) {
-      cat(sprintf("[DIRICHLET] Validation sample sizes: %s\n",
-                  paste(sprintf("%s=%d", names(sample_sizes), sample_sizes), collapse = ", ")))
-    }
-  }
-
-  return(invisible(TRUE))
-}
-
-# Apply Dirichlet perturbation to fractional covers based on true class
-# This simulates classification uncertainty by drawing from a Dirichlet
-# distribution centered on the confusion matrix row for the true class
-#
-# Parameters:
-#   fractions: Named numeric vector of fractional covers (must sum to ~1)
-#   true_class: The true vegetation class for this location
-#   conf_matrix: Row-normalized confusion matrix (optional, uses global if NULL)
-#   sample_sizes: Named vector of validation sample sizes per class (optional)
-#   concentration_scale: Multiplier for sample size to get Dirichlet alpha
-#
-# Returns:
-#   Perturbed fractional covers (same names, still sum to 1)
-#
-apply_dirichlet_perturbation <- function(fractions, true_class,
-                                          conf_matrix = NULL,
-                                          sample_sizes = NULL,
-                                          concentration_scale = DIRICHLET_CONCENTRATION_SCALE) {
-  # Use global confusion matrix if not provided
- if (is.null(conf_matrix)) {
-    if (exists(".CONFUSION_MATRIX", envir = globalenv())) {
-      conf_matrix <- get(".CONFUSION_MATRIX", envir = globalenv())
-    } else {
-      stop("[DIRICHLET] No confusion matrix available")
-    }
-  }
-
-  if (is.null(sample_sizes) && exists(".VALIDATION_SAMPLE_SIZES", envir = globalenv())) {
-    sample_sizes <- get(".VALIDATION_SAMPLE_SIZES", envir = globalenv())
-  }
-
-  # Validate inputs
-  if (is.null(conf_matrix) || !is.matrix(conf_matrix)) {
-    stop("[DIRICHLET] Invalid confusion matrix")
-  }
-
-  # Match true_class to confusion matrix row (case-insensitive)
-  row_names <- tolower(rownames(conf_matrix))
-  true_class_lower <- tolower(true_class)
-  row_idx <- which(row_names == true_class_lower)
-
-  if (length(row_idx) == 0) {
-    stop(sprintf("[DIRICHLET] True class '%s' not found in confusion matrix", as.character(true_class)))
-  }
-
-  # Get the confusion row for the true class (this is our Dirichlet mean)
-  mu <- as.numeric(conf_matrix[row_idx, ])
-  class_names <- colnames(conf_matrix)
-
-  # Ensure mu sums to 1 and has no zeros (add small epsilon for stability)
-  mu[mu < 1e-6] <- 1e-6
-  mu <- mu / sum(mu)
-
-  # Determine concentration parameter alpha
-  # Higher alpha = tighter concentration around mean = less noise
-  if (!is.null(sample_sizes) && true_class_lower %in% tolower(names(sample_sizes))) {
-    n_val <- sample_sizes[tolower(names(sample_sizes)) == true_class_lower]
-    alpha <- concentration_scale * n_val
-  } else {
-    # Default: assume moderate validation sample size
-    alpha <- concentration_scale * 20
-  }
-
-  # Ensure minimum alpha for numerical stability
-  alpha <- max(alpha, 5)
-
-  # Dirichlet parameter vector
-  alpha_vec <- alpha * mu
-
-  # Draw from Dirichlet distribution
-  # Using the gamma distribution method: X_i ~ Gamma(alpha_i, 1), then normalize
-  gamma_draws <- rgamma(length(alpha_vec), shape = alpha_vec, rate = 1)
-
-  # Handle edge case where all draws are zero
-  if (sum(gamma_draws) < 1e-10) {
-    gamma_draws <- mu  # Fall back to mean
-  }
-
-  perturbed <- gamma_draws / sum(gamma_draws)
-
-  # Map back to original fraction names
-  # The confusion matrix classes may not exactly match the fraction names
-  result <- fractions
-  frac_names_lower <- tolower(names(fractions))
-
-  for (i in seq_along(class_names)) {
-    class_lower <- tolower(class_names[i])
-    # Find matching fraction column (handle "frac_" prefix)
-    match_idx <- which(frac_names_lower == class_lower |
-                       frac_names_lower == paste0("frac_", class_lower))
-    if (length(match_idx) > 0) {
-      result[match_idx[1]] <- perturbed[i]
-    }
-  }
-
-  # Re-normalize to ensure sum = 1 (in case of partial matching)
-  if (sum(result) > 0) {
-    result <- result / sum(result)
-  }
-
+  # ORPHANED: confusion‑based fraction perturbation removed.
+  # If needed reintroduce as a pure function that accepts explicit inputs
+  # (fracs, conf_matrix, mapped_row, sample_sizes, concentration_scale, etc.).
+  # For safety, return `fracs` unchanged when present (no-op):
+  result <- if (exists("fracs")) fracs else numeric(0)
   return(result)
-}
-
-# Apply mixture-aware Dirichlet perturbation to fractional covers.
-#
-# Instead of conditioning on a single "true" class, this builds a Dirichlet mean
-# as a weighted mixture of confusion-matrix rows using the current fraction
-# vector as weights.
-apply_dirichlet_perturbation_mixture <- function(fractions,
-                                                 conf_matrix = NULL,
-                                                 sample_sizes = NULL,
-                                                 concentration_scale = DIRICHLET_CONCENTRATION_SCALE,
-                                                 min_weight = 1e-6) {
-  if (is.null(conf_matrix)) {
-    if (exists(".CONFUSION_MATRIX", envir = globalenv())) {
-      conf_matrix <- get(".CONFUSION_MATRIX", envir = globalenv())
-    } else {
-      stop("[DIRICHLET] No confusion matrix available")
-    }
-  }
-
-  if (is.null(sample_sizes) && exists(".VALIDATION_SAMPLE_SIZES", envir = globalenv())) {
-    sample_sizes <- get(".VALIDATION_SAMPLE_SIZES", envir = globalenv())
-  }
-
-  if (is.null(conf_matrix) || !is.matrix(conf_matrix) || nrow(conf_matrix) != ncol(conf_matrix)) {
-    stop("[DIRICHLET] Invalid confusion matrix")
-  }
-
-  if (is.null(fractions) || length(fractions) == 0) {
-    return(fractions)
-  }
-
-  fracs <- as.numeric(fractions)
-  names(fracs) <- names(fractions)
-  fracs[!is.finite(fracs)] <- 0
-  fracs[fracs < 0] <- 0
-
-  frac_sum <- sum(fracs)
-  if (!is.finite(frac_sum) || frac_sum <= 0) {
-    return(fractions)
-  }
-  fracs <- fracs / frac_sum
-
-  row_names <- tolower(rownames(conf_matrix))
-  col_names <- colnames(conf_matrix)
-  frac_names_lower <- tolower(names(fracs))
-
-  # Map fraction names to confusion-matrix rows (support 'frac_' prefix)
-  mapped_row <- rep(NA_character_, length(fracs))
-  for (i in seq_along(fracs)) {
-    nm <- frac_names_lower[i]
-    nm2 <- sub("^frac_", "", nm)
-    if (nm %in% row_names) {
-      mapped_row[i] <- nm
-    } else if (nm2 %in% row_names) {
-      mapped_row[i] <- nm2
-    }
-  }
-
-  keep <- is.finite(fracs) & fracs > 0 & !is.na(mapped_row) & (fracs >= min_weight)
-  if (!any(keep)) {
-    # No overlap with confusion matrix; leave unchanged
-    return(fracs)
-  }
-
-  w <- fracs[keep]
-  w <- w / sum(w)
-  rows <- mapped_row[keep]
-  row_idx <- match(rows, row_names)
-
-  # Weighted mean confusion row
-  mu <- rep(0, ncol(conf_matrix))
-  for (k in seq_along(row_idx)) {
-    mu <- mu + w[k] * as.numeric(conf_matrix[row_idx[k], ])
-  }
-
-  mu[!is.finite(mu)] <- 0
-  mu[mu < 1e-6] <- 1e-6
-  mu <- mu / sum(mu)
-
-  # Concentration based on validation support (fraction-weighted)
-  n_eff <- 20
-  if (!is.null(sample_sizes) && length(sample_sizes) > 0) {
-    ss_names <- tolower(names(sample_sizes))
-    ss <- as.numeric(sample_sizes)
-    ss[!is.finite(ss) | ss < 0] <- 0
-    ss_match <- ss[match(rows, ss_names)]
-    ss_match[is.na(ss_match)] <- 0
-    if (sum(ss_match) > 0) {
-      n_eff <- sum(w * ss_match)
-    }
-  }
-
-  alpha <- max(concentration_scale * n_eff, 5)
-  alpha_vec <- alpha * mu
-  gamma_draws <- rgamma(length(alpha_vec), shape = alpha_vec, rate = 1)
-  if (sum(gamma_draws) < 1e-10) {
-    gamma_draws <- mu
-  }
-  perturbed <- gamma_draws / sum(gamma_draws)
-
-  # Map back to original fraction names
-  result <- fracs
-  for (i in seq_along(col_names)) {
-    class_lower <- tolower(col_names[i])
-    match_idx <- which(frac_names_lower == class_lower |
-                         frac_names_lower == paste0("frac_", class_lower))
-    if (length(match_idx) > 0) {
-      result[match_idx[1]] <- perturbed[i]
-    }
-  }
-
-  if (sum(result) > 0) {
-    result <- result / sum(result)
-  }
-
-  return(result)
-}
-
-# Batch apply mixture-aware Dirichlet perturbation to a data frame of fractions.
-# Useful for resampling location-level results without requiring class labels.
-apply_dirichlet_perturbation_batch <- function(coef_df, frac_cols, true_class_col = NULL) {
-  if (!isTRUE(ENABLE_CLASSIFICATION_UNCERTAINTY)) {
-    return(coef_df)
-  }
-
-  # Check if confusion matrix is available
-  if (!exists(".CONFUSION_MATRIX", envir = globalenv())) {
-    stop("[DIRICHLET] No confusion matrix available")
-  }
-
-  result_df <- coef_df
-
-  for (i in seq_len(nrow(coef_df))) {
-    # Extract current fractions
-    fracs <- as.numeric(coef_df[i, frac_cols])
-    names(fracs) <- frac_cols
-
-    # Apply mixture-aware perturbation
-    perturbed <- apply_dirichlet_perturbation_mixture(fracs)
-
-    # Store back
-    result_df[i, frac_cols] <- perturbed
-  }
-
-  return(result_df)
-}
-
-# Simple i.i.d. residual bootstrap
-# Resamples residuals with replacement (assumes approximate independence)
-simple_residual_bootstrap <- function(residuals) {
-  n <- length(residuals)
-  if (n == 0) return(numeric(0))
-  
-  # Remove NA values for bootstrapping
-  residuals_non_na <- residuals[!is.na(residuals)]
-  n_non_na <- length(residuals_non_na)
-  
-  if (n_non_na == 0) return(residuals) # Return original if all are NA
-  
-  # Simple random sampling with replacement
-  resampled_indices <- sample(1:n_non_na, n_non_na, replace = TRUE)
-  
-  # Create the bootstrapped residuals vector
-  bootstrapped_residuals_non_na <- residuals_non_na[resampled_indices]
-  
-  # Place bootstrapped residuals back into the original structure with NAs
-  residuals_boot <- residuals
-  residuals_boot[!is.na(residuals)] <- bootstrapped_residuals_non_na
-  
-  return(residuals_boot)
-}
 
   fit_one_task <- function(task_data) {
     if (is.null(task_data) || nrow(task_data) == 0) return(NULL)
@@ -5838,16 +5577,6 @@ simple_residual_bootstrap <- function(residuals) {
     }
 
     y_raw <- as.numeric(raw_mat)
-
-    # Detect if library features were pruned (PRUNE_ZERO_WEIGHT_FEATURES)
-    # so we can apply the same pruning after z-scoring
-    .pruned_kept_idx <- NULL
-    if (exists("OPTIMIZED_LIBRARY") && !is.null(OPTIMIZED_LIBRARY)) {
-      for (vv in names(OPTIMIZED_LIBRARY)) {
-        pi <- OPTIMIZED_LIBRARY[[vv]]$pruned_info
-        if (!is.null(pi) && !is.null(pi$kept_idx)) { .pruned_kept_idx <- pi$kept_idx; break }
-      }
-    }
 
     # === CREATE VALIDITY MASK ===
     # Mask for valid (non-NA) observations - DO NOT replace NA with 0
@@ -5968,48 +5697,15 @@ simple_residual_bootstrap <- function(residuals) {
       y_work <- mesma_apply_representation_vec(y_raw, n_base_idx, n_bins, l2_normalize)
       y_norm <- mesma_zscore_vec_by_index(y_work, indices, PARAMS$means, PARAMS$sds, n_bins)
 
-      # Apply PCA-LDA transform to the z-scored observation so inference sits in the same
-      # PCA-LDA-scored feature space as training. This is applied before masking so column
-      # indices remain aligned between obs and library templates.
-      if (!is.null(PARAMS$weights) && length(PARAMS$weights) == length(y_norm)) {
-        y_norm_full_pca_lda <- y_norm  # PCA-LDA weights applied in solver via feature_weights
-      } else {
-        y_norm_full_pca_lda <- y_norm
+      # Always use PCA→LDA feature space (explicit projection).
+      if (is.null(PARAMS$pca_lda) || is.null(PARAMS$pca_lda$std_to_lda) || !is.matrix(PARAMS$pca_lda$std_to_lda)) {
+        stop("[PCA/LDA] Missing std_to_lda transform; PCA→LDA unmixing is required")
       }
-
-      # If the library was pruned, apply the same column subsetting to the
-      # observation vector, validity mask and weights so dimensions match.
-      weights_for_mask <- PARAMS$weights
-      if (!is.null(.pruned_kept_idx) && length(.pruned_kept_idx) < length(y_norm_full_pca_lda)) {
-        y_norm_full_pca_lda <- y_norm_full_pca_lda[.pruned_kept_idx]
-        valid_mask <- valid_mask[.pruned_kept_idx]
-        if (!is.null(weights_for_mask) && length(weights_for_mask) > length(.pruned_kept_idx)) {
-          weights_for_mask <- weights_for_mask[.pruned_kept_idx]
-        }
+      y_for_unmixing <- project_vec_to_pca_lda(y_norm, PARAMS$pca_lda)
+      weights_masked <- compute_pca_lda_feature_weights_from_mask(valid_mask, PARAMS$pca_lda)
+      if (is.null(y_for_unmixing) || is.null(weights_masked)) {
+        stop("[PCA/LDA] Failed to create PCA→LDA observation/weights; PCA→LDA unmixing is required")
       }
-
-      # Mask the observation (z-scored only, no PCA-LDA weighting applied to data)
-      y_norm_masked <- y_norm_full_pca_lda[valid_mask]
-
-      # Extract masked PCA-LDA weights to pass to solver
-      # The solver will apply weights directly to both endmembers and observations
-      if (!is.null(weights_for_mask) && length(weights_for_mask) == length(y_norm_full_pca_lda)) {
-        weights_masked <- weights_for_mask[valid_mask]
-      } else {
-        weights_masked <- rep(1, length(y_norm_masked))
-      }
-
-      # Check if we have sufficient signal (using unweighted norm for validation)
-      y_norm_val <- sqrt(sum(y_norm_masked^2, na.rm = TRUE))
-
-      if (is.na(y_norm_val) || y_norm_val < 1e-9) {
-        if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] loc=%s yr=%d: insufficient signal (norm=%.6g), skipping\n", loc, yr, y_norm_val))
-        return(NULL)
-      }
-
-      # Use the masked, z-score normalized observation (NOT pre-weighted)
-      # Weighting will be applied inside solve_weights_fcls via feature_weights parameter
-      y_for_unmixing <- y_norm_masked
 
       # Perform MESMA using all endmembers (barren + all veg types)
       # Barren is kept as from MESMA - no replacement
@@ -6026,6 +5722,29 @@ simple_residual_bootstrap <- function(residuals) {
       }
       if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG LIBRARY] loc=%s yr=%d: OPTIMIZED_LIBRARY contains %d vegetation types: %s\n",
                   loc, yr, length(OPTIMIZED_LIBRARY), paste(names(OPTIMIZED_LIBRARY), collapse=", ")))
+
+      # Determine the library feature dimension (first non-empty class).
+      lib_feature_dim <- NA_integer_
+      for (vv in names(OPTIMIZED_LIBRARY)) {
+        libv <- OPTIMIZED_LIBRARY[[vv]]
+        if (!is.null(libv) && !is.null(libv$M)) {
+          lib_feature_dim <- ncol(as.matrix(libv$M))
+          break
+        }
+      }
+
+      if (!is.finite(lib_feature_dim) || lib_feature_dim != length(y_for_unmixing)) {
+        stop(sprintf("[PCA/LDA] Optimized library feature dimension mismatch: lib_feature_dim=%s, y_dim=%d", as.character(lib_feature_dim), length(y_for_unmixing)))
+      }
+
+      # Check if we have sufficient signal in the chosen space.
+      y_w_chk <- y_for_unmixing * sqrt(pmax(weights_masked, 0))
+      y_norm_val <- sqrt(sum(y_w_chk^2, na.rm = TRUE))
+
+      if (is.na(y_norm_val) || y_norm_val < 1e-9) {
+        if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] loc=%s yr=%d: insufficient signal (norm=%.6g), skipping\n", loc, yr, y_norm_val))
+        return(NULL)
+      }
       
       top_variants <- list()
 
@@ -6035,63 +5754,56 @@ simple_residual_bootstrap <- function(residuals) {
           next
         }
 
-        # Build masked templates from raw library matrix, applying the SAME PCA-LDA transform
-        # used in training (if available) so the observation and templates lie in identical
-        # feature space before similarity ranking and unmixing.
-        # NOTE: lib$M is already pruned (if PRUNE_ZERO_WEIGHT_FEATURES is enabled)
-        # during precompute_optimized_library_weighted, so no need to prune again here
         M_full <- lib$M
-
-        # Apply PCA-LDA transform to each variant row (if we have matching weights)
-        if (!is.null(PARAMS$weights) && length(PARAMS$weights) == ncol(M_full)) {
-          M_full_trans <- t(apply(M_full, 1, function(r) {
-            as.numeric(r)  # PCA-LDA weights applied in solver via feature_weights
-          }))
-        } else {
-          M_full_trans <- M_full
-        }
-
-        # Mask to the valid observation columns
-        lib_M_masked <- M_full_trans[, valid_mask, drop = FALSE]
-
-        # Guard against NA/Inf in templates after masking
-        lib_M_masked[!is.finite(lib_M_masked)] <- 0
+        if (is.null(M_full)) next
+        if (is.null(dim(M_full))) M_full <- matrix(M_full, nrow = 1)
 
         lib_ids_kept <- lib$ids
+        if (length(lib_ids_kept) != nrow(M_full)) {
+          lib_ids_kept <- rep(paste0(v, "_1"), nrow(M_full))
+        }
 
-        if (nrow(lib_M_masked) == 0) {
+        if (nrow(M_full) == 0) next
+
+        # Templates are stored in PCA→LDA feature space (no masking).
+        if (ncol(M_full) != length(y_for_unmixing)) {
           next
         }
 
-        # L2-normalize each row (used for both similarity ranking and unmixing)
-        if (nrow(lib_M_masked) == 1) {
-          row_norm <- sqrt(sum(lib_M_masked^2, na.rm = TRUE))
-          lib_M_norm_masked <- if (is.finite(row_norm) && row_norm >= 1e-9) lib_M_masked / row_norm else lib_M_masked
+        M_full[!is.finite(M_full)] <- 0
+
+        # Similarity ranking (weighted cosine similarity).
+        w_masked <- weights_masked
+        if (is.null(w_masked) || length(w_masked) != length(y_for_unmixing)) w_masked <- rep(1, length(y_for_unmixing))
+        sqrt_w <- sqrt(pmax(w_masked, 0))
+
+        y_w <- y_for_unmixing * sqrt_w
+        denom_y <- sqrt(sum(y_w^2, na.rm = TRUE)); if (!is.finite(denom_y) || denom_y < 1e-12) denom_y <- 1
+        y_w_norm <- y_w / denom_y
+
+        M_w <- sweep(M_full, 2, sqrt_w, "*")
+        M_w_norm <- t(apply(M_w, 1, function(row) {
+          nr <- sqrt(sum(row^2, na.rm = TRUE))
+          if (!is.finite(nr) || nr < 1e-12) row else row / nr
+        }))
+
+        sims <- as.numeric(M_w_norm %*% y_w_norm)
+        best_idx <- order(sims, decreasing = TRUE)
+
+        # Templates for unmixing are L2-normalized (consistent with existing pipeline).
+        # Use precomputed normalization if available and aligned.
+        if (!is.null(lib$M_norm) && !is.null(dim(lib$M_norm)) && nrow(lib$M_norm) == nrow(lib$M) && ncol(lib$M_norm) == ncol(lib$M)) {
+          M_unmix <- lib$M_norm
         } else {
-          lib_M_norm_masked <- t(apply(lib_M_masked, 1, function(row) {
-            row_norm <- sqrt(sum(row^2, na.rm = TRUE))
-            if (!is.finite(row_norm) || row_norm < 1e-9) row else row / row_norm
+          M_unmix <- t(apply(M_full, 1, function(row) {
+            nr <- sqrt(sum(row^2, na.rm = TRUE))
+            if (!is.finite(nr) || nr < 1e-12) row else row / nr
           }))
         }
 
-        # Compute similarities using weighted vectors (for ranking only)
-        w_masked <- weights_masked
-        if (is.null(w_masked) || length(w_masked) != length(y_for_unmixing)) w_masked <- rep(1, length(y_for_unmixing))
-        y_for_sim <- y_for_unmixing * sqrt(pmax(w_masked, 0))
-        denom_sim <- sqrt(sum(y_for_sim^2, na.rm = TRUE)); if (denom_sim < 1e-12) denom_sim <- 1
-        y_sim_norm <- y_for_sim / denom_sim
-        sims <- as.numeric(lib_M_norm_masked %*% y_sim_norm)
-        # Include all variants for consideration (remove similarity-based top-K filtering)
-        best_idx <- order(sims, decreasing=TRUE)
-        
         top_variants[[v]] <- lapply(best_idx, function(i) {
-          # Use L2-normalized masked template for unmixing
-          masked_vec <- lib_M_norm_masked[i, ]
-          if (isTRUE(TESTING_MODE) && length(masked_vec) != length(y_for_unmixing)) {
-            cat(sprintf("[WARN fit_one_task] loc=%s yr=%d veg=%s: template length mismatch (template=%d, y=%d)\n",
-                        loc, yr, v, length(masked_vec), length(y_for_unmixing)))
-          }
-          list(vec = masked_vec, id = lib_ids_kept[i], similarity = sims[i])
+          vec_i <- as.numeric(M_unmix[i, ])
+          list(vec = vec_i, id = lib_ids_kept[i], similarity = sims[i])
         })
       }
 
@@ -6142,10 +5854,13 @@ simple_residual_bootstrap <- function(residuals) {
       # DIAGNOSTIC: Check coefficient values immediately after extraction
 
       # CRITICAL DEBUG: Print MESMA coefficients to console for diagnosis
-      cat(sprintf("[MESMA OUTPUT] loc=%s yr=%d: %s (rmse=%.4f)\n",
+      delta_norm_val <- if (!is.null(best_result$delta_norm)) best_result$delta_norm else NA
+      loss_type_val <- if (!is.null(best_result$loss_type)) best_result$loss_type else "unknown"
+      cat(sprintf("[MESMA OUTPUT] loc=%s yr=%d: %s (rmse=%.4f, solver=%s, delta_norm=%.4g)\n",
                   loc, yr,
                   paste(sprintf("%s=%.4f", names(coefs), coefs), collapse=", "),
-                  rmse))
+                  rmse, loss_type_val,
+                  if (is.finite(delta_norm_val)) delta_norm_val else 0))
 
       
       # Calculate model selection uncertainty from top models
@@ -6227,6 +5942,27 @@ simple_residual_bootstrap <- function(residuals) {
           dominant_class <- names(which.max(coefs))
         }
 
+        # Precompute IWLMM bounds for MC draws (reuse variant pool)
+        mc_iwlmm_bounds <- NULL
+        mc_iwlmm_active <- exists("USE_IWLMM") && isTRUE(USE_IWLMM)
+        if (mc_iwlmm_active && !is.null(E_best_masked)) {
+          mc_bound_sigma <- if (exists("IWLMM_BOUND_SIGMA")) IWLMM_BOUND_SIGMA else 2.0
+          mc_iwlmm_bounds <- matrix(0, nrow = nrow(E_best_masked), ncol = ncol(E_best_masked))
+          for (j in seq_along(mc_veg_subset)) {
+            v <- mc_veg_subset[j]
+            cands <- top_variants[[v]]
+            if (!is.null(cands) && length(cands) >= 2) {
+              Mv <- do.call(rbind, lapply(cands, function(z) as.numeric(z$vec)))
+              if (!is.null(Mv) && nrow(Mv) >= 2 && ncol(Mv) == nrow(E_best_masked)) {
+                sds <- apply(Mv, 2, sd, na.rm = TRUE)
+                sds[!is.finite(sds)] <- 0
+                mc_iwlmm_bounds[, j] <- mc_bound_sigma * sds
+              }
+            }
+          }
+          if (!any(mc_iwlmm_bounds > 0)) mc_iwlmm_bounds <- NULL
+        }
+
         # w_draws sized to full coef vector; inactive types stay 0
         w_draws <- matrix(NA_real_, nrow = length(coefs), ncol = n_mc)
         rownames(w_draws) <- names(coefs)
@@ -6248,7 +5984,12 @@ simple_residual_bootstrap <- function(residuals) {
             }
           }
 
-          res_mc <- solve_weights_fcls(E_mc, y_mc, feature_weights = weights_masked)
+          # Use IWLMM for MC draws when active
+          if (mc_iwlmm_active && !is.null(mc_iwlmm_bounds)) {
+            res_mc <- solve_weights_iwlmm(E_mc, y_mc, bounds = mc_iwlmm_bounds, feature_weights = weights_masked)
+          } else {
+            res_mc <- solve_weights_fcls(E_mc, y_mc, feature_weights = weights_masked)
+          }
           if (!is.null(res_mc) && !is.null(res_mc$w) && length(res_mc$w) == n_mc_subset) {
             # Expand subset weights back to full veg vector
             w_mc_full <- rep(0, length(coefs))
@@ -6395,7 +6136,6 @@ simple_residual_bootstrap <- function(residuals) {
           if (isTRUE(TESTING_MODE)) cat(sprintf("[WARN fit_one_task] loc=%s yr=%d: Inseparable variant check failed: %s\n", loc, yr, e$message))
       })
 
-      # Barren is kept as from MESMA - no replacement
       # Aggregate by vegetation type (sum coefficients for same veg type)
       # Must happen AFTER all filtering but BEFORE creating diagnostics/coef_agg usage
       if (nrow(coef_df) > 0) {
@@ -6421,15 +6161,18 @@ simple_residual_bootstrap <- function(residuals) {
       # --- Scale vegetation fractions by index-derived total vegetation cover ---
       # MESMA provides relative proportions among vegetation types.
       # We multiply the vegetation fractions by total_veg_cover (from MSAVI) to get absolute fractions.
-      # Barren fraction from MESMA is preserved - we do NOT replace it with index-derived estimate.
-      # NO equal distribution fallback - if MESMA says 0 vegetation, we keep it as 0.
+      # We output a single barren fraction (1 - total_veg_cover) to keep absolute fractions coherent.
 
-      veg_coefs_mask <- tolower(coef_agg$Veg) != "barren"
+      coef_agg$Veg <- as.character(coef_agg$Veg)
+      coef_agg_barren_mask <- tolower(coef_agg$Veg) == "barren"
+      coef_agg_barren_mask[is.na(coef_agg_barren_mask)] <- FALSE
+      veg_coefs_mask <- !coef_agg_barren_mask
       veg_coefs_mask[is.na(veg_coefs_mask)] <- FALSE
+
       sum_original_veg_coefs <- sum(coef_agg$coef[veg_coefs_mask], na.rm = TRUE)
 
       # Scale vegetation fractions: multiply by total_veg_cover / sum_of_veg_fractions
-      # This preserves MESMA's relative proportions while scaling to index-derived total veg cover
+      # This preserves MESMA's relative proportions while scaling to index-derived total veg cover.
       scale_factor <- 1.0
       if (is.finite(sum_original_veg_coefs) && sum_original_veg_coefs > 1e-9) {
         scale_factor <- total_veg_cover / sum_original_veg_coefs
@@ -6438,17 +6181,9 @@ simple_residual_bootstrap <- function(residuals) {
         # MESMA returned 0 vegetation - keep it as 0, don't fabricate equal fractions
       }
 
-      # Keep MESMA's barren fraction - do NOT replace with index-derived estimate
-      # Just ensure barren row exists in coef_agg
-      barren_idx <- which(tolower(coef_agg$Veg) == "barren")
-      if (length(barren_idx) == 0) {
-        # Add barren row from MESMA if it doesn't exist (use 1 - sum of scaled veg fractions)
-        mesma_barren <- 1 - sum(coef_agg$coef[veg_coefs_mask], na.rm = TRUE)
-        mesma_barren <- pmax(0, pmin(1, mesma_barren))
-        barren_row <- data.frame(Veg = "barren", coef = mesma_barren)
-        coef_agg <- rbind(coef_agg, barren_row)
-      }
-      # Note: If barren already exists in coef_agg, we keep MESMA's original value
+      # Drop any MESMA-derived barren row(s) and append a single PPI/MSAVI-based barren row.
+      coef_agg <- coef_agg[veg_coefs_mask, , drop = FALSE]
+      coef_agg <- rbind(coef_agg, data.frame(Veg = "barren", coef = barren_fraction, stringsAsFactors = FALSE))
 
       # --- Propagate scaling to coef_df (no equal distribution fallback) ---
 
@@ -6471,10 +6206,17 @@ simple_residual_bootstrap <- function(residuals) {
         }
         stop(e)
       })
-      
+
+      # Remove any MESMA-derived barren rows and append a single PPI/MSAVI-based barren row.
       if (nrow(coef_df) > 0) {
-        barren_row_df <- coef_df[1, , drop=FALSE] 
-        barren_row_df[] <- NA 
+        barren_rows <- tolower(coef_df$Veg) == "barren"
+        barren_rows[is.na(barren_rows)] <- FALSE
+        if (any(barren_rows)) coef_df <- coef_df[!barren_rows, , drop = FALSE]
+      }
+
+      if (nrow(coef_df) > 0) {
+        barren_row_df <- coef_df[1, , drop = FALSE]
+        barren_row_df[] <- NA
         barren_row_df$location_id <- loc
         barren_row_df$pheno_year <- yr
         barren_row_df$lat <- lat_val
@@ -6489,7 +6231,6 @@ simple_residual_bootstrap <- function(residuals) {
       } else {
         # No vegetation detected, use PPI barren fraction
         if (isTRUE(is.finite(barren_fraction) && barren_fraction > 0)) {
-          # Return barren only result
           coef_df <- data.frame(
             location_id = loc,
             pheno_year = yr,
@@ -6498,7 +6239,7 @@ simple_residual_bootstrap <- function(residuals) {
             Veg = "barren",
             variant_id = "barren_ppi",
             coef = barren_fraction,
-            rmse = if(exists("rmse") && is.numeric(rmse)) rmse else 0,
+            rmse = if (exists("rmse") && is.numeric(rmse)) rmse else 0,
             coef_025 = NA,
             coef_975 = NA,
             coef_sd = 0,
@@ -6511,7 +6252,6 @@ simple_residual_bootstrap <- function(residuals) {
             stringsAsFactors = FALSE
           )
         } else {
-          # No vegetation and no barren - fail
           if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_task] loc=%s yr=%d: coef_df empty after barren removal\n", loc, yr))
           return(NULL)
         }
@@ -6589,7 +6329,6 @@ simple_residual_bootstrap <- function(residuals) {
 
   }
 
-# New function: Process all years for a single location with multi-year bootstrap
   fit_one_location <- function(location_data) {
     if (is.null(location_data) || nrow(location_data) == 0) {
       if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_location] Received NULL or empty location_data\n"))
@@ -6610,11 +6349,8 @@ simple_residual_bootstrap <- function(residuals) {
       return(NULL)
     }
 
-    # Process each year individually first (to get point estimates and chosen variants)
+    # Process each year individually
     year_results <- list()
-    y_vecs_by_year <- list()
-    chosen_ids_by_year <- list()
-    w_hat_by_year <- list()
 
     # Wrap per-location processing in tryCatch so a single error does not discard valid year results
     out <- tryCatch({
@@ -6636,243 +6372,15 @@ simple_residual_bootstrap <- function(residuals) {
           })
 
         if (!is.null(res_yr)) {
-          tryCatch({
-            year_results[[as.character(yr)]] <- res_yr
-          }, error = function(e) {
-            if (isTRUE(TESTING_MODE)) cat(sprintf("[ERROR assigning year_results] loc=%s yr=%d: %s\n", loc, yr, e$message))
-            stop(e)  # Re-throw to be caught by outer handler
-          })
-
-          # Store data needed for multi-year bootstrap - wrapped in tryCatch to isolate errors
-          tryCatch({
-            # For inference/validation data, do NOT interpolate - use only actual observations.
-            # IMPORTANT: build from the same raw feature columns (base_indices) as fit_one_task(),
-            # then apply representation + z-scoring to match the library feature space.
-            n_bins <- TEMPORAL_BUDGET
-            base_indices <- if (!is.null(MESMA_PARAMS$base_indices)) MESMA_PARAMS$base_indices else MESMA_PARAMS$indices
-            n_base_idx <- length(base_indices)
-            l2_normalize <- isTRUE(MESMA_PARAMS$l2_normalize)
-
-            raw_mat_yr <- build_pentad_matrix(year_data, base_indices, interpolate = FALSE)
-            if (!is.null(raw_mat_yr)) {
-              vec_raw <- as.numeric(raw_mat_yr)
-              y_work <- mesma_apply_representation_vec(vec_raw, n_base_idx, n_bins, l2_normalize)
-              y_norm <- mesma_zscore_vec_by_index(y_work, MESMA_PARAMS$indices, MESMA_PARAMS$means, MESMA_PARAMS$sds, n_bins)
-
-              expected_length <- length(MESMA_PARAMS$indices) * n_bins
-              if (length(y_norm) != expected_length) {
-                if (isTRUE(TESTING_MODE)) {
-                  cat(sprintf("[WARN fit_one_location] loc=%s yr=%d: y_norm length mismatch (got %d, expected %d)\n"))
-                }
-              } else {
-                y_norm[!is.finite(y_norm)] <- 0
-                y_vecs_by_year[[length(y_vecs_by_year) + 1]] <- y_norm
-              }
-
-              # Get chosen variants and weights from this year's result
-              if (!is.null(res_yr$chosen_variants)) {
-                chosen_ids_by_year[[yr]] <- res_yr$chosen_variants
-              }
-              if (!is.null(res_yr$vegetation_proportions)) {
-                w_hat_by_year[[yr]] <- res_yr$vegetation_proportions
-              }
-            }
-          }, error = function(e) {
-            if (isTRUE(TESTING_MODE)) {
-              cat(sprintf("[WARN fit_one_location] loc=%s yr=%d: multi-year processing failed (%s), continuing with single-year results\n",
-                loc, yr, e$message))
-            }
-          })
+          year_results[[as.character(yr)]] <- res_yr
         } else {
           if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_location] loc=%s yr=%d: fit_one_task returned NULL\n", loc, yr))
         }
       }
 
-      # If we have results for multiple years and ENABLE_UNCERTAINTY, do multi-year bootstrap
       if (length(year_results) == 0) {
         if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG fit_one_location] loc=%s: no successful year results\n", loc))
         return(NULL)
-      }
-
-      # Run per-year bootstrap uncertainty as long as we have at least one successful year.
-      # (Historically this was gated on successfully reconstructing a full feature vector for every year,
-      # but the bootstrap below only depends on each year's fitted residuals/endmembers.)
-      if (isTRUE(ENABLE_UNCERTAINTY) && isTRUE(ENABLE_MULTI_YEAR_BOOTSTRAP) && length(year_results) >= 1) {
-        # Get comp_templates from first successful year result
-        top_variants <- NULL
-
-        for (yr in years) {
-          res_yr <- year_results[[as.character(yr)]]
-          if (!is.null(res_yr) && !is.null(res_yr$chosen_variants)) {
-            # Build comp_templates from the MESMA library
-            vegs <- names(res_yr$chosen_variants)
-            if (is.null(top_variants)) {
-              top_variants <- list()
-              for (v in vegs) top_variants[[v]] <- list()
-            }
-
-            break
-          }
-        }
-
-        # Build comp_templates from mesma_lib
-        if (!is.null(top_variants) && exists("mesma_lib")) {
-          comp_templates <- list()
-          for (v in names(top_variants)) {
-            if (v %in% names(mesma_lib)) {
-              comp_templates[[v]] <- mesma_lib[[v]]
-            }
-          }
-        }
-
-        # Perform per-year bootstrap to estimate uncertainty (coef CI, sd, rmse CI, variant frequencies)
-        if (isTRUE(ENABLE_UNCERTAINTY)) {
-          B_loc <- if (exists("BOOTSTRAP_B")) min(BOOTSTRAP_B, 100L) else 100L
-          if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG] Performing local bootstrap (B=%d) for loc=%s\n", B_loc, loc))
-
-          for (yr in years) {
-            res_yr <- year_results[[as.character(yr)]]
-            if (is.null(res_yr) || is.null(res_yr$residuals)) next
-
-            year_data <- location_data[location_data$pheno_year == yr, , drop = FALSE]
-            n_obs <- nrow(year_data)
-            if (n_obs < max(6, MIN_OBS_PER_LOC_YEAR)) {
-              if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG] Too few observations for bootstrap loc=%s yr=%s (n_obs=%d); skipping\n", loc, yr, n_obs))
-              next
-            }
-
-            boot_coef_by_veg <- list()
-            boot_variant_counts <- list()
-            boot_rmse <- numeric(0)
-
-            # Suppress verbose output during bootstraps
-            suppress_output_safely({
-              for (b in seq_len(B_loc)) {
-                residuals_boot <- simple_residual_bootstrap(res_yr$residuals)
-                y_boot <- res_yr$y_hat + residuals_boot
-
-                E_boot <- res_yr$E_best
-                if (is.null(E_boot) || !is.matrix(E_boot) || ncol(E_boot) < 1) next
-
-                res_b <- tryCatch({
-                  solve_weights_fcls(E_boot, y_boot, feature_weights = res_yr$weights_masked)
-                }, error = function(e) NULL)
-
-                if (is.null(res_b)) next
-
-                coefs_b <- res_b$w
-                chosen_ids_b <- res_yr$coef_df$variant_id
-                names(chosen_ids_b) <- res_yr$coef_df$Veg
-                names(coefs_b) <- res_yr$coef_df$Veg
-
-                dfb <- data.frame(
-                    Veg = sapply(strsplit(chosen_ids_b, "_(v|opt)"), `[`, 1),
-                    coef = coefs_b,
-                    stringsAsFactors = FALSE
-                )
-
-                for (i in seq_len(nrow(dfb))) {
-                  vg <- as.character(dfb$Veg[i])
-                  if (is.na(vg)) next
-                  val <- as.numeric(dfb$coef[i])
-                  if (!is.finite(val)) next
-                  if (is.null(boot_coef_by_veg[[vg]])) boot_coef_by_veg[[vg]] <- numeric(0)
-                  boot_coef_by_veg[[vg]] <- c(boot_coef_by_veg[[vg]], val)
-                }
-
-                for (i in seq_along(chosen_ids_b)) {
-                  vg <- names(chosen_ids_b)[i]
-                  if (is.na(vg) || !is.character(vg)) next
-                  vid <- chosen_ids_b[[i]]
-                  if (is.na(vid)) next
-                  if (is.null(boot_variant_counts[[vg]])) boot_variant_counts[[vg]] <- list()
-                  boot_variant_counts[[vg]][[as.character(vid)]] <- (boot_variant_counts[[vg]][[as.character(vid)]] %||% 0) + 1L
-                }
-
-                if (!is.null(res_b$rmse) && is.finite(as.numeric(res_b$rmse))) boot_rmse <- c(boot_rmse, as.numeric(res_b$rmse))
-              }
-            })
-            
-            # Build coef CI table
-            coef_ci_df <- NULL
-            if (length(boot_coef_by_veg) > 0) {
-              rows <- lapply(names(boot_coef_by_veg), function(vg) {
-                vals <- boot_coef_by_veg[[vg]]
-                vals <- vals[is.finite(vals)]
-                if (length(vals) == 0) return(NULL)
-                data.frame(Veg = vg,
-                           coef_median = as.numeric(median(vals, na.rm = TRUE)),
-                           coef_025 = as.numeric(quantile(vals, 0.025, na.rm = TRUE)),
-                           coef_975 = as.numeric(quantile(vals, 0.975, na.rm = TRUE)),
-                           coef_sd = as.numeric(stats::sd(vals, na.rm = TRUE)),
-                           interval = as.numeric(quantile(vals, 0.975, na.rm = TRUE) - quantile(vals, 0.025, na.rm = TRUE)),
-                           stringsAsFactors = FALSE)
-              })
-              rows <- rows[!sapply(rows, is.null)]
-              if (length(rows) > 0) coef_ci_df <- do.call(rbind, rows)
-            }
-
-            # Build variant frequency table
-            variant_freq_df <- NULL
-            if (length(boot_variant_counts) > 0) {
-              rows2 <- lapply(names(boot_variant_counts), function(vg) {
-                tbl <- boot_variant_counts[[vg]]
-                keys <- names(tbl)
-                counts <- as.integer(unlist(tbl))
-                dfv <- data.frame(Veg = rep(vg, length(keys)), Variant = keys, N = counts, Percent = counts / sum(counts) * 100, stringsAsFactors = FALSE)
-                dfv
-              })
-              rows2 <- rows2[!sapply(rows2, is.null)]
-              if (length(rows2) > 0) variant_freq_df <- do.call(rbind, rows2)
-            }
-
-            rmse_ci <- NULL
-            if (length(boot_rmse) > 0) {
-              rmse_ci <- as.numeric(quantile(boot_rmse, c(0.025, 0.975), na.rm = TRUE))
-            }
-
-            # Attach uncertainty to year_results
-            if (!is.null(coef_ci_df) || !is.null(variant_freq_df) || !is.null(rmse_ci)) {
-              if (is.null(year_results[[as.character(yr)]]$uncertainty)) year_results[[as.character(yr)]]$uncertainty <- list()
-              year_results[[as.character(yr)]]$uncertainty$coef_ci <- coef_ci_df
-              year_results[[as.character(yr)]]$uncertainty$variant_freq <- variant_freq_df
-              year_results[[as.character(yr)]]$uncertainty$rmse_ci <- rmse_ci
-              
-              # Update coef_df with uncertainty metrics if available
-              if (!is.null(coef_ci_df)) {
-                  curr_df <- year_results[[as.character(yr)]]$coef_df
-                  if (!is.null(curr_df)) {
-                      # We loop over rows of coef_ci_df
-                      for(r_idx in seq_len(nrow(coef_ci_df))) {
-                          v_type <- coef_ci_df$Veg[r_idx]
-                          # Find matching row(s) in curr_df (should be by Veg)
-                          match_idx <- which(curr_df$Veg == v_type)
-                          if(length(match_idx) > 0) {
-                              curr_df$coef_sd[match_idx] <- coef_ci_df$coef_sd[r_idx]
-                              curr_df$coef_025[match_idx] <- coef_ci_df$coef_025[r_idx]
-                              curr_df$coef_975[match_idx] <- coef_ci_df$coef_975[r_idx]
-                              curr_df$interval[match_idx] <- coef_ci_df$interval[r_idx]
-                              # Store median bootstrap estimate for plotting/prediction preference
-                              if ("coef_median" %in% names(coef_ci_df)) {
-                                curr_df$coef_median[match_idx] <- coef_ci_df$coef_median[r_idx]
-                              }
-                            }
-                        }
-                        year_results[[as.character(yr)]]$coef_df <- curr_df
-                    }
-                }
-              }
-            }
-          }
-
-        if (!is.null(top_variants) && exists("mesma_lib")) {
-          comp_templates <- list()
-          for (v in names(top_variants)) {
-            if (v %in% names(mesma_lib)) {
-              comp_templates[[v]] <- mesma_lib[[v]]
-            }
-          }
-        }
       }
 
       # Return results for all years
@@ -7073,7 +6581,7 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
   }
   
   if (!isTRUE(QUIET_MODE)) {
-    cat("Preparing locations for batched processing (multi-year bootstrap)...\n")
+    cat("Preparing locations for batched processing...\n")
 
     # DEBUG: Check what columns df_tasks has
     if (isTRUE(TESTING_MODE)) cat(sprintf("[DEBUG VALIDATION DATA] df_tasks has %d rows, %d columns\n", nrow(df_tasks), ncol(df_tasks)))
@@ -7120,7 +6628,16 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
 
     training_results_list <- aggregate_batch_results(batch_results, training_results_list, save_csv_dir = TEMP_RESULTS_DIR)
 
-  if (!isTRUE(QUIET_MODE)) cat(sprintf("\r  [Batch %d/%d complete]  ", i, n_batches))
+if (!isTRUE(QUIET_MODE)) {
+      # Use a carriage-return progress update only in interactive sessions;
+      # otherwise emit a single-line progress message to avoid cluttering logs.
+      if (interactive()) {
+        cat(sprintf("\r  [Batch %d/%d complete]  ", i, n_batches))
+        flush.console()
+      } else {
+        cat(sprintf("[Batch %d/%d complete]\n", i, n_batches))
+      }
+    }
   }
   cat("\n")
   
@@ -7486,7 +7003,7 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
       cat("[INFERENCE] NDVI data not available for inference; skipping NDVI aggregation.\n")
     }
 
-    # --- INFERENCE: Aggregate bootstrap (with Dirichlet perturbation) ---
+    # --- INFERENCE: Aggregate bootstrap ---
     if (!is.null(inference_coefs) && nrow(inference_coefs) > 0) {
       cat("[INFERENCE] Running aggregate bootstrap\n")
       aggregate_inf_full <- tryCatch({
@@ -7502,6 +7019,15 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
     } else {
       cat("[INFERENCE] No inference coefficients available; skipping aggregate bootstrap.\n")
     }
+
+    # --- Pixel purity & mixture composition plots ---
+    cat("[INFERENCE] Generating pixel purity and mixture composition plots\n")
+    tryCatch(
+      plot_pixel_purity_and_mixtures(inference_coefs, pure_threshold = 0.75,
+                                     mix_contrib_threshold = 0.10,
+                                     use_excluded_years_shade = FALSE),
+      error = function(e) cat(sprintf("[PURITY] Failed: %s\n", e$message))
+    )
 
   } else {
     cat("[INFERENCE] No inference data to process\n")
@@ -7700,7 +7226,6 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
           frac_col <- paste0("frac_", v) # e.g. frac_populus
           
           if (frac_col %in% names(sub)) {
-            # Use raw fraction directly (no rescaling needed - MESMA coeffs sum to 1)
             mean_frac <- mean(sub[[frac_col]], na.rm = TRUE)
             cat(sprintf("  %s: mean predicted fraction = %.3f\n", v, mean_frac))
           } else {
@@ -7814,13 +7339,7 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
                         all_classes[i], diag_vals[i], diag_vals[i] * 100))
           }
 
-          # Store confusion matrix for Dirichlet perturbation in bootstrap
-          # Compute validation sample sizes per class
-          val_sample_sizes <- table(val_coefs_veg$true_veg)
-          val_sample_sizes <- setNames(as.numeric(val_sample_sizes), names(val_sample_sizes))
 
-          store_confusion_matrix(mat_rownorm, sample_sizes = val_sample_sizes)
-          cat(sprintf("\n[DIRICHLET] Confusion matrix stored for classification uncertainty propagation\n"))
 
           # Store OOB fraction residuals for MC uncertainty propagation
           # Residual = predicted_fraction - true_fraction (where true is 1 for own class, 0 for others)
@@ -7982,7 +7501,7 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
     cat("[WARNING] No validation coefficients available for accuracy computation\n")
   }
 
-  # --- VALIDATION: Aggregate bootstrap (with Dirichlet perturbation) ---
+  # --- VALIDATION: Aggregate bootstrap ---
   if (exists("validation_coefs") && !is.null(validation_coefs) && nrow(validation_coefs) > 0) {
     cat("[VALIDATION] Running aggregate bootstrap\n")
     aggregate_val_full <- tryCatch({
@@ -8058,24 +7577,21 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
       return(NULL)
     }
 
-    # Use the same raw feature columns as fit_one_task() uses for build_pentad_matrix()
-    spectral_cols <- if (!is.null(MESMA_PARAMS$base_indices) && length(MESMA_PARAMS$base_indices) > 0) MESMA_PARAMS$base_indices else MESMA_PARAMS$indices
-    if (length(spectral_cols) == 0) {
-      cat("[SKIP] No spectral columns identified\n")
-      return(NULL)
-    }
+    # Mix at the raw-band level so derived indices (MSAVI, etc.) are physically consistent.
+    band_cols <- if (exists("RAW_BANDS", inherits = TRUE)) get("RAW_BANDS", inherits = TRUE) else c("blue", "green", "red", "nir", "swir1", "swir2")
+    band_cols <- unique(as.character(band_cols))
 
-    # Check that spectral columns exist in df_validation
-    available_cols <- intersect(spectral_cols, names(df_validation))
-    if (length(available_cols) < length(spectral_cols) * 0.5) {
-      cat(sprintf("[SKIP] Too few spectral columns available in df_validation (%d/%d)\n",
-                  length(available_cols), length(spectral_cols)))
+    df_validation_bands <- normalize_band_names(df_validation, bands = band_cols)
+    available_cols <- intersect(band_cols, names(df_validation_bands))
+    if (length(available_cols) < length(band_cols)) {
+      cat(sprintf("[SKIP] Missing raw band columns in df_validation (%d/%d present). Need: %s\n",
+                  length(available_cols), length(band_cols), paste(band_cols, collapse = ", ")))
       return(NULL)
     }
-    spectral_cols <- available_cols
+    band_cols <- available_cols
 
     # Get vegetation classes (excluding barren for mixing)
-    df_val_with_veg <- df_validation
+    df_val_with_veg <- df_validation_bands
     if (!"Veg" %in% names(df_val_with_veg)) {
       cat("[SKIP] No Veg column in df_validation\n")
       return(NULL)
@@ -8088,8 +7604,8 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
       return(NULL)
     }
 
-    cat(sprintf("[MIX] Using %d spectral columns and %d vegetation classes: %s\n",
-                length(spectral_cols), length(veg_classes), paste(veg_classes, collapse=", ")))
+    cat(sprintf("[MIX] Using %d raw band columns and %d vegetation classes: %s\n",
+          length(band_cols), length(veg_classes), paste(veg_classes, collapse=", ")))
 
     # Filter to TRAIN_YEARS if defined
     if (exists("TRAIN_YEARS") && !is.null(TRAIN_YEARS) && "pheno_year" %in% names(df_val_with_veg)) {
@@ -8099,7 +7615,7 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
 
     # Aggregate spectra to location-year level (mean across observations)
     # This gives us one "representative spectrum" per location-year
-    required_cols <- c("location_id", "pheno_year", "Veg", spectral_cols)
+    required_cols <- c("location_id", "pheno_year", "Veg", band_cols)
     if ("doy" %in% names(df_val_with_veg)) required_cols <- c(required_cols, "doy")
     if ("date" %in% names(df_val_with_veg)) required_cols <- c(required_cols, "date")
     if ("lat" %in% names(df_val_with_veg)) required_cols <- c(required_cols, "lat")
@@ -8195,7 +7711,7 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
             # Not enough common DOYs, aggregate to mean
             data_a_matched <- data_a[1, , drop = FALSE]
             data_b_matched <- data_b[1, , drop = FALSE]
-            for (sc in spectral_cols) {
+            for (sc in band_cols) {
               data_a_matched[[sc]] <- mean(data_a[[sc]], na.rm = TRUE)
               data_b_matched[[sc]] <- mean(data_b[[sc]], na.rm = TRUE)
             }
@@ -8206,7 +7722,7 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
           # No DOY, use first row with mean values
           data_a_matched <- data_a[1, , drop = FALSE]
           data_b_matched <- data_b[1, , drop = FALSE]
-          for (sc in spectral_cols) {
+          for (sc in band_cols) {
             data_a_matched[[sc]] <- mean(data_a[[sc]], na.rm = TRUE)
             data_b_matched[[sc]] <- mean(data_b[[sc]], na.rm = TRUE)
           }
@@ -8226,7 +7742,7 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
         mixed_data$class_b <- class_b
 
         # Mix spectral values: 0.5 * A + 0.5 * B
-        for (sc in spectral_cols) {
+        for (sc in band_cols) {
           val_a <- data_a_matched[[sc]][1:n_obs]
           val_b <- data_b_matched[[sc]][1:n_obs]
           if (length(val_a) == n_obs && length(val_b) == n_obs) {
@@ -8303,6 +7819,37 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
 
     mix_coefs_combined <- do.call(rbind, all_mix_coefs)
 
+    # Compute sample-level predicted total-veg and normalized veg-only fractions
+    if (!is.null(mix_coefs_combined) && nrow(mix_coefs_combined) > 0) {
+      wide_all <- mix_coefs_combined %>%
+        dplyr::mutate(Veg_class = sub("(_opt_[0-9]+|_single|_ppi)$", "", tolower(Veg))) %>%
+        dplyr::group_by(location_id, pheno_year, Veg_class) %>%
+        dplyr::summarise(coef = sum(coef, na.rm = TRUE), .groups = "drop") %>%
+        tidyr::pivot_wider(names_from = Veg_class, values_from = coef, values_fill = 0)
+
+      meta_cols_all <- c("location_id", "pheno_year")
+      veg_cols_all <- setdiff(names(wide_all), meta_cols_all)
+      veg_cols_no_barren_all <- setdiff(veg_cols_all, "barren")
+
+      wide_all$pred_total_veg_cover <- 0
+      if (length(veg_cols_no_barren_all) > 0) {
+        wide_all$pred_total_veg_cover <- rowSums(wide_all[, veg_cols_no_barren_all, drop = FALSE], na.rm = TRUE)
+      }
+
+      # Merge pred_total_veg_cover back into long-form mix_coefs_combined
+      mix_coefs_combined <- dplyr::left_join(mix_coefs_combined,
+                                             wide_all[, c("location_id", "pheno_year", "pred_total_veg_cover")],
+                                             by = c("location_id", "pheno_year"))
+
+      # Per-row veg-only normalized fraction
+      mix_coefs_combined$coef_norm <- NA_real_
+      veg_mask_long <- tolower(mix_coefs_combined$Veg) != "barren" & is.finite(mix_coefs_combined$pred_total_veg_cover) & mix_coefs_combined$pred_total_veg_cover > 1e-9
+      mix_coefs_combined$coef_norm[veg_mask_long] <- mix_coefs_combined$coef[veg_mask_long] / mix_coefs_combined$pred_total_veg_cover[veg_mask_long]
+      mix_coefs_combined$coef_norm[is.na(mix_coefs_combined$coef_norm)] <- NA_real_
+      mix_coefs_combined$coef_norm[mix_coefs_combined$coef_norm < 0] <- 0
+      mix_coefs_combined$coef_norm[mix_coefs_combined$coef_norm > 1] <- 1
+    }
+
     # Analyze results
     cat("\n--- ARTIFICIAL MIX VALIDATION RESULTS ---\n")
     cat(sprintf("Total unmixed mix samples: %d\n", length(unique(mix_coefs_combined$location_id))))
@@ -8313,22 +7860,82 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
       class_a <- coefs$class_a[1]
       class_b <- coefs$class_b[1]
 
-      # Pivot to wide format
+      # Pivot to wide format (one row per mixed sample)
       coefs_wide <- coefs %>%
         dplyr::mutate(Veg_class = sub("(_opt_[0-9]+|_single|_ppi)$", "", tolower(Veg))) %>%
         dplyr::group_by(location_id, pheno_year, Veg_class) %>%
         dplyr::summarise(coef = sum(coef, na.rm = TRUE), .groups = "drop") %>%
         tidyr::pivot_wider(names_from = Veg_class, values_from = coef, values_fill = 0)
 
+      # Attach MSAVI-derived expected total veg cover (fallback to 1.0 if missing)
+      msavi_col_mixed <- if ("MSAVI_raw" %in% names(mixed_df)) "MSAVI_raw" else if ("MSAVI" %in% names(mixed_df)) "MSAVI" else NA_character_
+      if (!is.na(msavi_col_mixed)) {
+        meta_msavi_local <- mixed_df %>%
+          dplyr::group_by(location_id, pheno_year) %>%
+          dplyr::summarise(msavi = median(.data[[msavi_col_mixed]], na.rm = TRUE), .groups = "drop") %>%
+          dplyr::mutate(
+            total_veg_cover_expected = pmin(pmax(msavi / (0.5 + msavi), 0), 1),
+            expected_barren = 1 - total_veg_cover_expected
+          )
+        meta_msavi_local$total_veg_cover_expected[!is.finite(meta_msavi_local$total_veg_cover_expected)] <- 1.0
+        meta_msavi_local$expected_barren[!is.finite(meta_msavi_local$expected_barren)] <- 0.0
+      } else {
+        meta_msavi_local <- unique(mixed_df[, c("location_id", "pheno_year")])
+        meta_msavi_local$msavi <- NA_real_
+        meta_msavi_local$total_veg_cover_expected <- 1.0
+        meta_msavi_local$expected_barren <- 0.0
+      }
+      coefs_wide <- dplyr::left_join(coefs_wide, meta_msavi_local, by = c("location_id", "pheno_year"))
+
       frac_col_a <- tolower(class_a)
       frac_col_b <- tolower(class_b)
 
-      # Identify all predicted vegetation columns (exclude metadata columns)
-      meta_cols <- c("location_id", "pheno_year")
+      # Identify predicted vegetation columns (exclude metadata columns)
+      meta_cols <- c("location_id", "pheno_year", "msavi", "total_veg_cover_expected", "expected_barren")
       all_veg_cols <- setdiff(names(coefs_wide), meta_cols)
+      veg_cols_no_barren <- setdiff(all_veg_cols, "barren")
 
-      cat(sprintf("\n  Mix %s + %s (N=%d):\n", class_a, class_b, nrow(coefs_wide)))
+      # Compute predicted total veg cover (sum of vegetation types, excludes barren)
+      coefs_wide$pred_total_veg_cover <- 0
+      if (length(veg_cols_no_barren) > 0) {
+        coefs_wide$pred_total_veg_cover <- rowSums(coefs_wide[, veg_cols_no_barren, drop = FALSE], na.rm = TRUE)
+      }
 
+      # Row-normalize vegetation-only predictions (veg-only conditional fractions)
+      for (vc in veg_cols_no_barren) {
+        norm_name <- paste0("norm_", vc)
+        coefs_wide[[norm_name]] <- ifelse(is.finite(coefs_wide$pred_total_veg_cover) & coefs_wide$pred_total_veg_cover > 1e-9,
+                                          coefs_wide[[vc]] / coefs_wide$pred_total_veg_cover,
+                                          NA_real_)
+      }
+
+      # Mixture acceptance criteria: require sufficient total veg AND both components present
+      MIN_TOTAL_VEG <- 0.05    # min MSAVI-scaled veg cover to consider a true mixture
+      MIN_NORM_FRAC <- 0.05    # min normalized veg-only fraction per component
+      norm_col_a <- paste0("norm_", frac_col_a)
+      norm_col_b <- paste0("norm_", frac_col_b)
+
+      mixture_mask <- rep(FALSE, nrow(coefs_wide))
+      if (norm_col_a %in% names(coefs_wide) && norm_col_b %in% names(coefs_wide)) {
+        mixture_mask <- is.finite(coefs_wide$pred_total_veg_cover) &
+                        coefs_wide$pred_total_veg_cover >= MIN_TOTAL_VEG &
+                        !is.na(coefs_wide[[norm_col_a]]) & coefs_wide[[norm_col_a]] >= MIN_NORM_FRAC &
+                        !is.na(coefs_wide[[norm_col_b]]) & coefs_wide[[norm_col_b]] >= MIN_NORM_FRAC
+      }
+
+      n_total <- nrow(coefs_wide)
+      n_mixtures <- sum(mixture_mask, na.rm = TRUE)
+      n_barren_dominated <- 0
+      if ("barren" %in% all_veg_cols) {
+        n_barren_dominated <- sum(coefs_wide$barren >= 0.5, na.rm = TRUE)
+      } else {
+        n_barren_dominated <- sum(coefs_wide$pred_total_veg_cover < MIN_TOTAL_VEG, na.rm = TRUE)
+      }
+
+      cat(sprintf("\n  Mix %s + %s — samples=%d, accepted-mixtures=%d, barren-dominated=%d\n",
+                  class_a, class_b, n_total, n_mixtures, n_barren_dominated))
+
+      # --- Absolute (MSAVI-weighted) evaluation across all synthetic rows ---
       total_predicted <- 0
       for (vc in all_veg_cols) {
         pred_vals <- coefs_wide[[vc]]
@@ -8336,18 +7943,46 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
         sd_pred <- sd(pred_vals, na.rm = TRUE)
         total_predicted <- total_predicted + mean_pred
 
-        # Expected is 0.5 for the two mixed classes, 0.0 for all others
         if (vc == frac_col_a || vc == frac_col_b) {
-          rmse_val <- sqrt(mean((pred_vals - 0.5)^2, na.rm = TRUE))
-          cat(sprintf("    %s: predicted=%.3f ± %.3f (expected=0.500, RMSE=%.3f)\n",
-                      vc, mean_pred, sd_pred, rmse_val))
+          expected_vec_abs <- 0.5 * coefs_wide$total_veg_cover_expected
+          rmse_val_abs <- sqrt(mean((pred_vals - expected_vec_abs)^2, na.rm = TRUE))
+          cat(sprintf("    [ABS] %s: predicted=%.3f ± %.3f (expected=%.3f MSAVI-scaled, RMSE=%.3f)\n",
+                      vc, mean_pred, sd_pred, mean(expected_vec_abs, na.rm = TRUE), rmse_val_abs))
+        } else if (tolower(vc) == "barren") {
+          expected_vec_b <- coefs_wide$expected_barren
+          rmse_val_b <- sqrt(mean((pred_vals - expected_vec_b)^2, na.rm = TRUE))
+          cat(sprintf("    [ABS] %s: predicted=%.3f ± %.3f (expected=%.3f MSAVI-derived, RMSE=%.3f)\n",
+                      vc, mean_pred, sd_pred, mean(expected_vec_b, na.rm = TRUE), rmse_val_b))
         } else {
-          rmse_val <- sqrt(mean((pred_vals - 0.0)^2, na.rm = TRUE))
-          cat(sprintf("    %s: predicted=%.3f ± %.3f (expected=0.000, RMSE=%.3f)\n",
-                      vc, mean_pred, sd_pred, rmse_val))
+          rmse_val_o <- sqrt(mean((pred_vals - 0.0)^2, na.rm = TRUE))
+          cat(sprintf("    [ABS] %s: predicted=%.3f ± %.3f (expected=0.000, RMSE=%.3f)\n",
+                      vc, mean_pred, sd_pred, rmse_val_o))
         }
       }
-      cat(sprintf("    Sum: %.3f (expected=1.000)\n", total_predicted))
+      cat(sprintf("    [ABS] Sum(all classes, mean) = %.3f  Mean MSAVI total_veg_cover = %.3f\n",
+                  total_predicted, mean(coefs_wide$total_veg_cover_expected, na.rm = TRUE)))
+
+      # --- Normalized (veg-only) evaluation — only on accepted mixtures ---
+      if (n_mixtures > 0) {
+        for (vc in veg_cols_no_barren) {
+          norm_col <- paste0("norm_", vc)
+          pred_norm_vals <- coefs_wide[[norm_col]][mixture_mask]
+          mean_norm <- mean(pred_norm_vals, na.rm = TRUE)
+          sd_norm <- sd(pred_norm_vals, na.rm = TRUE)
+
+          if (vc == frac_col_a || vc == frac_col_b) {
+            rmse_norm <- sqrt(mean((pred_norm_vals - 0.5)^2, na.rm = TRUE))
+            cat(sprintf("    [NORM] %s: normalized_pred=%.3f ± %.3f (expected=0.500, RMSE=%.3f)\n",
+                        vc, mean_norm, sd_norm, rmse_norm))
+          } else {
+            rmse_norm_o <- sqrt(mean((pred_norm_vals - 0.0)^2, na.rm = TRUE))
+            cat(sprintf("    [NORM] %s: normalized_pred=%.3f ± %.3f (expected=0.000, RMSE=%.3f)\n",
+                        vc, mean_norm, sd_norm, rmse_norm_o))
+          }
+        }
+      } else {
+        cat("    [NORM] No accepted mixtures (filtered by MSAVI/barren criteria) — skipping veg-only normalized evaluation.\n")
+      }
     }
 
     return(mix_coefs_combined)
