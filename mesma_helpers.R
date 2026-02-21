@@ -1,4 +1,283 @@
 
+# --- Consolidated shared helpers (moved here) ---------------------------------
+# General small utilities used across multiple scripts. These were de-duplicated
+# from inline copies in other files and are kept here as the canonical source.
+
+# Additional helpers migrated from fit_veg_mixture_mesma.R to reduce redundancy.
+# These functions were previously defined in the main script but are generic
+# enough to be reused by other tools; moving them here centralizes maintenance.
+
+safe_as_numeric <- function(x) {
+  as.numeric(as.character(x))
+}
+
+make_location_id <- function(lon, lat) {
+  lon <- as.numeric(lon)
+  lat <- as.numeric(lat)
+  invalid_mask <- !is.finite(lon) | !is.finite(lat)
+  res <- sprintf("L_%0.6f_%0.6f", round(lat, 6), round(lon, 6))
+  res[invalid_mask] <- NA_character_
+  res
+}
+
+assign_pheno_year <- function(d) {
+  d <- as.Date(d)
+  # phenological year begins on May 1 (boundary = 30 April).
+  # Dates in Jan-Apr are assigned to the previous calendar year.
+  ifelse(is.na(d), NA_integer_, ifelse(lubridate::month(d) >= 5, lubridate::year(d), lubridate::year(d) - 1))
+}
+
+# Perform Whittaker smoothing on a 1‑D series.
+#
+# The smoothed vector `z` is obtained by minimising
+#   \sum_i (y_i - z_i)^2 + \lambda \sum_i (\Delta^2 z_i)^2
+# where \Delta^2 z_i = z_i - 2 z_{i-1} + z_{i-2} is the second
+# difference.  The first term enforces fidelity to the original data
+# and the second term penalises roughness; because we penalise the
+# *second* difference the result is a piecewise‑linear (once
+# differentiable) trend rather than merely encouraging consecutive
+# points to be close.  A larger `lambda` yields a smoother (flatter)
+# curve.  This is the standard second‑order Whittaker smoother; if you
+# prefer the first‑order formulation
+# \sum (\Delta z_i)^2 replace `diff(..., differences = 2)` with a
+# first‑difference matrix.
+#
+# Arguments:
+#   y: numeric vector of observations (can contain NAs).
+#   lambda: smoothing penalty (higher -> smoother).
+#
+whittaker_smooth <- function(y, lambda = 500) {
+  n <- length(y)
+  if (n < 3) return(rep(NA_real_, n))
+
+  yy <- as.numeric(y)
+  w <- as.numeric(is.finite(yy))
+  yy[!is.finite(yy)] <- 0
+
+  W <- diag(w, nrow = n, ncol = n)
+  D <- diff(diag(n), differences = 2)
+  A <- W + lambda * crossprod(D)
+  b <- W %*% yy
+
+  tryCatch(
+    as.numeric(base::solve(A, b)),
+    error = function(e) {
+      tryCatch(as.numeric(base::qr.solve(A, b)), error = function(e2) rep(NA_real_, n))
+    }
+  )
+}
+
+# Iteratively reweighted Whittaker smoother (IRW)
+# Uses Huber-style weights to reduce influence of outliers.
+# Returns a list with: `z` (smoothed values), `weights` (final weights), `residuals`.
+whittaker_smooth_irw <- function(y, lambda = 500, max_iter = 10L, k = 1.345, tol = 1e-6) {
+  n <- length(y)
+  if (n < 3) return(list(z = rep(NA_real_, n), weights = rep(0, n), residuals = rep(NA_real_, n)))
+
+  yy <- as.numeric(y)
+  finite_mask <- is.finite(yy)
+  yy[!finite_mask] <- 0
+
+  # initial weights: 1 for finite, 0 for NA
+  w <- as.numeric(finite_mask)
+  z_prev <- rep(0, n)
+
+  D <- diff(diag(n), differences = 2)
+  DtD <- crossprod(D)
+
+  for (it in seq_len(as.integer(max_iter))) {
+    W <- diag(w, nrow = n, ncol = n)
+    A <- W + lambda * DtD
+    b <- W %*% yy
+    z <- tryCatch(as.numeric(base::solve(A, b)), error = function(e) as.numeric(base::qr.solve(A, b)))
+
+    resid <- yy - z
+    # robust scale estimate (MAD) on finite residuals; fallback to sd
+    rfin <- resid[finite_mask]
+    s <- stats::mad(rfin, constant = 1.4826, na.rm = TRUE)
+    if (!is.finite(s) || s <= 0) s <- stats::sd(rfin, na.rm = TRUE)
+    if (!is.finite(s) || s <= 0) s <- 1
+
+    u <- resid / (k * s)
+    # Huber weight: psi(u)/u where psi(u)=u for |u|<=1, =sign(u) otherwise
+    w_new <- rep(0, n)
+    small <- abs(u) <= 1
+    w_new[small] <- 1
+    w_new[!small & finite_mask] <- 1 / abs(u[!small & finite_mask])
+    w_new[!finite_mask] <- 0
+
+    # check convergence (max change in z)
+    if (max(abs(z - z_prev), na.rm = TRUE) < tol) {
+      return(list(z = z, weights = w_new, residuals = resid))
+    }
+
+    w <- as.numeric(w_new)
+    z_prev <- z
+  }
+
+  # final solve (in case loop ended by iter count)
+  W <- diag(w, nrow = n, ncol = n)
+  A <- W + lambda * DtD
+  b <- W %*% yy
+  z <- tryCatch(as.numeric(base::solve(A, b)), error = function(e) as.numeric(base::qr.solve(A, b)))
+  resid <- yy - z
+  list(z = z, weights = w, residuals = resid)
+}
+
+remove_large_outliers_whittaker <- function(df, candidates, lambda = 500, min_group_rows = 3L, min_rows_with_date = 5L) {
+  if (is.null(df) || nrow(df) == 0) return(df)
+  if (is.null(candidates) || length(candidates) == 0) {
+    cat("[WHITTAKER] No candidate indices found for smoothing; skipping\n")
+    return(df)
+  }
+  candidates <- intersect(candidates, names(df))
+  if (length(candidates) == 0) {
+    cat("[WHITTAKER] No candidate indices found for smoothing; skipping\n")
+    return(df)
+  }
+  if (!"location_id" %in% names(df)) {
+    cat("[WHITTAKER] 'location_id' missing from data; skipping smoothing\n")
+    return(df)
+  }
+
+  if (!"pheno_year" %in% names(df) && "date" %in% names(df)) {
+    df$pheno_year <- assign_pheno_year(df$date)
+  }
+
+  grp <- interaction(df$location_id, ifelse(is.na(df$pheno_year), "NA", as.character(df$pheno_year)), drop = TRUE)
+  groups <- split(seq_len(nrow(df)), grp)
+  total_smoothed <- 0L
+  n_groups <- length(groups)
+
+  for (g in seq_along(groups)) {
+    rows <- groups[[g]]
+    sub <- df[rows, , drop = FALSE]
+    if (length(rows) < min_group_rows) next
+
+    has_date <- "date" %in% names(sub) && any(!is.na(sub$date))
+    if (!has_date || length(rows) < min_rows_with_date) next
+
+    sub$doy <- as.numeric(format(sub$date, "%j"))
+
+    for (col in candidates) {
+      if (!is.numeric(sub[[col]])) next
+      colv <- sub[[col]]
+
+      idx_all <- which(is.finite(sub$doy))
+      if (length(idx_all) < min_rows_with_date) next
+
+      ord <- order(sub$doy[idx_all], na.last = NA)
+      idx_ord <- idx_all[ord]
+      y_ord <- as.numeric(colv[idx_ord])
+      if (sum(is.finite(y_ord)) < min_rows_with_date) next
+
+      tryCatch({
+        fit_res <- whittaker_smooth_irw(y_ord, lambda = lambda)
+        fit_ord <- fit_res$z
+        if (is.null(fit_ord) || all(!is.finite(fit_ord))) next
+
+        smooth_ord <- is.finite(fit_ord)
+        if (any(smooth_ord, na.rm = TRUE)) {
+          colv[idx_ord[smooth_ord]] <- fit_ord[smooth_ord]
+          total_smoothed <- total_smoothed + sum(smooth_ord, na.rm = TRUE)
+          sub[[col]] <- colv
+        }
+      }, error = function(e) {
+        # If smoothing fails for this column/group, keep original values.
+      })
+    }
+
+    df[rows, names(sub)] <- sub
+  }
+
+  if (total_smoothed > 0) {
+    cat(sprintf("[WHITTAKER] Smoothed %d values across %d groups\n", total_smoothed, n_groups))
+  }
+
+  df
+}
+
+pheno_doy <- function(d) {
+  d <- tryCatch(as.Date(d), error = function(e) NA)
+  month <- lubridate::month(d)
+  ifelse(is.na(d), NA_integer_,
+         # use May 1 as Day 1 of the phenological year
+         ifelse(month >= 5,
+                as.integer(d - as.Date(paste0(lubridate::year(d), "-05-01"))) + 1L,
+                as.integer(d - as.Date(paste0(lubridate::year(d) - 1, "-05-01"))) + 1L
+         )
+  )
+}
+
+# Compute a per-location DVI soil baseline for PPI (deterministic, per-location)
+compute_dvi_soil_per_location <- function(df, quantile_p = 0.10, min_samples = 5L) {
+  if (is.null(df) || nrow(df) == 0) stop("[PPI] compute_dvi_soil_per_location: empty df")
+  if (!"location_id" %in% names(df)) stop("[PPI] compute_dvi_soil_per_location: missing location_id")
+  if (!"DVI" %in% names(df) && all(c("nir", "red") %in% names(df))) df$DVI <- as.numeric(df$nir) - as.numeric(df$red)
+  if (!"DVI" %in% names(df)) stop("[PPI] compute_dvi_soil_per_location: missing DVI (and nir/red not available)")
+
+  locs <- unique(as.character(df$location_id))
+  dvi_soil_vec <- rep(NA_real_, nrow(df))
+  for (loc in locs) {
+    idx <- which(as.character(df$location_id) == loc)
+    vals <- df$DVI[idx]
+    vals <- vals[is.finite(vals)]
+    if (length(vals) < as.integer(min_samples)) next
+    q <- suppressWarnings(as.numeric(stats::quantile(vals, probs = quantile_p, na.rm = TRUE, names = FALSE, type = 7)))
+    if (!is.finite(q)) next
+    low_vals <- vals[vals <= q]
+    if (length(low_vals) < 2L) next
+    soil <- suppressWarnings(as.numeric(stats::median(low_vals, na.rm = TRUE)))
+    if (!is.finite(soil)) next
+    dvi_soil_vec[idx] <- soil
+  }
+
+  need_idx <- is.finite(df$DVI) & !is.finite(dvi_soil_vec)
+  if (any(need_idx)) {
+    bad_locs <- unique(as.character(df$location_id[need_idx]))
+    stop(sprintf("[PPI] Cannot compute per-location dvi_soil for %d rows across %d locations (example locs: %s)",
+                 sum(need_idx), length(bad_locs), paste(head(bad_locs, 10), collapse = ", ")))
+  }
+  dvi_soil_vec
+}
+
+# Calculate common spectral indices (data.table-style implementation; requires data.table when df is a data.table)
+calculate_indices <- function(df) {
+  eps <- 1e-9
+
+  # keep implementation identical to existing scripts (data.table idiom)
+  df[, `:=`(
+    DVI   = nir - red,
+    OSAVI = (nir - red) / (nir + red + 0.16),
+    MCARI = ((red - green) - 0.2*(red - blue)) * (red / (green + eps)),
+    NIRv  = (nir * ((nir - red) / (nir + red + eps))) * 1.3,
+    PSRI  = (red - blue) / (nir + eps),
+    NBR   = (nir - swir2) / (nir + swir2 + eps),
+    TCW   = (swir1 - swir2) / (swir1 + swir2 + eps),
+    NDVI   = (nir - red) / (nir + red + eps),
+    MSAVI2 = (2 * nir + 1 - sqrt(pmax(0, (2 * nir + 1)^2 - 8 * (nir - red)))) / 2,
+    MSAVI  = (2 * nir + 1 - sqrt(pmax(0, (2 * nir + 1)^2 - 8 * (nir - red)))) / 2,
+    NDMI   = (nir - swir1) / (nir + swir1 + eps),
+    TCB    = 0.3029 * blue + 0.2786 * green + 0.4733 * red + 0.5599 * nir + 0.508 * swir1 + 0.1872 * swir2,
+    GVI    = -0.2941 * blue - 0.243 * green - 0.5424 * red + 0.7276 * nir + 0.0713 * swir1 - 0.1608 * swir2,
+    SATVI  = (swir1 - red) / (swir1 + red + 0.5) * (1 + 0.5),
+    EVI    = 2.5 * (nir - red) / (nir + 6 * red - 7.5 * blue + 1)
+  )]
+
+  # Add PPI if available (caller scripts may provide ppi/calculate_solar_zenith)
+  if (exists("ppi") && exists("calculate_solar_zenith") && "fraction_veg" %in% names(df)) {
+    dvi_soil_val <- df$DVI[df$fraction_veg == 0][1]
+    if (is.finite(dvi_soil_val)) {
+      zenith_rad <- calculate_solar_zenith(lat = 40, doy = 180, hour = 10.5)
+      M_val <- suppressWarnings(max(df$DVI, na.rm = TRUE))
+      if (is.finite(M_val)) df$PPI <- ppi(dvi = df$DVI, zenith.angle = zenith_rad, M = M_val, dvi.soil = dvi_soil_val)
+    }
+  }
+
+  return(df)
+}
+
+# ------------------------------------------------------------------------------
 analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor, grid_type = "full") {
   cat("\n=== INTER-CLASS VARIANT SIMILARITY ANALYSIS ===\n")
 
@@ -213,54 +492,7 @@ analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor,
     cat(sprintf("[ERROR] Failed to generate similarity heatmap: %s\n", e$message))
   })
 
-  # --- Detect high-similarity populus/tamarix variants (cross-class similarity > 0.95) ---
-  # These variants are spectrally indistinguishable and should be labeled as "woody_unknown"
-  WOODY_CROSS_SIM_THRESHOLD <- 0.95
-  populus_indices <- which(tolower(all_vegs) == "populus")
-  tamarix_indices <- which(tolower(all_vegs) == "tamarix")
 
-  woody_unknown_variants <- character(0)
-
-  if (length(populus_indices) > 0 && length(tamarix_indices) > 0) {
-    cat(sprintf("\n[CROSS-CLASS SIMILARITY] Checking %d populus vs %d tamarix variants (threshold: %.2f)\n",
-                length(populus_indices), length(tamarix_indices), WOODY_CROSS_SIM_THRESHOLD))
-
-    # Extract cross-class similarities from the similarity matrix
-    for (p_idx in populus_indices) {
-      for (t_idx in tamarix_indices) {
-        sim_val <- sim_mat[p_idx, t_idx]
-        if (!is.na(sim_val) && sim_val > WOODY_CROSS_SIM_THRESHOLD) {
-          # Both variants are indistinguishable - add both to woody_unknown list
-          p_id <- all_ids[p_idx]
-          t_id <- all_ids[t_idx]
-          if (!(p_id %in% woody_unknown_variants)) {
-            woody_unknown_variants <- c(woody_unknown_variants, p_id)
-            cat(sprintf("  - %s (populus) has similarity %.3f with %s (tamarix)\n", p_id, sim_val, t_id))
-          }
-          if (!(t_id %in% woody_unknown_variants)) {
-            woody_unknown_variants <- c(woody_unknown_variants, t_id)
-            cat(sprintf("  - %s (tamarix) has similarity %.3f with %s (populus)\n", t_id, sim_val, p_id))
-          }
-        }
-      }
-    }
-
-    if (length(woody_unknown_variants) > 0) {
-      cat(sprintf("[CROSS-CLASS SIMILARITY] Found %d variants with cross-class similarity > %.2f\n",
-                  length(woody_unknown_variants), WOODY_CROSS_SIM_THRESHOLD))
-      cat(sprintf("  Variants: %s\n", paste(woody_unknown_variants, collapse = ", ")))
-    } else {
-      cat(sprintf("[CROSS-CLASS SIMILARITY] No populus/tamarix variants exceed similarity threshold of %.2f\n",
-                  WOODY_CROSS_SIM_THRESHOLD))
-    }
-  } else {
-    cat("[CROSS-CLASS SIMILARITY] Skipping: need both populus and tamarix variants present\n")
-  }
-
-  # Store in global environment for use during MESMA fitting
-  assign("WOODY_UNKNOWN_VARIANTS", woody_unknown_variants, envir = globalenv())
-  cat(sprintf("[CROSS-CLASS SIMILARITY] Assigned WOODY_UNKNOWN_VARIANTS to global env (%d variants)\n",
-              length(woody_unknown_variants)))
 
   # == AGENT FIX: Print #loc-years per variant ==
   cat("\n=== VARIANT SAMPLE SIZES (Loc-Years) ===\n")
@@ -305,19 +537,105 @@ add_excluded_years_shade <- function(start_year = 1992, end_year = 1999, is_date
 }
 
 # Helper: add vertical lines at year boundaries for ggplot2 time-series plots.
+# Draws major vertical grid lines (default: every 10 yrs). By default we DO NOT draw
+# the minor (5-year) vertical lines anymore, but we still provide x-axis labels every
+# 5 years so plots show ticks/labels at 5-year intervals. Set `minor_by` to a value
+# to re-enable minor vlines if needed.
 # Usage: + add_year_lines(is_date = TRUE)  # x axis is Date
 #        + add_year_lines(is_date = FALSE) # x axis is numeric (year)
-add_year_lines <- function(start_year = 1985, end_year = 2025, is_date = FALSE, color = "grey50", linetype = "dashed", alpha = 0.5) {
+# Optional arguments:
+#  minor_by, major_by - spacing for minor/major lines (integers). Set to NULL to disable.
+#  minor_size, major_size - line widths for minor/major lines.
+#  minor_color, major_color, minor_linetype, major_linetype, minor_alpha, major_alpha - styles.
+add_year_lines <- function(start_year = 1985,
+                           end_year = 2025,
+                           is_date = FALSE,
+                           color = "grey50",
+                           linetype = "dashed",
+                           alpha = 0.5,
+                           minor_by = NULL,
+                           major_by = 10L,
+                           minor_size = 0.4,
+                           major_size = 0.9,
+                           minor_color = color,
+                           major_color = color,
+                           minor_linetype = linetype,
+                           major_linetype = "solid",
+                           minor_alpha = alpha,
+                           major_alpha = alpha) {
   if (!requireNamespace("ggplot2", quietly = TRUE)) return(NULL)
-  years <- seq(start_year, end_year, by = 1)
-  if (is_date) {
-    xintercepts <- as.Date(paste0(years, "-01-01"))
-    return(ggplot2::geom_vline(xintercept = as.numeric(xintercepts), color = color, linetype = linetype, alpha = alpha))
-  } else {
-    return(ggplot2::geom_vline(xintercept = years, color = color, linetype = linetype, alpha = alpha))
+
+  # Generate sequences for minor/major lines; allow disabling by setting to NULL or <=0
+  minor_seq <- if (!is.null(minor_by) && minor_by > 0) seq(start_year, end_year, by = as.integer(minor_by)) else integer(0)
+  major_seq <- if (!is.null(major_by) && major_by > 0) seq(start_year, end_year, by = as.integer(major_by)) else integer(0)
+
+  # Avoid drawing duplicate lines where major years overlap minor years
+  minor_seq <- setdiff(minor_seq, major_seq)
+
+  layers <- list()
+  if (length(minor_seq) > 0) {
+    if (is_date) {
+      xints <- as.Date(paste0(minor_seq, "-01-01"))
+      layers <- c(layers, list(ggplot2::geom_vline(xintercept = as.numeric(xints), color = minor_color, linetype = minor_linetype, alpha = minor_alpha, size = minor_size)))
+    } else {
+      layers <- c(layers, list(ggplot2::geom_vline(xintercept = minor_seq, color = minor_color, linetype = minor_linetype, alpha = minor_alpha, size = minor_size)))
+    }
   }
+
+  if (length(major_seq) > 0) {
+    if (is_date) {
+      xints <- as.Date(paste0(major_seq, "-01-01"))
+      layers <- c(layers, list(ggplot2::geom_vline(xintercept = as.numeric(xints), color = major_color, linetype = major_linetype, alpha = major_alpha, size = major_size)))
+    } else {
+      layers <- c(layers, list(ggplot2::geom_vline(xintercept = major_seq, color = major_color, linetype = major_linetype, alpha = major_alpha, size = major_size)))
+    }
+  }
+
+  # Add axis breaks/labels at 5-year intervals (labels only; no minor vlines).
+  # Using the same visual styling as the existing major-year labels (i.e. default axis text).
+  if (!is.null(start_year) && !is.null(end_year)) {
+    if (is_date) {
+      date_breaks <- seq(as.Date(paste0(start_year, "-01-01")), as.Date(paste0(end_year, "-01-01")), by = "5 years")
+      layers <- c(layers, list(ggplot2::scale_x_date(breaks = date_breaks, date_labels = "%Y")))
+    } else {
+      layers <- c(layers, list(ggplot2::scale_x_continuous(breaks = seq(start_year, end_year, by = 5))))
+    }
+  }
+
+  # Return list of layers so callers can add them directly to ggplot
+  return(layers)
 }
 
+
+# Colorblind-friendly discrete palette (Okabe-Ito) — use for categorical veg colors
+MESMA_OKABE_ITO <- c(
+  "black" = "#000000",
+  "orange" = "#E69F00",
+  "skyblue" = "#56B4E9",
+  "bluishgreen" = "#009E73",
+  "yellow" = "#F0E442",
+  "blue" = "#0072B2",
+  "vermillion" = "#D55E00",
+  "purple" = "#CC79A7"
+)
+
+# A consistent theme for MESMA time-series plots (subtle grid, panel border)
+theme_mesma <- function(base_size = 11, base_family = "") {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) return(ggplot2::theme_minimal(base_size = base_size))
+  ggplot2::theme_minimal(base_size = base_size, base_family = base_family) +
+    ggplot2::theme(
+      panel.border = ggplot2::element_rect(fill = NA, color = "#d9d9d9", size = 0.5),
+      panel.grid.major = ggplot2::element_line(color = "#efefef", size = 0.45),
+      panel.grid.minor = ggplot2::element_blank(),
+      axis.title = ggplot2::element_text(size = base_size * 0.95),
+      axis.text = ggplot2::element_text(size = base_size * 0.85),
+      plot.title = ggplot2::element_text(face = "bold", size = base_size * 1.05),
+      legend.position = "bottom",
+      legend.background = ggplot2::element_rect(fill = NA, colour = NA),
+      legend.key = ggplot2::element_rect(fill = NA, color = NA),
+      plot.background = ggplot2::element_rect(fill = "white", color = NA)
+    )
+}
 
 ensure_library_and_templates <- function(force = FALSE) {
   # Attempt to construct or expose `mesma_lib` and `compressed_templates_accessor`
@@ -381,7 +699,7 @@ ensure_variant_similarity_heatmap <- function(force = FALSE) {
 # --- Reproducible RNG helpers -------------------------------------------------
 # Provide a single, overridable MESMA seed so all scripts and functions can be
 # made comparable by setting the MESMA_SEED environment variable (or calling
-# set_mesma_seed()). Defaults to 42 for backward-compatibility.
+# set_mesma_seed()). Defaults to 123 (was 42) for reproducibility.
 #
 # Usage:
 #  - call set_mesma_seed() early in a top-level script
@@ -393,9 +711,9 @@ set_mesma_seed <- function(base = NULL, announce = TRUE, set_env_vars = TRUE) {
     ev <- Sys.getenv("MESMA_SEED", unset = NA_character_)
     if (!is.na(ev) && nzchar(ev)) {
       base <- suppressWarnings(as.integer(ev))
-      if (is.na(base)) base <- 42L
+      if (is.na(base)) base <- 123L
     } else {
-      base <- 42L
+      base <- 123L
     }
   }
   base <- as.integer(base)
@@ -419,8 +737,8 @@ set_mesma_seed <- function(base = NULL, announce = TRUE, set_env_vars = TRUE) {
 
 # Return a deterministic seed derived from the master seed (useful for offsets)
 get_mesma_seed <- function(offset = 0L) {
-  base <- as.integer(getOption("mesma.seed", Sys.getenv("MESMA_SEED", unset = "42")))
-  if (!is.finite(base) || length(base) == 0) base <- 42L
+  base <- as.integer(getOption("mesma.seed", Sys.getenv("MESMA_SEED", unset = "123")))
+  if (!is.finite(base) || length(base) == 0) base <- 123L
   offset <- as.integer(offset)
   # keep result in integer range
   as.integer((base + offset) %% .Machine$integer.max)
@@ -445,7 +763,7 @@ NDDI_DUST_THRESHOLD <- get_nddi_threshold()
 # --- Shared vegetation label canonicalization helpers -------------------------
 
 # Canonical list of herb-group labels (map these to "herbs")
-HERBS_GROUP <- c("herbs", "alhagi", "salicornia", "halocnemum", "phragmites")
+HERBS_GROUP <- c("herbs", "salicornia", "halocnemum", "phragmites")
 
 # Agriculture alias mapping (map these to "agriculture")
 AGRICULTURE_ALIASES <- c("agri", "agric", "agriculture", "agricultural")
@@ -461,7 +779,8 @@ canonicalize_veg_labels <- function(df, veg_col = NULL) {
 
   v <- tolower(trimws(as.character(df[[veg_col]])))
   # Fix typos
-  v[v == "tamairx"] <- "tamarix"
+  # Fix common typos and canonicalize typos to "tamarix"
+  v[v %in% c("tamairx", "tamarix")] <- "tamarix"
   # Map herb-group
   v[v %in% HERBS_GROUP] <- "herbs"
   # Map agriculture aliases
@@ -470,22 +789,10 @@ canonicalize_veg_labels <- function(df, veg_col = NULL) {
   df
 }
 
-# --- Woody aggregation helper for bootstrap results --------------------------
-# Sums bootstrap matrices for populus + tamarix + woody_unknown into a "woody" category.
-# `veg_boot_res` is a named list of [B x n_years] matrices. Modifies in place and returns.
-aggregate_woody_bootstrap <- function(veg_boot_res, label = "BOOTSTRAP") {
-  woody_types <- c("populus", "tamarix", "woody_unknown")
-  woody_mats <- veg_boot_res[tolower(names(veg_boot_res)) %in% woody_types]
-  if (length(woody_mats) >= 1) {
-    woody_mat <- Reduce(`+`, lapply(woody_mats, function(m) { m[is.na(m)] <- 0; m }))
-    all_na_mask <- Reduce(`&`, lapply(woody_mats, is.na))
-    woody_mat[all_na_mask] <- NA_real_
-    colnames(woody_mat) <- colnames(woody_mats[[1]])
-    veg_boot_res[["woody"]] <- woody_mat
-    cat(sprintf("[%s] Added 'woody' category (populus + tamarix + woody_unknown) with combined bootstrap CIs\n", label))
-  }
-  veg_boot_res
-}
+# --- Woody aggregation support removed ----------------------------------
+# The old `aggregate_woody_bootstrap()` helper has been removed because the
+# concept of "woody aggregation" is no longer used.  Previous callers should
+# now operate on the raw bootstrap results directly.
 
 # --- Bootstrap results compilation helper ------------------------------------
 # Compiles a list of [B x n_years] bootstrap matrices into a single data.frame

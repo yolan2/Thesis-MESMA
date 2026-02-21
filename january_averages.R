@@ -9,6 +9,8 @@ library(MASS)
 
 # Ensure PPI helpers are loaded early so functions like calculate_solar_zenith are available
 if (!exists("calculate_solar_zenith") && file.exists("ppi_helpers.R")) source("ppi_helpers.R")
+# Shared canonical helpers are provided by 'mesma_helpers.R' (de-duplicated)
+if (!exists("make_location_id") && file.exists("mesma_helpers.R")) source("mesma_helpers.R")
 # Optional visualization helpers (provide shading for excluded years)
 if (file.exists("mesma_helpers.R")) {
   source("mesma_helpers.R")
@@ -88,7 +90,7 @@ ENABLE_OUTLIER_REMOVAL <- FALSE
 OUTLIER_MAD_THRESHOLD <- 3.5
 
 # Remove large outliers robustly per (location_id, pheno_year) where possible, otherwise per-location.
-# Uses spline-based outlier detection for groups with sufficient data, otherwise falls back to MAD.
+# Uses two-pass B-spline outlier detection for groups with sufficient data, otherwise falls back to MAD.
 remove_large_outliers <- function(df, candidates = NULL, mad_thresh = OUTLIER_MAD_THRESHOLD) {
   if (!exists("OUTLIER_SPLINE_MAX_DF", inherits = TRUE)) OUTLIER_SPLINE_MAX_DF <- 10L
   if (!isTRUE(ENABLE_OUTLIER_REMOVAL)) return(df)
@@ -117,15 +119,43 @@ remove_large_outliers <- function(df, candidates = NULL, mad_thresh = OUTLIER_MA
   removed_idx <- logical(nrow(df))
   n_groups <- length(groups)
 
+  fit_bspline_and_predict <- function(x_train, y_train, x_pred) {
+    n_unique <- length(unique(x_train))
+    n_train <- length(x_train)
+    if (n_unique < 4 || n_train < 5) return(rep(NA_real_, length(x_pred)))
+
+    basis_df <- floor(min(OUTLIER_SPLINE_MAX_DF, n_train / 2, n_unique - 1))
+    basis_df <- max(4L, as.integer(basis_df))
+    if (basis_df >= n_unique) basis_df <- n_unique - 1L
+    if (basis_df < 4L) return(rep(NA_real_, length(x_pred)))
+
+    fit <- stats::lm(y_train ~ splines::bs(x_train, df = basis_df, degree = 3, intercept = TRUE))
+    stats::predict(fit, newdata = data.frame(x_train = x_pred))
+  }
+
+  residual_outlier_mask <- function(residuals, mad_thresh) {
+    med_res <- stats::median(residuals, na.rm = TRUE)
+    mad_res <- stats::mad(residuals, na.rm = TRUE)
+    if (is.finite(mad_res) && mad_res > 1e-6) {
+      return(abs(residuals - med_res) > mad_thresh * mad_res)
+    }
+    q <- stats::quantile(residuals, probs = c(0.25, 0.75), na.rm = TRUE, names = FALSE)
+    iqr_res <- q[2] - q[1]
+    if (!is.finite(iqr_res) || iqr_res <= 0) return(rep(FALSE, length(residuals)))
+    lo <- q[1] - 1.5 * iqr_res
+    hi <- q[2] + 1.5 * iqr_res
+    (residuals < lo) | (residuals > hi)
+  }
+
   for (g in seq_along(groups)) {
     rows <- groups[[g]]
     sub <- df[rows, , drop = FALSE]
     if (length(rows) < 3) next  # not enough data
     out_mask <- rep(FALSE, nrow(sub))
 
-    # Check if we have date for spline
+    # Check if we have date for B-spline
     has_date <- "date" %in% names(sub) && any(!is.na(sub$date))
-    use_spline <- has_date && length(rows) >= 10  # Use spline if enough data and date available
+    use_spline <- has_date && length(rows) >= 10  # Use B-spline if enough data and date available
 
     if (use_spline) {
       # Compute DOY
@@ -134,30 +164,29 @@ remove_large_outliers <- function(df, candidates = NULL, mad_thresh = OUTLIER_MA
         if (!is.numeric(sub[[col]])) next
         colv <- sub[[col]]
         finite_idx <- is.finite(colv) & is.finite(sub$doy)
-        if (sum(finite_idx) < 5) next  # not enough for spline
+        if (sum(finite_idx) < 5) next  # not enough for B-spline
         tryCatch({
           x <- sub$doy[finite_idx]
           y <- colv[finite_idx]
-          n_unique <- length(unique(x))
-          fit1 <- stats::smooth.spline(x, y, df = min(OUTLIER_SPLINE_MAX_DF, length(x)/2, n_unique - 1))
-          pred1 <- predict(fit1, x)$y
+          pred1 <- fit_bspline_and_predict(x, y, x)
+          if (all(!is.finite(pred1))) stop("B-spline pass1 failed")
           res1 <- y - pred1
-          mad1 <- stats::mad(res1, na.rm = TRUE)
-          if (!is.finite(mad1) || mad1 <= 1e-6) stop("Invalid MAD")
-          keep_mask <- abs(res1 - stats::median(res1, na.rm = TRUE)) <= (mad_thresh * 1.5 * mad1)
-          if (sum(keep_mask) >= 5) {
-            n_unique2 <- length(unique(x[keep_mask]))
-            fit2 <- stats::smooth.spline(x[keep_mask], y[keep_mask], df = min(OUTLIER_SPLINE_MAX_DF, sum(keep_mask)/2, n_unique2 - 1))
-            pred_final <- predict(fit2, x)$y
+
+          pass1_outliers <- residual_outlier_mask(res1, mad_thresh = mad_thresh)
+          keep_mask <- !pass1_outliers
+
+          if (sum(keep_mask) >= 5 && length(unique(x[keep_mask])) >= 4) {
+            pred_final <- fit_bspline_and_predict(x[keep_mask], y[keep_mask], x)
+            if (all(!is.finite(pred_final))) pred_final <- pred1
           } else {
             pred_final <- pred1
           }
+
           residuals <- y - pred_final
-          med_res <- stats::median(residuals, na.rm = TRUE)
-          mad_res <- stats::mad(residuals, na.rm = TRUE)
-          if (!is.finite(mad_res) || mad_res <= 0) stop("Invalid Final MAD")
+          final_outliers <- residual_outlier_mask(residuals, mad_thresh = mad_thresh)
+
           this_mask <- rep(FALSE, length(colv))
-          this_mask[finite_idx] <- abs(residuals - med_res) > mad_thresh * mad_res
+          this_mask[finite_idx] <- final_outliers
           out_mask <- out_mask | this_mask
         }, error = function(e) {
           med <- stats::median(colv, na.rm = TRUE)
@@ -240,10 +269,8 @@ if (length(missing_indices) > 0 && all(c('nir','red') %in% names(df_raw))) {
 }
 
 # Helper: assign phenology year from a date (used by outlier grouping)
-assign_pheno_year <- function(d) {
-  d <- as.Date(d)
-  ifelse(is.na(d), NA_integer_, ifelse(lubridate::month(d) >= 3, lubridate::year(d), lubridate::year(d) - 1))
-}
+# assign_pheno_year() moved to 'mesma_helpers.R'
+if (!exists("assign_pheno_year") && file.exists("mesma_helpers.R")) source("mesma_helpers.R")
 
 # Early dust filtering (NDDI) to remove contaminated observations before processing
 # NOTE: snow-index (previously NDSI) removed; pipeline uses dust-only filtering (NDDI).
@@ -270,36 +297,8 @@ if ("NDDI" %in% names(df_raw)) {
 
 # Compute a per-location DVI soil baseline for PPI.
 # Baseline is the median of the lowest `quantile_p` fraction of DVI within each location.
-compute_dvi_soil_per_location <- function(df, quantile_p = 0.10, min_samples = 5L) {
-  if (is.null(df) || nrow(df) == 0) stop("[PPI] compute_dvi_soil_per_location: empty df")
-  if (!"location_id" %in% names(df)) stop("[PPI] compute_dvi_soil_per_location: missing location_id")
-  if (!"DVI" %in% names(df) && all(c("nir", "red") %in% names(df))) df$DVI <- as.numeric(df$nir) - as.numeric(df$red)
-  if (!"DVI" %in% names(df)) stop("[PPI] compute_dvi_soil_per_location: missing DVI (and nir/red not available)")
-
-  locs <- unique(as.character(df$location_id))
-  dvi_soil_vec <- rep(NA_real_, nrow(df))
-  for (loc in locs) {
-    idx <- which(as.character(df$location_id) == loc)
-    vals <- df$DVI[idx]
-    vals <- vals[is.finite(vals)]
-    if (length(vals) < as.integer(min_samples)) next
-    q <- suppressWarnings(as.numeric(stats::quantile(vals, probs = quantile_p, na.rm = TRUE, names = FALSE, type = 7)))
-    if (!is.finite(q)) next
-    low_vals <- vals[vals <= q]
-    if (length(low_vals) < 2L) next
-    soil <- suppressWarnings(as.numeric(stats::median(low_vals, na.rm = TRUE)))
-    if (!is.finite(soil)) next
-    dvi_soil_vec[idx] <- soil
-  }
-
-  need_idx <- is.finite(df$DVI) & !is.finite(dvi_soil_vec)
-  if (any(need_idx)) {
-    bad_locs <- unique(as.character(df$location_id[need_idx]))
-    stop(sprintf("[PPI] Cannot compute per-location dvi_soil for %d rows across %d locations (example locs: %s)",
-                 sum(need_idx), length(bad_locs), paste(head(bad_locs, 10), collapse = ", ")))
-  }
-  dvi_soil_vec
-}
+# compute_dvi_soil_per_location() moved to 'mesma_helpers.R'
+if (!exists("compute_dvi_soil_per_location") && file.exists("mesma_helpers.R")) source("mesma_helpers.R")
 
 # Ensure PPI exists; require per-location dvi_soil and per-location M (no auto fallbacks)
 if (!"PPI" %in% names(df_raw) || all(!is.finite(df_raw$PPI))) {
@@ -499,57 +498,10 @@ if (file.exists("ppi_helpers.R")) {
   warning("ppi_helpers.R not found - PPI will not be calculated")
 }
 
-calculate_indices <- function(df) {
-  # Expects columns: blue, green, red, nir, swir1, swir2
-  eps <- 1e-9
+# calculate_indices() moved to 'mesma_helpers.R' (canonical implementation)
+if (!exists("calculate_indices") && file.exists("mesma_helpers.R")) source("mesma_helpers.R")
 
-  df[, `:=`(
-    # Original Set
-    DVI   = nir - red,
-    OSAVI = (nir - red) / (nir + red + 0.16),
-    MCARI = ((red - green) - 0.2*(red - blue)) * (red / (green + eps)),
-    #CRI   = (1/(green + eps)) - (1/(red + eps)),
-    #PRI   = (green - red) / (green + red + eps),
-    NIRv  = (nir * ((nir - red) / (nir + red + eps))) * 1.3, # Including the 1.3 scaling
-    PSRI  = (red - blue) / (nir + eps),
-    NBR   = (nir - swir2) / (nir + swir2 + eps),
-    TCW   = (swir1 - swir2) / (swir1 + swir2 + eps),
-    #TCG   = (green - red) / (green + red + eps),
-    #MNDWI = (green - swir1) / (green + swir1 + eps),
-
-    # New Additions
-    NDVI   = (nir - red) / (nir + red + eps),
-    MSAVI2 = (2 * nir + 1 - sqrt(pmax(0, (2 * nir + 1)^2 - 8 * (nir - red)))) / 2,
-    MSAVI  = (2 * nir + 1 - sqrt(pmax(0, (2 * nir + 1)^2 - 8 * (nir - red)))) / 2,
-    NDMI   = (nir - swir1) / (nir + swir1 + eps),
-    TCB    = 0.3029 * blue + 0.2786 * green + 0.4733 * red + 0.5599 * nir + 0.508 * swir1 + 0.1872 * swir2,
-    GVI    = -0.2941 * blue - 0.243 * green - 0.5424 * red + 0.7276 * nir + 0.0713 * swir1 - 0.1608 * swir2,
-    SATVI  = (swir1 - red) / (swir1 + red + 0.5) * (1 + 0.5),
-    EVI    = 2.5 * (nir - red) / (nir + 6 * red - 7.5 * blue + 1)
-  )]
-
-  # Add PPI if ppi helpers are available
-  if (exists("ppi") && exists("calculate_solar_zenith")) {
-    # For synthetic mixing: use soil endmember DVI as dvi_soil
-    # Assume first row (fraction_veg = 0) is pure soil
-    if ("fraction_veg" %in% names(df)) {
-      dvi_soil_val <- df$DVI[df$fraction_veg == 0][1]
-      if (is.finite(dvi_soil_val)) {
-        # Calculate zenith angle (use typical mid-latitude, mid-season value)
-        # Assume lat=40°N, DOY=180 (summer solstice), 10:30 AM
-        zenith_rad <- calculate_solar_zenith(lat = 40, doy = 180, hour = 10.5)
-
-        # Calculate PPI using ppi() function
-        M_val <- suppressWarnings(max(df$DVI, na.rm = TRUE))
-        if (!is.finite(M_val)) stop("[PPI] Synthetic mixing: cannot compute finite M")
-        df$PPI <- ppi(dvi = df$DVI, zenith.angle = zenith_rad, M = M_val, dvi.soil = dvi_soil_val)
-        cat(sprintf("Calculated PPI for synthetic mixing (dvi_soil=%.6f, zenith=%.4f rad)\n", dvi_soil_val, zenith_rad))
-      }
-    }
-  }
-
-  return(df)
-}
+# NOTE: compute_indices_from_bands remains local to january_averages.R for extraction compatibility.
 
 
 # Raw spectral bands (optional - included if present)
@@ -1252,8 +1204,8 @@ AGRI_ALIASES <- c("agri", "agric", "agriculture", "agricultural")
 # Veg types to build per-type models for (agri ignores no_soil flag; others require no_soil==1)
 NEW_VEG_TYPES <- c("agri", "tamarix", "populus", "herbs")
 # Per-veg color mapping (named vector)
-# woody_unknown is a blend color between tamarix and populus for indistinguishable variants
-veg_colors <- c("agri" = "#1b9e77", "tamarix" = "#d95f02", "populus" = "#7570b3", "herbs" = "#e7298a", "woody_unknown" = "#a0522d")
+
+veg_colors <- c("agri" = "#1b9e77", "tamarix" = "#D55E00", "populus" = "#0072B2", "herbs" = "#009E73")
 assign("VEG_CALIBRATION_COLORS", veg_colors, envir = globalenv())
 
 FVC_MODELS_BY_VEG <- list()
@@ -1804,73 +1756,16 @@ library(openxlsx)
 library(ggplot2)
 library(tidyr)
 
-# Helper functions
-make_location_id <- function(lon, lat) {
-  # Ensure inputs are numeric
-  lon <- as.numeric(lon)
-  lat <- as.numeric(lat)
-  
-  if (length(lon) == 1 && length(lat) == 1) {
-    if (!is.finite(lon) || !is.finite(lat)) return(NA_character_)
-    sprintf("L_%0.6f_%0.6f", round(lat, 6), round(lon, 6))
-  } else {
-    # Vectorized approach
-    res <- rep(NA_character_, length(lon))
-    valid <- is.finite(lon) & is.finite(lat)
-    if (any(valid)) {
-      res[valid] <- sprintf("L_%0.6f_%0.6f", round(lat[valid], 6), round(lon[valid], 6))
-    }
-    res
-  }
-}
+# Helper functions (canonical versions live in 'mesma_helpers.R')
+if (!exists("make_location_id") && file.exists("mesma_helpers.R")) source("mesma_helpers.R")
+if (!exists("safe_as_numeric") && file.exists("mesma_helpers.R")) source("mesma_helpers.R")
 
-safe_as_numeric <- function(x) {
-  if (is.null(x)) return(x)
-  if (is.factor(x)) x <- as.character(x)
-  if (is.character(x)) {
-    s <- trimws(x)
-    lower <- tolower(s)
-    lower[lower %in% c("true", "t")] <- "1"
-    lower[lower %in% c("false", "f")] <- "0"
-    suppressWarnings(num <- as.numeric(lower))
-    return(num)
-  }
-  if (is.numeric(x)) return(as.numeric(x))
-  suppressWarnings(num <- as.numeric(as.character(x)))
-  num
-}
 
 # Indices and RAW_BANDS are defined earlier in the file; outlier configuration was moved earlier to make the helper available at load time.
 
-calculate_indices <- function(df) {
-  # Ensure bands are present
-  req_bands <- c("blue", "green", "red", "nir", "swir1", "swir2")
-  missing_bands <- setdiff(req_bands, names(df))
-  if (length(missing_bands) > 0) {
-    cat("Warning: Missing bands for index calculation:", paste(missing_bands, collapse=", "), ". Skipping index calculation.\n")
-    return(df)
-  }
-  
-  eps <- 1e-9
-  
-  # Calculate DVI if missing
-  if (!"DVI" %in% names(df)) df$DVI <- df$nir - df$red
-  
-  # Calculate additional indices
-  df$OSAVI <- (df$nir - df$red) / (df$nir + df$red + 0.16)
-  df$MCARI <- ((df$red - df$green) - 0.2*(df$red - df$blue)) * (df$red / (df$green + eps))
-  df$NIRv  <- (df$nir * ((df$nir - df$red) / (df$nir + df$red + eps))) * 1.3
-  df$PSRI  <- (df$red - df$blue) / (df$nir + eps)
-  df$NBR   <- (df$nir - df$swir2) / (df$nir + df$swir2 + eps)
-  # Project-specific TCW (Normalized Difference) definition
-  df$TCW   <- (df$swir1 - df$swir2) / (df$swir1 + df$swir2 + eps) 
-  df$NDMI  <- (df$nir - df$swir1) / (df$nir + df$swir1 + eps)
-  
-  # Tasseled Cap (using project-specific coefficients)
-  df$TCB   <- 0.3029 * df$blue + 0.2786 * df$green + 0.4733 * df$red + 0.5599 * df$nir + 0.508 * df$swir1 + 0.1872 * df$swir2
-  df$GVI   <- -0.2941 * df$blue - 0.243 * df$green - 0.5424 * df$red + 0.7276 * df$nir + 0.0713 * df$swir1 - 0.1608 * df$swir2
-  
-  # Ensure NDVI/MSAVI are present and consistent
+# calculate_indices() is centralized in 'mesma_helpers.R'.
+if (!exists("calculate_indices") && file.exists("mesma_helpers.R")) source("mesma_helpers.R")
+# (local compute_indices_from_bands remains for band-derived convenience)
   df$NDVI <- (df$nir - df$red) / (df$nir + df$red + eps)
   df$MSAVI <- (2 * df$nir + 1 - sqrt(pmax(0, (2 * df$nir + 1)^2 - 8 * (df$nir - df$red)))) / 2
   
@@ -2013,7 +1908,7 @@ if (file.exists(MAPPING_CSV)) {
     map_df$Veg <- as.character(map_df[[veg_cols[1]]])
     map_df$Veg <- tolower(trimws(as.character(map_df$Veg)))
     map_df$Veg <- ifelse(grepl("phragmites", map_df$Veg, ignore.case = TRUE) |
-                         map_df$Veg %in% c("herbs", "alhagi", "salicornia", "halocnemum"),
+                         map_df$Veg %in% c("herbs", "salicornia", "halocnemum"),
                          "herbs", map_df$Veg)
   }
   
@@ -2064,7 +1959,7 @@ if (file.exists(TRAINING_CSV)) {
         if ("Veg" %in% names(training_df)) {
             training_df$Veg <- tolower(trimws(as.character(training_df$Veg)))
             training_df$Veg <- ifelse(grepl("phragmites", training_df$Veg, ignore.case = TRUE) |
-                                      training_df$Veg %in% c("herbs", "alhagi", "salicornia", "halocnemum"),
+                                      training_df$Veg %in% c("herbs", "salicornia", "halocnemum"),
                                       "herbs", training_df$Veg)
         }
   for (orig in names(band_mapping)) if (orig %in% names(training_df) && !band_mapping[orig] %in% names(training_df)) names(training_df)[names(training_df) == orig] <- band_mapping[orig]
@@ -2712,9 +2607,9 @@ for (idx in indices_to_snr) {
     next
   }
 
-  # Point estimates: mean predicted FVC in January (bias vs zero) and RMSE vs zero
-  bias_point <- mean(jan_loc$fvc, na.rm = TRUE)
-  rmse_point <- sqrt(mean((jan_loc$fvc)^2, na.rm = TRUE))
+  # Point estimates: uncertainty-adjusted (bootstrap median) predicted FVC in January (bias vs zero) and RMSE vs zero
+  bias_point <- NA_real_
+  rmse_point <- NA_real_
 
   # Hierarchical bootstrap over locations to get CI (mean and RMSE vs zero)
   B <- 1000
@@ -2729,6 +2624,9 @@ for (idx in indices_to_snr) {
     boot_bias[b] <- mean(sel_d$fvc, na.rm = TRUE)
     boot_rmse[b] <- sqrt(mean((sel_d$fvc)^2, na.rm = TRUE))
   }
+
+  bias_point <- median(boot_bias, na.rm = TRUE)
+  rmse_point <- median(boot_rmse, na.rm = TRUE)
 
   index_bias_list[[idx]] <- list(
     bias = median(boot_bias, na.rm = TRUE),
@@ -2890,7 +2788,7 @@ p <- ggplot(plot_data_mean, aes(x = pheno_year, y = mean_val)) +
        subtitle = "Normalization: Index - SeasonalTrend(doy) + Mean(SeasonalTrend)",
        x = "Year",
        y = "Mean Normalized Value") +
-  theme_minimal()
+  theme_mesma()
 
 print(p)
 
@@ -2909,7 +2807,7 @@ p_med <- ggplot(plot_data_median, aes(x = pheno_year, y = median_val)) +
        subtitle = "Normalization: Index - SeasonalTrend(doy) + Mean(SeasonalTrend)",
        x = "Year",
        y = "Median Normalized Value") +
-  theme_minimal()
+  theme_mesma()
 
 print(p_med)
 
@@ -2930,7 +2828,7 @@ if (nrow(np_mean) > 0) {
     facet_wrap(~ index, scales = "fixed") +
     labs(title = "NDVI and PPI: Mean Seasonally-Normalized Trends (same y-scale)",
          x = "Year", y = "Normalized Value") +
-    theme_minimal()
+    theme_mesma()
 
   ggsave(file.path(output_dir, "ndvi_ppi_summer_trend_normalized_mean.png"), plot = p_np_mean, width = 10, height = 4.5)
   cat("Saved NDVI+PPI mean comparison plot to:", file.path(output_dir, "ndvi_ppi_summer_trend_normalized_mean.png"), "\n")
@@ -2949,7 +2847,7 @@ if (nrow(np_med) > 0) {
     facet_wrap(~ index, scales = "fixed") +
     labs(title = "NDVI and PPI: Median Seasonally-Normalized Trends (same y-scale)",
          x = "Year", y = "Normalized Value") +
-    theme_minimal()
+    theme_mesma()
 
   ggsave(file.path(output_dir, "ndvi_ppi_summer_trend_normalized_median.png"), plot = p_np_med, width = 10, height = 4.5)
   cat("Saved NDVI+PPI median comparison plot to:", file.path(output_dir, "ndvi_ppi_summer_trend_normalized_median.png"), "\n")

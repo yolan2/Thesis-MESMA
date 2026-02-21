@@ -2,35 +2,10 @@
 ## Provides: safe_as_numeric, calculate_solar_zenith, ppi, add_ppi_columns, auto_add_ppi_columns
 ## Also provides shared utility functions: make_location_id, assign_pheno_year, pheno_doy
 
-safe_as_numeric <- function(x) {
-  as.numeric(as.character(x))
-}
+# Shared utilities moved to `mesma_helpers.R` — canonical definitions live there.
+if (!exists("safe_as_numeric") && file.exists("mesma_helpers.R")) source("mesma_helpers.R")
 
-make_location_id <- function(lon, lat) {
-  lon <- as.numeric(lon)
-  lat <- as.numeric(lat)
-  invalid_mask <- !is.finite(lon) | !is.finite(lat)
-  res <- sprintf("L_%0.6f_%0.6f", round(lat, 6), round(lon, 6))
-  res[invalid_mask] <- NA_character_
-  res
-}
-
-assign_pheno_year <- function(d) {
-  d <- as.Date(d)
-  ifelse(is.na(d), NA_integer_, ifelse(lubridate::month(d) >= 3, lubridate::year(d), lubridate::year(d) - 1))
-}
-
-pheno_doy <- function(d) {
-  d <- tryCatch(as.Date(d), error = function(e) NA)
-  month <- lubridate::month(d)
-  ifelse(is.na(d), NA_integer_,
-    ifelse(month >= 3,
-      as.integer(d - as.Date(paste0(lubridate::year(d), "-03-01"))) + 1L,
-      as.integer(d - as.Date(paste0(lubridate::year(d) - 1, "-03-01"))) + 1L
-    )
-  )
-}
-
+# PPI-specific helpers continue below.
 calculate_solar_zenith <- function(lat, doy, hour = 10.5) {
   # This function is CORRECT. It addresses the SZA issue.
   lat_rad <- lat * pi / 180
@@ -114,7 +89,9 @@ add_ppi_columns <- function(df, dvi_soil = NULL) {
     stop(sprintf("[PPI ERROR] dvi_soil baseline not established for %d rows; provide explicit dvi_soil for these rows.\n", sum(need_idx)))
   }
 
-  # Note: Global PPI M computation has been removed. Per-location or per-call M is used instead; fallback M=0.7 will be applied only when necessary.
+  # NOTE: Per the current experimental setting, the canopy-maximum M is fixed
+  # to PPI_FULL_VEG_COVER (default 0.7). We DO NOT compute per-location max(DVI)
+  # for M — use the fixed value and nudge above dvi_soil when required.
 
 
   # Latitude Handling for SZA
@@ -159,23 +136,24 @@ add_ppi_columns <- function(df, dvi_soil = NULL) {
         dsoil_val <- dsoil_loc[is.finite(dsoil_loc)][1]
         if (!is.finite(dsoil_val)) next
         if (!any(is.finite(dvi_loc) & is.finite(zen_loc))) next
-        M_loc <- suppressWarnings(max(dvi_loc, na.rm = TRUE))
+        # Use fixed canopy-maximum M (do NOT compute max(DVI) dynamically)
+        M_loc <- if (exists("PPI_FULL_VEG_COVER")) get("PPI_FULL_VEG_COVER") else 0.7
+        # Ensure M is strictly above the local soil baseline to avoid invalid denominator
         if (!is.finite(M_loc) || M_loc <= dsoil_val) {
-          # Fall back to just above the local soil baseline to avoid invalid denom
           M_loc <- dsoil_val + 1e-3
-        } else {
-          # use M_loc (max DVI) silently
+          warning(sprintf("[PPI] Fixed M <= dvi_soil for location '%s' — using M = dvi_soil + 1e-3 (%.6f)", loc, M_loc))
         }
         df$PPI[idx_loc] <- ppi(dvi_loc, zen_loc, M = M_loc, dvi.soil = dsoil_val)
       }
     } else {
       # No location info: compute a single M from the available rows (no fallback constants)
-      M_global <- suppressWarnings(max(df$DVI[calc_idx], na.rm = TRUE))
-      if (!is.finite(M_global)) stop("[PPI ERROR] Cannot compute M (non-finite) for dataset without location_id.")
-      # Ensure M is above the soil baseline
+      # Use fixed global M (do NOT compute max(DVI) dynamically)
+      M_global <- if (exists("PPI_FULL_VEG_COVER")) get("PPI_FULL_VEG_COVER") else 0.7
       min_dsoil <- suppressWarnings(min(df$dvi_soil[calc_idx], na.rm = TRUE))
       if (is.finite(min_dsoil) && M_global <= min_dsoil) {
-        stop("[PPI ERROR] Computed M is not greater than dvi_soil baseline; cannot compute PPI.")
+        # Nudge M above the soil baseline to avoid errors
+        M_global <- min_dsoil + 1e-3
+        warning(sprintf("[PPI] Fixed global M <= min dvi_soil; using M = dvi_soil + 1e-3 (%.6f)", M_global))
       }
       df$PPI[calc_idx] <- ppi(df$DVI[calc_idx], df$zenith.angle[calc_idx], M = M_global, dvi.soil = df$dvi_soil[calc_idx])
     }

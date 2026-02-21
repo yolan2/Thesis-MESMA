@@ -10,6 +10,70 @@ from sklearn.ensemble import RandomForestClassifier, IsolationForest
 from sklearn.metrics import confusion_matrix, accuracy_score, classification_report
 from collections import Counter
 
+# --- Align RF feature space with MESMA (RAW_BANDS + OPTIMAL_INDICES) ---
+MESMA_RAW_BANDS = ["blue", "green", "red", "nir", "swir1", "swir2"]
+MESMA_OPTIMAL_INDICES = ["PSRI", "NDMI", "EVI", "TCW", "NDTI", "BSI", "MSI", "SIPI"]
+
+
+def _compute_mesma_indices(band_df: "pd.DataFrame") -> "pd.DataFrame":
+    """Compute MESMA-style indices from available band columns in `band_df`.
+
+    - `band_df` should contain one or more of the columns named in MESMA_RAW_BANDS.
+    - Returns a DataFrame with any available RAW_BANDS followed by the MESMA_OPTIMAL_INDICES
+      that can be computed from the available bands.
+    - Uses the same formulas as `compute_indices_from_bands()` in `fit_veg_mixture_mesma.R`.
+    """
+    eps = 1e-9
+    out = pd.DataFrame(index=band_df.index)
+
+    # copy available raw bands (keep same order as MESMA_RAW_BANDS)
+    for b in MESMA_RAW_BANDS:
+        if b in band_df.columns:
+            out[b] = pd.to_numeric(band_df[b], errors="coerce")
+
+    # convenience local alias access
+    b = out
+
+    # PSRI: (red - blue) / (nir + eps)
+    if set(["red", "blue", "nir"]).issubset(b.columns):
+        out["PSRI"] = (b["red"] - b["blue"]) / (b["nir"].astype(float) + eps)
+
+    # NDMI: (nir - swir1) / (nir + swir1 + eps)
+    if set(["nir", "swir1"]).issubset(b.columns):
+        out["NDMI"] = (b["nir"] - b["swir1"]) / (b["nir"] + b["swir1"] + eps)
+
+    # EVI: 2.5 * ((nir - red) / (nir + 6*red - 7.5*blue + 1 + eps))
+    if set(["nir", "red", "blue"]).issubset(b.columns):
+        out["EVI"] = 2.5 * ((b["nir"] - b["red"]) / (b["nir"] + 6*b["red"] - 7.5*b["blue"] + 1 + eps))
+
+    # TCW: (swir1 - swir2) / (swir1 + swir2 + eps)
+    if set(["swir1", "swir2"]).issubset(b.columns):
+        out["TCW"] = (b["swir1"] - b["swir2"]) / (b["swir1"] + b["swir2"] + eps)
+
+    # NDTI: (swir1 - swir2) / (swir1 + swir2 + eps)  (same form as TCW)
+    if set(["swir1", "swir2"]).issubset(b.columns):
+        out["NDTI"] = (b["swir1"] - b["swir2"]) / (b["swir1"] + b["swir2"] + eps)
+
+    # BSI: ((swir1 + red) - (nir + blue)) / ((swir1 + red) + (nir + blue) + eps)
+    if set(["swir1", "red", "nir", "blue"]).issubset(b.columns):
+        term1 = b["swir1"] + b["red"]
+        term2 = b["nir"] + b["blue"]
+        out["BSI"] = (term1 - term2) / (term1 + term2 + eps)
+
+    # MSI: swir1 / (nir + eps)
+    if set(["swir1", "nir"]).issubset(b.columns):
+        out["MSI"] = b["swir1"] / (b["nir"] + eps)
+
+    # SIPI: (nir - blue) / (nir - red + eps)
+    if set(["nir", "blue", "red"]).issubset(b.columns):
+        out["SIPI"] = (b["nir"] - b["blue"]) / (b["nir"] - b["red"] + eps)
+
+    # Keep column order predictable: raw bands (in MESMA_RAW_BANDS order) then MESMA_OPTIMAL_INDICES
+    cols = [c for c in MESMA_RAW_BANDS if c in out.columns]
+    cols += [c for c in MESMA_OPTIMAL_INDICES if c in out.columns]
+    return out.loc[:, cols]
+
+
 def parse_coordinate(val):
     """Parses coordinate values, handling '40,123' format and strings."""
     try:
@@ -25,165 +89,173 @@ def parse_coordinate(val):
 def collect_training_data(downloads_dir="downloads", spatial_reference_list=None):
     if spatial_reference_list is None: spatial_reference_list = []
 
-    training_data = []
+    rows = []           # list of dicts (feature-name -> value)
     labels = []
-    groups = [] 
-    group_purity = {} # Map group_id -> bool (True if pure) 
-    
+    groups = []
+    group_purity = {}
+
     sample_folders = [f for f in os.listdir(downloads_dir) if os.path.isdir(os.path.join(downloads_dir, f))]
-    
-    matched_count = 0
-    total_folders = 0
-    
     print(f"Scanning {len(sample_folders)} folders for training data...")
-    
-    # Pre-calculate pure point coordinates for debugging
+
+    # Pre-calc pure points for diagnostics
     pure_coords = [p for p in spatial_reference_list if p[2] == 1]
     print(f"DEBUG: Tracking {len(pure_coords)} pure points from SHP for matching issues.")
 
     for folder in sample_folders:
         parts = folder.split('_')
-        
-        # Parse Coordinates from Folder Name (L_LON_LAT_TYPE...)
-        folder_lat = None
-        folder_lon = None
-        typ = None
-        
+        # parse folder name (same logic as before)
+        folder_lat = None; folder_lon = None; typ = None
         is_l_format = (parts[0] == 'L' and len(parts) > 3)
-        
         if is_l_format:
             try:
-                # Format: L_{lon}_{lat}_{type}_...
-                folder_lon = float(parts[1])
-                folder_lat = float(parts[2])
-                
+                folder_lon = float(parts[1]); folder_lat = float(parts[2])
                 if 'SD' in parts:
-                    sd_index = parts.index('SD')
-                    typ = "_".join(parts[3:sd_index])
+                    sd_index = parts.index('SD'); typ = "_".join(parts[3:sd_index])
             except ValueError:
                 continue
         else:
-            # Fallback for Sample_ID formats, try to parse type at least
-             if 'SD' in parts:
-                sd_index = parts.index('SD')
-                typ = "_".join(parts[2:sd_index])
-             elif len(parts) >= 3:
+            if 'SD' in parts:
+                sd_index = parts.index('SD'); typ = "_".join(parts[2:sd_index])
+            elif len(parts) >= 3:
                 typ = parts[2]
-
         if not typ: continue
-        
-        # Standardize type
         if typ == 'water': typ = 'barren'
         if typ.lower() == 'none': continue
 
         allowed_classes = ['populus', 'barren', 'tamarix', 'herbs']
-        
-        # Check spatial match BEFORE type filtering for debug purposes
-        is_pure = False
-        matched_purity = 0
-        match_found = False
-        
+        # spatial match diagnostic
+        is_pure = False; match_found = False; matched_purity = 0
         if folder_lat is not None and folder_lon is not None and spatial_reference_list:
-            # Find closest point
             min_dist = 1e9
-            
             for (ref_lat, ref_lon, ref_purity) in spatial_reference_list:
                 dist = (folder_lat - ref_lat)**2 + (folder_lon - ref_lon)**2
                 if dist < min_dist:
-                    min_dist = dist
-                    matched_purity = ref_purity
-            
-            # Threshold: 0.001 degrees is roughly 111 meters (relaxed from 0.00025)
+                    min_dist = dist; matched_purity = ref_purity
             if min_dist < (0.001 ** 2):
-                match_found = True
-                is_pure = (matched_purity == 1)
-        
-        # Now apply type filtering
-        if typ not in allowed_classes:
-            # if match_found and is_pure:
-            #     print(f"WARNING: Folder {folder} is spatially close to a PURE point but skipped due to type '{typ}'.")
-            continue
-            
-        total_folders += 1
-        
-        if match_found:
-             matched_count += 1
-             if is_pure:
-                 # print(f"  Match: {folder} -> Pure: {is_pure}")
-                 pass
-            
-        group_id = folder
-        group_purity[group_id] = is_pure
-            
+                match_found = True; is_pure = (matched_purity == 1)
+        if typ not in allowed_classes: continue
+
         group_id = folder
         group_purity[group_id] = is_pure
 
-        # Find the analytic tif file recursively
+        # find analytic tif
         sr_tif = None
         for root, dirs, files in os.walk(os.path.join(downloads_dir, folder)):
             for file in files:
                 if 'AnalyticMS_SR' in file and file.endswith('.tif'):
-                    sr_tif = os.path.join(root, file)
-                    break
-            if sr_tif:
-                break
-        
-        if not sr_tif:
-            continue
-            
-        with rasterio.open(sr_tif) as src:
-            if src.count != 8:
-                continue
-            
-            bands = src.read()  # shape (8, h, w)
-            mask = bands[0] != 0
-            
-            if not np.any(mask):
-                continue
-                
-            valid_pixels = bands[:, mask].T 
-            
-            if valid_pixels.shape[0] > 0:
-                training_data.extend(valid_pixels.tolist())
-                labels.extend([typ] * valid_pixels.shape[0])
-                groups.extend([group_id] * valid_pixels.shape[0])
+                    sr_tif = os.path.join(root, file); break
+            if sr_tif: break
+        if not sr_tif: continue
 
-    print(f"Matched {matched_count} folders to shapefile points out of {total_folders} candidates.")
-    return np.array(training_data), np.array(labels), np.array(groups), group_purity
+        with rasterio.open(sr_tif) as src:
+            # read bands and try to construct named-band DataFrame when possible
+            bands = src.read()  # shape (nb, h, w)
+            mask = bands[0] != 0
+            if not np.any(mask): continue
+            valid_pixels = bands[:, mask].T  # (n_pixels, n_bands)
+
+            # attempt to detect band -> name mapping
+            band_names = []
+            descs = []
+            try:
+                descs = [d.lower() if d else '' for d in (src.descriptions or [])]
+            except Exception:
+                descs = []
+
+            if descs and len(descs) == src.count:
+                # try to map known names from descriptions
+                for d in descs:
+                    if 'blue' in d: band_names.append('blue')
+                    elif 'green' in d: band_names.append('green')
+                    elif 'red' in d and 'red edge' not in d: band_names.append('red')
+                    elif 'nir' in d and 'swir' not in d: band_names.append('nir')
+                    elif 'swir1' in d or 'swir 1' in d or 'swir' in d and 'swir2' not in d: band_names.append('swir1')
+                    elif 'swir2' in d or 'swir 2' in d: band_names.append('swir2')
+                    else:
+                        band_names.append(None)
+            else:
+                # heuristic: if image has exactly 6 bands assume Landsat-like order
+                if src.count == 6:
+                    band_names = ['blue','green','red','nir','swir1','swir2']
+                else:
+                    # fallback: create generic band names (preserve ordering)
+                    band_names = [f'band_{i+1}' for i in range(src.count)]
+
+            # build DataFrame for the raw bands (columns named)
+            df_bands = pd.DataFrame(valid_pixels, columns=band_names)
+
+            # try to compute MESMA indices where possible; if not possible we'll keep raw bands
+            fea_df = _compute_mesma_indices(df_bands)
+            if fea_df.shape[1] == 0:
+                # fallback to raw bands (use generic names)
+                fea_df = df_bands.copy()
+
+            # append rows
+            for i, row in fea_df.iterrows():
+                rows.append(row.to_dict()); labels.append(typ); groups.append(group_id)
+
+    print(f"Collected features from {len(rows)} pixels across {len(set(groups))} groups (folders)")
+    if len(rows) == 0:
+        return pd.DataFrame(), np.array([]), np.array([]), group_purity
+
+    X_df = pd.DataFrame(rows)
+    # Ensure deterministic column order: MESMA raw bands first then OPTIMAL_INDICES then any remaining
+    cols_order = [c for c in MESMA_RAW_BANDS if c in X_df.columns]
+    cols_order += [c for c in MESMA_OPTIMAL_INDICES if c in X_df.columns and c not in cols_order]
+    # add any other columns at end
+    cols_order += [c for c in X_df.columns if c not in cols_order]
+    X_df = X_df.loc[:, cols_order]
+
+    # diagnostic: print final feature list so user can confirm consistency with MESMA
+    print(f"[FEATURE SPACE] Training features: {list(X_df.columns)}")
+
+    return X_df, np.array(labels), np.array(groups), group_purity
 
 def remove_outliers(X, y, groups, contamination=0.05, random_state=42):
     """
     Removes outliers from the training data using Isolation Forest per class.
+
+    Accepts X as a numpy array or pandas DataFrame. Returns X in the same *type*
+    as the input (DataFrame preserved when given).
     """
     print("\n--- REMOVING OUTLIERS (Isolation Forest per Class) ---")
     print(f"Target Contamination: {contamination*100}%")
-    
+
+    is_df = isinstance(X, pd.DataFrame)
+    n_rows = len(y)
     unique_classes = np.unique(y)
-    keep_mask = np.zeros(len(y), dtype=bool) 
+    keep_mask = np.zeros(n_rows, dtype=bool)
     total_removed = 0
-    
+
     for cls in unique_classes:
         cls_indices = np.where(y == cls)[0]
-        X_cls = X[cls_indices]
-        
+        if is_df:
+            X_cls = X.iloc[cls_indices]
+        else:
+            X_cls = X[cls_indices]
+
         if len(X_cls) < 10:
             keep_mask[cls_indices] = True
             continue
-            
+
         iso = IsolationForest(contamination=contamination, random_state=random_state, n_jobs=-1)
+        # sklearn accepts DataFrame or ndarray
         preds = iso.fit_predict(X_cls)
         inliers_cls = (preds == 1)
-        
+
         keep_indices = cls_indices[inliers_cls]
         keep_mask[keep_indices] = True
-        
+
         n_removed = len(cls_indices) - len(keep_indices)
         total_removed += n_removed
 
-    X_clean = X[keep_mask]
+    if is_df:
+        X_clean = X.iloc[keep_mask].reset_index(drop=True)
+    else:
+        X_clean = X[keep_mask]
     y_clean = y[keep_mask]
     groups_clean = groups[keep_mask]
-    
+
     print(f"Total Outliers Removed: {total_removed} / {len(y)} ({(total_removed/len(y))*100:.1f}%)")
     print(f"Cleaned Data Size: {len(X_clean)} pixels")
     return X_clean, y_clean, groups_clean
@@ -210,36 +282,45 @@ def purity_based_split(X, y, groups, group_purity):
 
 def evaluate_rf_with_holdout(X, y, groups, group_purity):
     print("\n--- EVALUATING MODEL (Train on PURE, Test on IMPURE) ---")
-    
-    train_idx, test_idx = purity_based_split(X, y, groups, group_purity)
-    
-    X_train, X_test = X[train_idx], X[test_idx]
+
+    # Accept X as DataFrame or ndarray
+    is_df = isinstance(X, pd.DataFrame)
+    if is_df:
+        X_df = X.copy().reset_index(drop=True)
+    else:
+        X_df = pd.DataFrame(X)
+
+    train_idx, test_idx = purity_based_split(X_df.values, y, groups, group_purity)
+
+    X_train_df = X_df.iloc[train_idx]
+    X_test_df = X_df.iloc[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
-    
-    print(f"Training Pixels (Pure): {len(X_train)} | Test Pixels (Impure): {len(X_test)}")
+
+    print(f"Training Pixels (Pure): {len(X_train_df)} | Test Pixels (Impure): {len(X_test_df)}")
     print(f"Training Class Distribution: {dict(Counter(y_train))}")
-    
-    if len(X_train) == 0:
+
+    if len(X_train_df) == 0:
         print("No pure training data. Using all data for training.")
         clf_final = RandomForestClassifier(n_estimators=100, max_depth=10, min_samples_split=10, min_samples_leaf=10, max_features='sqrt', class_weight='balanced', random_state=42, n_jobs=-1)
-        clf_final.fit(X, y)
+        # pass DataFrame so sklearn records feature names
+        clf_final.fit(X_df, y)
         return clf_final
 
     clf = RandomForestClassifier(n_estimators=100, max_depth=10, min_samples_split=10, min_samples_leaf=10, max_features='sqrt', class_weight='balanced', random_state=42, n_jobs=-1)
-    clf.fit(X_train, y_train)
-    
-    if len(X_test) > 0:
-        y_pred_test = clf.predict(X_test)
+    clf.fit(X_train_df, y_train)
+
+    if len(X_test_df) > 0:
+        y_pred_test = clf.predict(X_test_df)
         std_acc = accuracy_score(y_test, y_pred_test)
         print(f"\n[Test] Standard Accuracy (Impure): {std_acc:.4f}")
         print("\nClassification Report (Standard Test):")
         print(classification_report(y_test, y_pred_test, labels=clf.classes_))
         print("\nConfusion Matrix (Standard Test):")
         print(confusion_matrix(y_test, y_pred_test, labels=clf.classes_))
-        
+
         if 'barren' in clf.classes_:
             barren_idx = np.where(clf.classes_ == 'barren')[0][0]
-            probs = clf.predict_proba(X_test)
+            probs = clf.predict_proba(X_test_df)
             probs[:, barren_idx] = 0
             new_pred_indices = np.argmax(probs, axis=1)
             y_pred_veg = clf.classes_[new_pred_indices]
@@ -247,52 +328,51 @@ def evaluate_rf_with_holdout(X, y, groups, group_purity):
             print(f"[Test] Vegetation-Only Accuracy (Impure): {veg_acc:.4f}")
             print("\nConfusion Matrix (Vegetation-Only Logic):")
             print(confusion_matrix(y_test, y_pred_veg, labels=clf.classes_))
-            
-    y_pred_train = clf.predict(X_train)
+
+    y_pred_train = clf.predict(X_train_df)
     train_acc = accuracy_score(y_train, y_pred_train)
     print(f"\n[Resubstitution] Training Pixel Accuracy (Pure): {train_acc:.4f}")
     print("\nConfusion Matrix (Training):")
     print(confusion_matrix(y_train, y_pred_train, labels=clf.classes_))
 
     clf_final = RandomForestClassifier(n_estimators=100, max_depth=10, min_samples_split=10, min_samples_leaf=10, max_features='sqrt', class_weight='balanced', random_state=42, n_jobs=-1)
-    clf_final.fit(X_train, y_train)
-    return clf_final
-
+    clf_final.fit(X_train_df, y_train)
 def predict_for_samples(downloads_dir, clf):
     print("\n--- PREDICTING FRACTIONAL COMPOSITION PER SAMPLE (Pixel-based) ---")
-    
+
+    # Attempt to retrieve training feature order from the trained classifier
+    feature_cols = None
+    if hasattr(clf, 'feature_names_in_'):
+        try:
+            feature_cols = list(clf.feature_names_in_)
+        except Exception:
+            feature_cols = None
+
     sample_folders = [f for f in os.listdir(downloads_dir) if os.path.isdir(os.path.join(downloads_dir, f))]
     sample_folders.sort()
-    
+
     predictions = []
 
     for folder in sample_folders:
         parts = folder.split('_')
-        folder_lon = None
-        folder_lat = None
-        true_typ = None
-        
+        folder_lon = None; folder_lat = None; true_typ = None
         if parts[0] == 'L' and len(parts) > 3:
             try:
-                folder_lon = float(parts[1])
-                folder_lat = float(parts[2])
+                folder_lon = float(parts[1]); folder_lat = float(parts[2])
                 if 'SD' in parts:
-                    sd_index = parts.index('SD')
-                    true_typ = "_".join(parts[3:sd_index])
+                    sd_index = parts.index('SD'); true_typ = "_".join(parts[3:sd_index])
             except:
                 pass
         else:
-             if 'SD' in parts:
-                sd_index = parts.index('SD')
-                true_typ = "_".join(parts[2:sd_index])
-             elif len(parts) >= 3:
+            if 'SD' in parts:
+                sd_index = parts.index('SD'); true_typ = "_".join(parts[2:sd_index])
+            elif len(parts) >= 3:
                 true_typ = parts[2]
 
         year = None
         for p in parts:
             if len(p) == 4 and p.isdigit() and int(p) > 2000:
-                year = int(p)
-                break
+                year = int(p); break
 
         if true_typ == 'water': true_typ = 'barren'
         if not true_typ or true_typ.lower() == 'none': continue
@@ -304,36 +384,70 @@ def predict_for_samples(downloads_dir, clf):
         for root, dirs, files in os.walk(os.path.join(downloads_dir, folder)):
             for file in files:
                 if 'AnalyticMS_SR' in file and file.endswith('.tif'):
-                    sr_tif = os.path.join(root, file)
-                    break
+                    sr_tif = os.path.join(root, file); break
             if sr_tif: break
         if not sr_tif: continue
-            
+
         with rasterio.open(sr_tif) as src:
-            if src.count != 8: continue
-            
             bands = src.read()
             mask = bands[0] != 0
             if not np.any(mask): continue
-                
-            valid_pixels_data = bands[:, mask].T 
-            preds = clf.predict(valid_pixels_data)
+            valid_pixels = bands[:, mask].T  # (n_pixels, n_bands)
+
+            # attempt to name bands like during training
+            descs = []
+            try:
+                descs = [d.lower() if d else '' for d in (src.descriptions or [])]
+            except Exception:
+                descs = []
+            if descs and len(descs) == src.count:
+                band_names = []
+                for d in descs:
+                    if 'blue' in d: band_names.append('blue')
+                    elif 'green' in d: band_names.append('green')
+                    elif 'red' in d and 'red edge' not in d: band_names.append('red')
+                    elif 'nir' in d and 'swir' not in d: band_names.append('nir')
+                    elif 'swir1' in d or 'swir 1' in d or ('swir' in d and 'swir2' not in d): band_names.append('swir1')
+                    elif 'swir2' in d or 'swir 2' in d: band_names.append('swir2')
+                    else: band_names.append(None)
+            else:
+                if src.count == 6:
+                    band_names = ['blue','green','red','nir','swir1','swir2']
+                else:
+                    band_names = [f'band_{i+1}' for i in range(src.count)]
+
+            df_bands = pd.DataFrame(valid_pixels, columns=band_names)
+            fea_df = _compute_mesma_indices(df_bands)
+            if fea_df.shape[1] == 0:
+                fea_df = df_bands.copy()
+
+            # Align with training feature columns if available
+            if feature_cols is not None:
+                # ensure all required cols present; fill missing with 0
+                missing = [c for c in feature_cols if c not in fea_df.columns]
+                if missing:
+                    # safer to fill with zeros rather than drop
+                    for m in missing:
+                        fea_df[m] = 0.0
+                fea_df = fea_df.reindex(columns=feature_cols)
+
+            # predict (sklearn accepts DataFrame directly)
+            try:
+                preds = clf.predict(fea_df)
+            except Exception:
+                # fallback: convert to numpy array
+                preds = clf.predict(fea_df.values)
+
             counts = Counter(preds)
             total = len(preds)
             fractions = {k: v/total for k, v in counts.items()}
-            
+
             loc_id = folder
-            
-            pred_row = {
-                'location_id': loc_id,
-                'year': year,
-                'folder': folder,
-                'true_type': true_typ
-            }
+            pred_row = {'location_id': loc_id, 'year': year, 'folder': folder, 'true_type': true_typ}
             for cls in allowed_classes:
                 pred_row[f'{cls}_frac'] = fractions.get(cls, 0.0)
             predictions.append(pred_row)
-    
+
     if predictions:
         pred_df = pd.DataFrame(predictions)
         out_csv = "rf_predictions.csv"
@@ -471,7 +585,7 @@ def main():
     barren_groups = [grp for grp in np.unique(groups) if any(y[i] == 'barren' for i in np.where(groups == grp)[0])]
     if barren_groups:
         print(f"Barren groups found: {len(barren_groups)}. Splitting in half for pure/impure.")
-        seed = int(os.environ.get("MESMA_SEED", "42"))
+        seed = int(os.environ.get("MESMA_SEED", "123"))
         np.random.seed(seed)
         import random as _py_random
         _py_random.seed(seed)

@@ -237,57 +237,9 @@ if (file.exists("ppi_helpers.R")) {
   warning("ppi_helpers.R not found - PPI will not be calculated")
 }
 
-calculate_indices <- function(df) {
-  # Expects columns: blue, green, red, nir, swir1, swir2
-  eps <- 1e-9
+# calculate_indices() centralized in 'mesma_helpers.R'
+if (!exists("calculate_indices") && file.exists("mesma_helpers.R")) source("mesma_helpers.R")
 
-  df[, `:=`(
-    # Original Set
-    DVI   = nir - red,
-    OSAVI = (nir - red) / (nir + red + 0.16),
-    MCARI = ((red - green) - 0.2*(red - blue)) * (red / (green + eps)),
-    #CRI   = (1/(green + eps)) - (1/(red + eps)),
-    #PRI   = (green - red) / (green + red + eps),
-    NIRv  = (nir * ((nir - red) / (nir + red + eps))) * 1.3, # Including the 1.3 scaling
-    PSRI  = (red - blue) / (nir + eps),
-    NBR   = (nir - swir2) / (nir + swir2 + eps),
-    TCW   = (swir1 - swir2) / (swir1 + swir2 + eps),
-    #TCG   = (green - red) / (green + red + eps),
-    #MNDWI = (green - swir1) / (green + swir1 + eps),
-
-    # New Additions
-    NDVI   = (nir - red) / (nir + red + eps),
-    MSAVI2 = (2 * nir + 1 - sqrt(pmax(0, (2 * nir + 1)^2 - 8 * (nir - red)))) / 2,
-    MSAVI  = (2 * nir + 1 - sqrt(pmax(0, (2 * nir + 1)^2 - 8 * (nir - red)))) / 2,
-    NDMI   = (nir - swir1) / (nir + swir1 + eps),
-    TCB    = 0.3029 * blue + 0.2786 * green + 0.4733 * red + 0.5599 * nir + 0.508 * swir1 + 0.1872 * swir2,
-    GVI    = -0.2941 * blue - 0.243 * green - 0.5424 * red + 0.7276 * nir + 0.0713 * swir1 - 0.1608 * swir2,
-    SATVI  = (swir1 - red) / (swir1 + red + 0.5) * (1 + 0.5),
-    EVI    = 2.5 * (nir - red) / (nir + 6 * red - 7.5 * blue + 1)
-  )]
-
-  # Add PPI if ppi helpers are available
-  if (exists("ppi") && exists("calculate_solar_zenith")) {
-    # For synthetic mixing: use soil endmember DVI as dvi_soil
-    # Assume first row (fraction_veg = 0) is pure soil
-    if ("fraction_veg" %in% names(df)) {
-      dvi_soil_val <- df$DVI[df$fraction_veg == 0][1]
-      if (is.finite(dvi_soil_val)) {
-        # Calculate zenith angle (use typical mid-latitude, mid-season value)
-        # Assume lat=40°N, DOY=180 (summer solstice), 10:30 AM
-        zenith_rad <- calculate_solar_zenith(lat = 40, doy = 180, hour = 10.5)
-
-        # Calculate PPI using ppi() function
-        M_val <- suppressWarnings(max(df$DVI, na.rm = TRUE))
-        if (!is.finite(M_val)) stop("[PPI] Cannot compute finite M for synthetic mixing")
-        df$PPI <- ppi(dvi = df$DVI, zenith.angle = zenith_rad, M = M_val, dvi.soil = dvi_soil_val)
-        cat(sprintf("Calculated PPI for synthetic mixing (dvi_soil=%.6f, zenith=%.4f rad)\n", dvi_soil_val, zenith_rad))
-      }
-    }
-  }
-
-  return(df)
-}
 
 # Raw spectral bands (optional - included if present)
 RAW_BANDS <- c("blue", "green", "red", "nir", "swir1", "swir2")

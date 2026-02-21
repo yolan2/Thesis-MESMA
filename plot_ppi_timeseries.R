@@ -7,42 +7,7 @@ library(ggplot2)
 library(readr)
 library(sf)
 
-# --- Helper Functions (Copied from january_averages.R) ---
-
-make_location_id <- function(lon, lat) {
-  # Ensure inputs are numeric
-  lon <- as.numeric(lon)
-  lat <- as.numeric(lat)
-  
-  if (length(lon) == 1 && length(lat) == 1) {
-    if (!is.finite(lon) || !is.finite(lat)) return(NA_character_)
-    sprintf("L_%0.6f_%0.6f", round(lat, 6), round(lon, 6))
-  } else {
-    # Vectorized approach
-    res <- rep(NA_character_, length(lon))
-    valid <- is.finite(lon) & is.finite(lat)
-    if (any(valid)) {
-      res[valid] <- sprintf("L_%0.6f_%0.6f", round(lat[valid], 6), round(lon[valid], 6))
-    }
-    res
-  }
-}
-
-safe_as_numeric <- function(x) {
-  if (is.null(x)) return(x)
-  if (is.factor(x)) x <- as.character(x)
-  if (is.character(x)) {
-    s <- trimws(x)
-    lower <- tolower(s)
-    lower[lower %in% c("true", "t")] <- "1"
-    lower[lower %in% c("false", "f")] <- "0"
-    suppressWarnings(num <- as.numeric(lower))
-    return(num)
-  }
-  if (is.numeric(x)) return(as.numeric(x))
-  suppressWarnings(num <- as.numeric(as.character(x)))
-  num
-}
+# Inline helpers removed — rely on canonical implementations in `ppi_helpers.R` (legacy copies deleted).
 
 # Legacy normalize_no_soil_col removed — 'no soil' / 'no_soil' columns are not used in PPI plotting any more.
 
@@ -50,7 +15,7 @@ safe_as_numeric <- function(x) {
 if (file.exists("ppi_helpers.R")) {
   source("ppi_helpers.R")
 } else {
-  warning("ppi_helpers.R not found; using local inline PPI logic (ensure ppi_helpers.R in project root for consistent PPI calculation)")
+  stop("Required file 'ppi_helpers.R' not found — inline helper copies were removed; add ppi_helpers.R to project root.")
 }
 # Optional visualization helpers (provide shading for excluded years)
 if (file.exists("mesma_helpers.R")) {
@@ -146,7 +111,7 @@ if (file.exists(MAPPING_CSV)) {
       map_df$Veg <- as.character(map_df[[veg_cols[1]]])
       map_df$Veg <- tolower(trimws(as.character(map_df$Veg)))
       map_df$Veg <- ifelse(grepl("phragmites", map_df$Veg, ignore.case = TRUE) |
-                           map_df$Veg %in% c("herbs", "alhagi", "salicornia", "halocnemum"),
+                           map_df$Veg %in% c("herbs", "salicornia", "halocnemum"),
                            "herbs", map_df$Veg)
     }
 
@@ -233,7 +198,7 @@ cat("Aggregating data...\n")
 
 # Filter out rows with missing PPI or Veg
 # And filter for specific vegetation types: barren, herbs, populus, tamarix
-target_veg <- c("barren", "herbs", "populus", "tamarix", "woody_unknown")
+target_veg <- c("barren", "herbs", "populus", "tamarix")
 
 plot_data <- df |> 
   dplyr::filter(!is.na(PPI), !is.na(Veg)) |> 
@@ -262,24 +227,11 @@ p <- ggplot(ppi_summary, aes(x = date, y = mean_PPI, color = Veg, fill = Veg)) +
        subtitle = "Shaded area represents Standard Error",
        x = "Date",
        y = "PPI") +
-  theme_minimal() +
-  theme(legend.position = "bottom")
-
-# Save plot
-output_file <- file.path(OUTPUT_DIR, "PPI_timeseries_by_veg.png")
-ggsave(output_file, plot = p, width = 12, height = 8, bg = "white")
-
-cat("Plot saved to:", output_file, "\n")
-
+  theme_mesma() +
 # Also plot by DOY (Day of Year) to see seasonality
 p_doy <- ggplot(plot_data, aes(x = doy, y = PPI, color = Veg)) +
   geom_smooth(se = FALSE) + 
   labs(title = "Seasonal PPI Profile by Vegetation Type (Smoothed)",
        x = "Day of Year",
        y = "PPI") +
-  theme_minimal() +
-  facet_wrap(~year)
-
-output_file_doy <- file.path(OUTPUT_DIR, "PPI_seasonality_by_veg.png")
-ggsave(output_file_doy, plot = p_doy, width = 12, height = 8, bg = "white")
-cat("Seasonality plot saved to:", output_file_doy, "\n")
+  theme_mesma() +

@@ -80,23 +80,24 @@ MAX_VARIANTS_PER_VEG <- 7       # Max variants generated per vegetation type; in
 
 MIN_ENDMEMBER_SAMPLES <- 5L      # Minimum raw samples required to form an endmember variant. Raise to be stricter.
 
-ALLOWED_VEG <- c("populus", "tamarix", "herbs")
+ALLOWED_VEG <- c("populus", "tamarix", "herbs", "agriculture")
                                  # Restrict vegetation classes to these labels during training; edit to match your dataset.
 
 # Index defaults
 OPTIMAL_INDICES <- c(
-  "PSRI", "NDMI", "EVI",
-  "NDTI", "BSI", "TCW", "TCB",
+  "PSRI", "NDMI", "EVI","TCW",
+  "NDTI", "BSI", 
   # Complementary indices (measure different properties than the core set)
   "MSI",   # moisture stress (SWIR1/NIR)
   "SIPI"  # pigment ratio (structure-insensitive)
 )
                                  # Suggested default indices to include in fitting; add or remove indices depending on sensor and quality.
 
-# Outlier removal
-ENABLE_OUTLIER_REMOVAL <- TRUE   # Remove strong outliers prior to prototype building (recommended TRUE for noisy sensors).
-OUTLIER_MAD_THRESHOLD <- 3.5     # How aggressively to trim outliers (higher -> fewer removals). ~3-4 is typical.
-OUTLIER_SPLINE_MAX_DF <- 10L     # Max degrees-of-freedom for spline trend in outlier detection (caps wiggliness)
+# PPI normalization / canopy-maximum settings
+# PPI_FULL_VEG_COVER is the index value that corresponds to full vegetation cover.
+# Set to 0.7 and DO NOT compute dynamically for now (fixed canopy maximum used by add_ppi_columns()).
+PPI_FULL_VEG_COVER <- 0.7
+
 
 # Prototype plot options
 GENERATE_PROTO_PLOTS <- TRUE     # Turn on to save one plot per prototype (useful for inspection; can generate many files)
@@ -126,7 +127,7 @@ COMBO_ABORT_LIMIT <- 5e7          # Hard abort threshold: if combos exceed this,
 
 # Bootstrap / inference sizing
 BOOTSTRAP_B <- 200L              # Number of bootstrap iterations (location-level). Higher -> more stable CIs but slower. 100-500 typical.
-MAX_INFERENCE_LOCATIONS <- 2000L    # TEMP DEBUG: Reduce to e.g. 2 locations to reproduce/inspect issue quickly
+MAX_INFERENCE_LOCATIONS <- 2000L    # Restored to full inference scale
 
 # Spatial dependence handling in bootstrap
 # NOTE: The default location bootstrap resamples locations i.i.d., which can
@@ -142,14 +143,15 @@ BOOTSTRAP_BLOCK_MAX_MISSING_FRAC <- 0.20  # If > this fraction of locations lack
 
 # Uncertainty handling
 ENABLE_UNCERTAINTY <- TRUE       # Turn off to skip expensive uncertainty estimation (bootstrap, MC propagation) for faster runs.
-ENABLE_MULTI_YEAR_BOOTSTRAP <- FALSE # If TRUE, run per-location multi-year bootstrap; set FALSE to skip for speed/stability.
 DEBUG_UNCERTAINTY <- TRUE        # Verbose diagnostics for uncertainty steps; set FALSE for quiet production runs.
 
-# Classification uncertainty propagation (Dirichlet perturbation)
-ENABLE_CLASSIFICATION_UNCERTAINTY <- TRUE  # If TRUE, apply Dirichlet perturbation based on confusion matrix during bootstrap.
-DIRICHLET_CONCENTRATION_SCALE <- 10.0      # Multiplier for validation sample size to set Dirichlet concentration (alpha).
-                                           # Higher values = tighter concentration = less classification noise.
-                                           # Lower values = more spread = larger classification uncertainty.
+# Robust loss configuration
+HUBER_DELTA <- 1.0               # Huber transition point (|residual| <= delta uses L2; larger residuals use linear penalty).
+
+# Outlier removal
+ENABLE_OUTLIER_REMOVAL <- FALSE  # Enable/disable robust outlier removal in time-series data
+
+
 
 # MC propagation
 ENABLE_MONTE_CARLO <- TRUE       # Propagate observation noise into coefficient uncertainty via repeated unmixing draws. Disable to save time.
@@ -163,17 +165,31 @@ ENABLE_ENDMEMBER_BUNDLES <- TRUE # If TRUE, represent endmember variability as a
 # Uses the OOB validation residuals (predicted - true fractions) to add systematic prediction bias/error to MC draws
 ENABLE_OOB_FRACTION_UNCERTAINTY <- TRUE  # If TRUE, add OOB-derived fraction errors to MC draws
 
-# Huber loss for FCLS (robust to outliers)
-USE_HUBER_LOSS <- TRUE         # If TRUE, use Huber loss instead of RMSE in FCLS solver (more robust to outliers)
-HUBER_DELTA <- 1.345             # Huber delta parameter (threshold for switching from L2 to L1).
-                                 # 1.345 * sigma gives 95% efficiency for Gaussian data.
-                                 # Lower values = more robust but less efficient. Higher = closer to RMSE.
-HUBER_MAX_ITER <- 20             # Max iterations for IRLS (iteratively reweighted least squares)
-HUBER_TOL <- 1e-4                # Convergence tolerance for IRLS
+# IWLMM (Inequality-constrained Weighted Linear Mixture Model, Li et al. 2021)
+USE_IWLMM <- TRUE               # If TRUE, use IWLMM instead of standard FCLS. Allows endmember perturbations
+                                 # within bounded intervals derived from within-class variance, improving fit
+                                 # for pixels where fixed endmembers are suboptimal.
+IWLMM_BOUND_SIGMA <- 2.0        # Perturbation bound as multiple of within-class SD per feature per endmember.
+                                 # ±IWLMM_BOUND_SIGMA * sigma_j_k. Higher = more flexibility, risk of overfitting.
+                                 # Typical range: 1.0 - 3.0. Set to 2.0 for a moderate trade-off.
+IWLMM_MAX_ITER <- 15            # Max alternating iterations between solving fractions and perturbations.
+IWLMM_TOL <- 1e-4               # Convergence tolerance for alternating optimization (max change in fractions).
+IWLMM_REGULARIZE_DELTA <- 0.01  # L2 penalty on perturbation magnitude to prevent overfitting.
+                                 # J_total = J_fit + lambda_delta * ||ΔM||^2. Set to 0 to disable.
+
+# Sparse unmixing (L1-penalized solver)
+USE_SPARSE_UNMIXING <- TRUE         # If TRUE, use L1-penalized unmixing: min ||Ef-y||² + λ·||f||₁  s.t. f≥0, sum(f)≤1.
+                                    # Relaxes sum-to-one to sum-to-at-most-one; λ drives irrelevant endmembers to exactly 0.
+SPARSE_LAMBDA <- 0.01              # L1 penalty strength. Higher = more aggressive sparsity.
+                                    # Typical range: 0.001 (mild) - 0.1 (aggressive). Set to 0 for standard FCLS behavior.
 
 # Feature selection / pruning
 ENABLE_FEATURE_PRUNING <- TRUE  # Automatically drop highly correlated features before training?
 FEATURE_PRUNING_THRESHOLD <- 0.95 # Correlation threshold above which a feature is considered redundant and dropped.
+
+# PCA->LDA PC pruning: enable automatic removal of weak PCs by default.
+# Set to FALSE to disable PC pruning even when LDA_PC_CUM_CONTRIB < 1.0
+ENABLE_LDA_PC_PRUNING <- TRUE
 
 
 
@@ -181,6 +197,12 @@ FEATURE_PRUNING_THRESHOLD <- 0.95 # Correlation threshold above which a feature 
 MIN_OBS_PER_LOC_YEAR <- 3L      # Minimum rows required per location-year for processing. Increase to be stricter on noisy cases.
 MIN_UNIQUE_DOY_DEFAULT <- 5L    # Minimum unique DOYs per loc-year during training to consider time-series adequate.
 MIN_UNIQUE_DOY_INFERENCE <- 3L  # Less strict for inference to allow sparse inputs.
+# Minimum number of non-empty temporal pentads required for a training trace to be
+# considered for endmember construction. This prefilters very sparse training
+# samples before they enter the prototype/variant pipeline.
+# Relaxed from 30 -> 10 to allow OOB holdout traces with sparser coverage to
+# participate in cluster/OOB evaluation during library optimization.
+MIN_PENTADS_PER_TRAIN_SAMPLE <- 10L
 
 # Modeling/algorithmic caps and defaults
 ENABLE_LDA_L2_NORMALIZATION <- TRUE # L2-normalize training samples to focus on temporal shape rather than amplitude.
@@ -216,6 +238,8 @@ TEMPORAL_BUDGET <- ceiling(365 / TEMPORAL_AGGREGATION_DAYS)  # Number of tempora
 MIN_CLUSTER_SIZE <- 4L           # Minimum cluster size to accept a variant prototype
 INTERPOLATE_INFERENCE <- TRUE   # If TRUE, linearly interpolate missing pentads for inference/validation (default: FALSE — preserves validation integrity)
 PCA_VARIANCE_THRESHOLD <- 0.95    # PCA energy to retain when reducing endmember dimensionality prior to clustering
+# Fraction of LDA discriminative strength to retain when pruning PCA components (0.95 = 95%)
+LDA_PC_CUM_CONTRIB <- 0.95
 
 # Whether to prune features with zero LDA weight from optimized libraries
 # Disabled for now - diagnostics only, no actual pruning applied
@@ -229,14 +253,14 @@ PRUNE_ZERO_MIN_FEATURES <- 3
 # Measures feature contribution by randomizing each feature and testing performance degradation.
 # Features whose permutation doesn't significantly degrade performance are pruned.
 OOB_TUNING_FRACTION <- 0.15         # Fraction held out from training data for cluster optimization evaluation
-VALIDATION_FRACTION <- 0.20         # Fraction held out for validation (stratified by location/Veg)
+VALIDATION_FRACTION <- 0.30         # Fraction held out for validation (stratified by location/Veg)
 PERMUTATION_N_ITER <- 400            # Number of permutations per feature for significance testing
 PERMUTATION_MIN_SAMPLES <- 20       # Minimum OOB samples required for testing
 
 # Endmember selection tuning
-MAX_K_EAR <- 7L                  # Maximum number of endmembers to consider per vegetation class in EAR selection (conservative increase to explore one more k).
+MAX_K_EAR <- 6L                  # Maximum number of endmembers to consider per vegetation class in EAR selection (increased to allow up to 8 clusters per class).
 CLUSTER_COMPLEXITY_LAMBDA <- 0.005  # Complexity penalty per total endmember: S = min(R_oob, R_train) - λ * sum(k)
-BARREN_SIM_THRESHOLD <- 0.75     # Pre-filter: drop vegetation training observations whose cosine similarity to barren mean exceeds this threshold
+BARREN_SIM_THRESHOLD <- 0.8     # Pre-filter: drop vegetation training observations whose cosine similarity to barren mean exceeds this threshold
 
 
 # === END GLOBAL CONFIG ===
