@@ -107,8 +107,74 @@ if (file.exists("mesma_config.R")) {
   stop("Required file 'mesma_config.R' not found in project root.")
 }
 
-# Override: inference CSV for this script (differs from mesma_config.R default)
-INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_mid (2).csv"
+# Optional per-run overrides (used by batch wrappers)
+env_inference_csv <- Sys.getenv("MESMA_INFERENCE_CSV", unset = "")
+if (nzchar(env_inference_csv)) {
+  INFERENCE_CSV <- env_inference_csv
+  cat(sprintf("[CONFIG] Override INFERENCE_CSV from environment: %s\n", INFERENCE_CSV))
+}
+
+
+env_out_dir <- Sys.getenv("MESMA_OUT_DIR", unset = "")
+if (nzchar(env_out_dir)) {
+  OUT_DIR <- env_out_dir
+  cat(sprintf("[CONFIG] Override OUT_DIR from environment: %s\n", OUT_DIR))
+}
+
+# -----------------------------------------------------------------------------
+# Batch-run helper: if the provided inference path refers to a directory,
+# wildcard list, or multiple files, execute the script once per CSV file.
+# This makes "batch mode" the default behaviour when more than one input is
+# available; the wrapper (run_mesma.bat) also uses the same mechanism but
+# having it in the R script ensures downstream calls (e.g. from Rstudio or
+# other schedulers) behave the same way.
+#
+# The logic below prevents infinite recursion by setting an environment flag
+# once the batch splitting has been performed.
+# -----------------------------------------------------------------------------
+
+get_inference_file_list <- function(path) {
+  # return a character vector of CSV paths; if `path` is empty, return zero-length
+  if (nzchar(path)) {
+    if (dir.exists(path)) {
+      return(list.files(path, pattern = "\\.csv$", full.names = TRUE))
+    }
+    if (grepl(",", path)) {
+      return(strsplit(path, ",")[[1]])
+    }
+    if (file.exists(path)) {
+      return(path)
+    }
+  }
+  # no explicit input provided -> don't assume anything
+  character(0)
+}
+
+if (Sys.getenv("MESMA_BATCH_STARTED", unset = "") == "") {
+  # allow an alternate variable pointing directly to a directory
+  env_inference_dir <- Sys.getenv("MESMA_INFERENCE_DIR", unset = "")
+  candidate_files <- character(0)
+  if (nzchar(env_inference_dir) && dir.exists(env_inference_dir)) {
+    candidate_files <- list.files(env_inference_dir, pattern = "\\.csv$", full.names = TRUE)
+    cat(sprintf("[BATCH] MESMA_INFERENCE_DIR provided; scanning %s and found %d file(s)\n", env_inference_dir, length(candidate_files)))
+  } else {
+    candidate_files <- get_inference_file_list(env_inference_csv)
+  }
+  if (length(candidate_files) > 1) {
+    cat(sprintf("[BATCH] Detected %d inference files; spawning separate runs\n", length(candidate_files)))
+    for (f in candidate_files) {
+      cat(sprintf("[BATCH] -> %s\n", f))
+      # launch a new Rscript process for each file; pass along any overrides
+      Sys.setenv(MESMA_INFERENCE_CSV = f)
+      Sys.setenv(MESMA_BATCH_STARTED = "1")
+      cmd <- c(shQuote("fit_veg_mixture_mesma.R"))
+      status <- system2(Sys.which("Rscript"), args = cmd)
+      if (status != 0) stop(sprintf("Child run for '%s' failed (exit %d)", f, status))
+    }
+    cat("[BATCH] All child runs finished; exiting parent process.\n")
+    quit(save = "no")
+  }
+}
 
 if (file.exists("ppi_helpers.R")) {
   source("ppi_helpers.R")
@@ -180,6 +246,61 @@ aggregate_batch_results <- function(batch_results, results_list, save_csv_dir = 
     }
   }
   results_list
+}
+
+# --- Shared utility: save canonical inference fractions CSV for downstream scripts ---
+save_inference_results_csv <- function(inference_coefs, out_csv = "inference_results/inference_results.csv", source_csv = NA_character_) {
+  if (is.null(inference_coefs) || !is.data.frame(inference_coefs) || nrow(inference_coefs) == 0) {
+    cat("[INFERENCE] No inference coefficients available to write canonical CSV.\n")
+    return(invisible(FALSE))
+  }
+
+  source_base <- if (!is.na(source_csv) && nzchar(as.character(source_csv))) basename(as.character(source_csv)) else NA_character_
+  source_tag <- if (!is.na(source_base) && nzchar(source_base)) {
+    gsub("_+", "_", gsub("[^A-Za-z0-9]+", "_", tools::file_path_sans_ext(source_base)))
+  } else {
+    NA_character_
+  }
+
+  out_df <- inference_coefs
+  if (!("inference_source_csv" %in% names(out_df))) out_df$inference_source_csv <- source_base
+  if (!("inference_source_tag" %in% names(out_df))) out_df$inference_source_tag <- source_tag
+
+  # Keep stable column order for downstream readers while preserving any extra columns
+  preferred_cols <- c(
+    "location_id", "pheno_year", "lat", "lon", "Veg", "variant_id",
+    "coef", "rmse", "coef_025", "coef_975", "coef_sd", "interval",
+    "n_obs", "inseparable_variant_flag", "inseparable_variant_details",
+    "inference_source_csv", "inference_source_tag"
+  )
+  ordered_cols <- c(intersect(preferred_cols, names(out_df)), setdiff(names(out_df), preferred_cols))
+  out_df <- out_df[, ordered_cols, drop = FALSE]
+
+  # Deterministic row ordering: location -> year -> class
+  if (all(c("location_id", "pheno_year", "Veg") %in% names(out_df))) {
+    out_df <- out_df %>%
+      mutate(
+        location_id = as.character(location_id),
+        pheno_year = suppressWarnings(as.integer(pheno_year)),
+        Veg = as.character(Veg)
+      ) %>%
+      arrange(location_id, pheno_year, Veg)
+  }
+
+  out_dir <- dirname(out_csv)
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  readr::write_csv(out_df, out_csv, na = "NA")
+  cat(sprintf("[INFERENCE] Wrote canonical inference fractions CSV: %s (%d rows)\n", out_csv, nrow(out_df)))
+
+  # Also persist a source-specific copy so lower/middle/etc. remain separated across runs.
+  if (!is.na(source_tag) && nzchar(source_tag)) {
+    source_csv_out <- file.path(out_dir, sprintf("inference_results_%s.csv", source_tag))
+    readr::write_csv(out_df, source_csv_out, na = "NA")
+    cat(sprintf("[INFERENCE] Wrote source-specific inference CSV: %s\n", source_csv_out))
+  }
+
+  invisible(TRUE)
 }
 
 # --- Shared plot constants ---
@@ -888,7 +1009,17 @@ remove_large_outliers <- function(df, candidates = NULL, mad_thresh = OUTLIER_MA
 df <- normalize_band_names(df)
 
 if (!"date" %in% names(df) && "prediction_date" %in% names(df)) df$date <- as.Date(df$prediction_date)
-if ("date" %in% names(df)) df$date <- as.Date(df$date)
+if ("date" %in% names(df)) {
+  df$date <- as.Date(df$date)
+  # --- FILTER OUT EARLY-MONTH OBSERVATIONS --------------------------------------------------
+  # remove all records from January through April as requested by user
+  if (nrow(df) > 0) {
+    before_n <- nrow(df)
+    df <- df[!(lubridate::month(df$date) %in% 1:4), , drop = FALSE]
+    removed_n <- before_n - nrow(df)
+    cat(sprintf("[DATE FILTER] Dropped %d rows with month Jan-Apr (remaining %d rows)\n", removed_n, nrow(df)))
+  }
+}
 
 # Compute NDDI and MSAVI from raw bands so early contamination filtering can proceed
 before_cols <- names(df)
@@ -1222,40 +1353,12 @@ if ("location_id" %in% names(df) && "location_id" %in% names(gpts_map)) {
 
 }
 
-# Helper to compute soil line slope from filtered bare-soil pixels
-compute_soil_line_slope <- function(input_df, min_samples = MIN_ENDMEMBER_SAMPLES, assign_global_dvi = TRUE) {
-  if (is.null(input_df) || nrow(input_df) == 0) stop("[SOIL LINE] No input data provided to compute_soil_line_slope")
-  if (!all(c('nir','red','Veg') %in% names(input_df))) {
-    stop("[SOIL LINE] Cannot compute soil line slope: required columns 'nir', 'red', and 'Veg' are missing")
-  }
-  bare_soil_df <- input_df[tolower(input_df$Veg) == 'barren' & is.finite(input_df$nir) & is.finite(input_df$red), , drop = FALSE]
-  if (nrow(bare_soil_df) > min_samples) {
-    soil_line_model <- tryCatch(lm(nir ~ red, data = bare_soil_df), error = function(e) e)
-    if (!inherits(soil_line_model, "error")) {
-      slope <- as.numeric(coef(soil_line_model)[2])
-      if (!is.finite(slope)) stop("[SOIL LINE] Estimated slope is non-finite")
-      assign("SOIL_LINE_SLOPE", slope, envir = globalenv())
-      cat(sprintf("[SOIL LINE] Calculated SOIL_LINE_SLOPE=%.4f from %d bare soil pixels\n", slope, nrow(bare_soil_df)))
-      # Also compute and store a training DVI soil baseline (mean DVI on bare soil) for PPI use
-      if (assign_global_dvi) {
-        dvi_soil_calc <- mean(bare_soil_df$nir - bare_soil_df$red, na.rm = TRUE)
-        if (is.finite(dvi_soil_calc)) {
-          cat(sprintf("[SOIL LINE] Computed training DVI soil baseline (local only): dvi_soil = %.6f\n", dvi_soil_calc))
-        }
-      }
-      return(invisible(slope))
-    }
-    else {
-      stop("[SOIL LINE] Linear fit failed; cannot estimate SOIL_LINE_SLOPE")
-    }
-  }
-  stop(sprintf("[SOIL LINE] Not enough bare soil pixels to estimate SOIL_LINE_SLOPE (need > %d, have %d)",
-               as.integer(min_samples), as.integer(nrow(bare_soil_df))))
-}
-
 # Dust contamination (NDDI > NDDI_DUST_THRESHOLD; default 0.18) already filtered in [EARLY FILTERING] above.
 # Proceed with outlier removal, soil line estimation, and index recomputation.
 df <- remove_large_outliers(df)
+if (!exists("compute_soil_line_slope", mode = "function")) {
+  stop("[SOIL LINE] Required helper 'compute_soil_line_slope' not available. Ensure mesma_helpers.R is loaded.")
+}
 compute_soil_line_slope(df)
 df <- compute_indices_from_bands(df)
 
@@ -1618,7 +1721,7 @@ train_feature_pipeline <- function(df, class_col, feature_cols) {
 
   cat("  Building trace matrix...\n")
   for(sub in traces) {
-    if(nrow(sub) < 5) next
+    if(nrow(sub) < MIN_PENTADS_PER_TRAIN_SAMPLE) next
     
     mat <- build_pentad_matrix(sub, feature_cols) # 37 x K
     if(is.null(mat)) next
@@ -2677,115 +2780,9 @@ location_bootstrap_msavi <- function(all_coefs, df_tasks, B = BOOTSTRAP_B, seed 
 location_bootstrap_noindex <- function(all_coefs, df_tasks = NULL, B = BOOTSTRAP_B, seed = 123)
   location_bootstrap_index(all_coefs, df_tasks, index_name = "NOINDEX", B = B, seed = seed, noindex = TRUE)
 
-# Precompute B Dirichlet draws for every location-year so that each bootstrap
-# replicate gets a fresh classification perturbation.
-# Returns list(draws = named list of [B x K] matrices, alpha_info = list of alpha metadata).
-precompute_dirichlet_draws <- function(all_coefs, B, conf_matrix, sample_sizes = NULL,
-                                       concentration_scale = DIRICHLET_CONCENTRATION_SCALE) {
-  loc_yr_keys <- unique(paste(all_coefs$location_id, all_coefs$pheno_year, sep = "___"))
-  row_names <- tolower(rownames(conf_matrix))
-  col_names <- colnames(conf_matrix)
-  K <- ncol(conf_matrix)
-
-  draws <- list()
-
-  for (key in loc_yr_keys) {
-    parts <- strsplit(key, "___")[[1]]
-    loc_id <- parts[1]
-    p_year <- as.numeric(parts[2])
-
-    mask <- all_coefs$location_id == loc_id & all_coefs$pheno_year == p_year
-    loc_yr_data <- all_coefs[mask, ]
-    if (nrow(loc_yr_data) == 0) next
-
-    # Build fraction vector
-    fracs <- setNames(pmax(as.numeric(loc_yr_data$coef), 0),
-                      tolower(as.character(loc_yr_data$Veg)))
-    fracs[!is.finite(fracs)] <- 0
-    frac_sum <- sum(fracs)
-    if (frac_sum <= 0) next
-    fracs <- fracs / frac_sum
-
-    # Map fraction names to confusion-matrix rows
-    mapped_row <- rep(NA_character_, length(fracs))
-    for (i in seq_along(fracs)) {
-      nm <- names(fracs)[i]
-      nm2 <- sub("^frac_", "", nm)
-      if (nm %in% row_names) mapped_row[i] <- nm
-      else if (nm2 %in% row_names) mapped_row[i] <- nm2
-    }
-
-    keep <- is.finite(fracs) & fracs > 0 & !is.na(mapped_row) & fracs >= 1e-6
-    if (!any(keep)) next
-
-    w <- fracs[keep]; w <- w / sum(w)
-    rows <- mapped_row[keep]
-    row_idx <- match(rows, row_names)
-
-    # Weighted mean confusion row
-    mu <- rep(0, K)
-    for (k in seq_along(row_idx)) {
-      mu <- mu + w[k] * as.numeric(conf_matrix[row_idx[k], ])
-    }
-    mu[!is.finite(mu)] <- 0
-    mu[mu < 1e-6] <- 1e-6
-    mu <- mu / sum(mu)
-
-    # Concentration from validation support
-    n_eff_val <- 20
-    if (!is.null(sample_sizes) && length(sample_sizes) > 0) {
-      ss_names <- tolower(names(sample_sizes))
-      ss <- as.numeric(sample_sizes)
-      ss[!is.finite(ss) | ss < 0] <- 0
-      ss_match <- ss[match(rows, ss_names)]
-      ss_match[is.na(ss_match)] <- 0
-      if (sum(ss_match) > 0) n_eff_val <- sum(w * ss_match)
-    }
-
-    alpha <- max(concentration_scale * n_eff_val, 5)
-    alpha_vec <- alpha * mu
-
-    # Vectorized B Dirichlet draws via rgamma
-    gamma_mat <- matrix(rgamma(B * K, shape = rep(alpha_vec, each = B), rate = 1),
-                        nrow = B, ncol = K)
-    row_sums <- rowSums(gamma_mat)
-    zero_rows <- row_sums < 1e-10
-    if (any(zero_rows)) {
-      gamma_mat[zero_rows, ] <- matrix(rep(mu, sum(zero_rows)),
-                                       nrow = sum(zero_rows), byrow = TRUE)
-      row_sums[zero_rows] <- 1
-    }
-    dirichlet_mat <- gamma_mat / row_sums
-    colnames(dirichlet_mat) <- tolower(col_names)
-
-    draws[[key]] <- dirichlet_mat
-  }
-
-  draws
-}
-
 # Location-based bootstrap for global aggregation
 location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123) {
   set.seed(seed)
-
-  # =========================================================================
-  # CLASSIFICATION UNCERTAINTY: Precompute B Dirichlet draws per location-year
-  # so each bootstrap replicate gets a fresh classification perturbation.
-  # =========================================================================
-  dirichlet_draws <- NULL
-  if (isTRUE(ENABLE_CLASSIFICATION_UNCERTAINTY) &&
-      exists(".CONFUSION_MATRIX", envir = globalenv())) {
-    conf_matrix <- get(".CONFUSION_MATRIX", envir = globalenv())
-    sample_sizes <- if (exists(".VALIDATION_SAMPLE_SIZES", envir = globalenv())) {
-      get(".VALIDATION_SAMPLE_SIZES", envir = globalenv())
-    } else NULL
-
-    message("[BOOTSTRAP] Classification uncertainty enabled; precomputing B Dirichlet draws per location-year.")
-    dirichlet_draws <- precompute_dirichlet_draws(all_coefs, B, conf_matrix, sample_sizes)
-    message(sprintf("[BOOTSTRAP] Precomputed Dirichlet draws for %d location-years", length(dirichlet_draws)))
-  } else if (isTRUE(ENABLE_CLASSIFICATION_UNCERTAINTY)) {
-    message("[BOOTSTRAP] Classification uncertainty enabled but no confusion matrix available; skipping.")
-  }
 
   veg_types <- unique(all_coefs$Veg[!is.na(all_coefs$Veg)])
   years <- sort(unique(all_coefs$pheno_year[!is.na(all_coefs$pheno_year)]))
@@ -2917,27 +2914,6 @@ location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123)
       n_eff_vec[i] <- n_eff_est
 
       if (n_obs > 0) {
-        # Build per-replicate Dirichlet-perturbed coefficients if available.
-        # perturbed_coef_mat is [B x n_obs]: each row b gives Dirichlet draw b
-        # for each location's coefficient of this veg type.
-        perturbed_coef_mat <- NULL
-        if (!is.null(dirichlet_draws) && n_obs > 0) {
-          loc_keys <- paste(yr_data$location_id, yr_data$pheno_year, sep = "___")
-          veg_lower <- tolower(as.character(veg))
-          perturbed_coef_mat <- matrix(NA_real_, nrow = B, ncol = n_obs)
-          for (j in seq_len(n_obs)) {
-            draw_mat <- dirichlet_draws[[loc_keys[j]]]
-            if (!is.null(draw_mat)) {
-              col_idx <- match(veg_lower, colnames(draw_mat))
-              if (!is.na(col_idx)) {
-                perturbed_coef_mat[, j] <- draw_mat[, col_idx]
-                next
-              }
-            }
-            perturbed_coef_mat[, j] <- yr_data$coef[j]
-          }
-        }
-
         # DECISION: Small Sample Size vs Large Sample Size
         if (n_obs < 15) {
              # --- SMALL SAMPLE: USE POOLED VARIANCE ---
@@ -2952,28 +2928,13 @@ location_bootstrap_aggregate <- function(all_coefs, B = BOOTSTRAP_B, seed = 123)
                se_mean <- pooled_sd / sqrt(n_eff_i)
              }
 
-             if (!is.null(perturbed_coef_mat)) {
-               # Each replicate gets a Dirichlet-perturbed mean + parametric noise
-               for (b in 1:B) {
-                 perturbed_mu <- mean(perturbed_coef_mat[b, ], na.rm = TRUE)
-                 boot_means[b, i] <- rnorm(1, mean = perturbed_mu, sd = se_mean)
-               }
-             } else {
-               boot_means[, i] <- rnorm(B, mean = mu, sd = se_mean)
-             }
+             boot_means[, i] <- rnorm(B, mean = mu, sd = se_mean)
 
         } else {
              # --- SUFFICIENT SAMPLE: USE RESAMPLING ---
-             if (!is.null(perturbed_coef_mat)) {
-               for (b in 1:B) {
-                 idx <- sample(seq_len(n_obs), n_obs, replace = TRUE)
-                 boot_means[b, i] <- mean(perturbed_coef_mat[b, idx], na.rm = TRUE)
-               }
-             } else {
-               for (b in 1:B) {
-                 boot_sample <- sample(yr_data$coef, n_obs, replace = TRUE)
-                 boot_means[b, i] <- mean(boot_sample, na.rm = TRUE)
-               }
+             for (b in 1:B) {
+               boot_sample <- sample(yr_data$coef, n_obs, replace = TRUE)
+               boot_means[b, i] <- mean(boot_sample, na.rm = TRUE)
              }
         }
       }
@@ -3091,10 +3052,11 @@ load_and_prepare_inference_data <- function() {
           cat(sprintf("[NOTICE] Reconstructed location_id from lat/lon: %d unique locations\n",
                       length(unique(df_inf$location_id[!is.na(df_inf$location_id)]))))
 
-          # Apply MAX_INFERENCE_LOCATIONS limit immediately after loading
+          # Apply MAX_INFERENCE_LOCATIONS limit once per inference CSV file
           if (exists("MAX_INFERENCE_LOCATIONS") && is.numeric(MAX_INFERENCE_LOCATIONS)) {
             unique_locations <- unique(df_inf$location_id[!is.na(df_inf$location_id)])
             n_unique <- length(unique_locations)
+            inf_file_label <- if (exists("INFERENCE_CSV") && nzchar(as.character(INFERENCE_CSV))) basename(as.character(INFERENCE_CSV)) else "<unknown file>"
 
             if (n_unique > MAX_INFERENCE_LOCATIONS) {
               set.seed(get_mesma_seed(123))  # Deterministic sampling for reproducibility
@@ -3103,13 +3065,13 @@ load_and_prepare_inference_data <- function() {
               # Filter the dataframe to only include sampled locations
               df_inf <- df_inf[df_inf$location_id %in% sampled_locations, ]
 
-              cat(sprintf("[INFERENCE LOADING] Reduced from %d to %d locations (MAX_INFERENCE_LOCATIONS=%d)\n",
-                          n_unique, MAX_INFERENCE_LOCATIONS, MAX_INFERENCE_LOCATIONS))
+              cat(sprintf("[INFERENCE LOADING] %s: reduced from %d to %d locations (MAX_INFERENCE_LOCATIONS=%d per inference file)\n",
+                          inf_file_label, n_unique, MAX_INFERENCE_LOCATIONS, MAX_INFERENCE_LOCATIONS))
               cat(sprintf("[INFERENCE LOADING] Filtered dataset: %d rows from %d locations\n",
                           nrow(df_inf), length(unique(df_inf$location_id[!is.na(df_inf$location_id)]))))
             } else {
-              cat(sprintf("[INFERENCE LOADING] Using all %d locations (MAX_INFERENCE_LOCATIONS=%d)\n",
-                          n_unique, MAX_INFERENCE_LOCATIONS))
+              cat(sprintf("[INFERENCE LOADING] %s: using all %d locations (<= MAX_INFERENCE_LOCATIONS=%d per inference file)\n",
+                          inf_file_label, n_unique, MAX_INFERENCE_LOCATIONS))
             }
           }
 
@@ -3176,7 +3138,7 @@ load_and_prepare_inference_data <- function() {
       if (!"pheno_year" %in% names(df_inf)) df_inf$pheno_year <- assign_pheno_year(df_inf$date)
       if (!"doy" %in% names(df_inf)) df_inf$doy <- pheno_doy(df_inf$date)
       if (!"zenith.angle" %in% names(df_inf)) df_inf$zenith.angle <- NA_real_
-      if (!"DVI_max" %in% names(df_inf)) df_inf$DVI_max <- NA_real_
+      df_inf$DVI_max <- 0.7
 
       # IMPORTANT: Use ALL years for inference - inference should cover the full temporal range
       if (exists("TRAIN_YEARS") && !is.null(TRAIN_YEARS)) {
@@ -5366,6 +5328,43 @@ print_weights_summary <- function(stage_name, params) {
       cat(sprintf("\n[CONFUSION MATRIX] %s Avg Row-Normalized Veg Fraction (diagonal): %.1f%%\n", label, 100 * avg_cor_pred_veg_frac))
       cat(sprintf("[CONFUSION MATRIX] %s Veg Classification Accuracy: %.1f%% (%d/%d correct)\n",
                   label, 100 * veg_class_accuracy, correct_veg, total_veg))
+
+      # --- Save numeric matrices and make PNG visualizations if OUTPUT_DIR exists or can be created ---
+      if (exists("OUTPUT_DIR") && !is.null(OUTPUT_DIR)) {
+        if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
+        lab_clean <- tolower(gsub("[^A-Za-z0-9]+", "_", label))
+        all_csv <- file.path(OUTPUT_DIR, sprintf("%s_confusion_matrix_all.csv", lab_clean))
+        write.csv(avg_pred_frac, file = all_csv, row.names = TRUE)
+        cat(sprintf("[SAVE] Wrote %s\n", all_csv))
+        if (length(veg_rows) > 0 && length(veg_cols) > 0) {
+          veg_csv <- file.path(OUTPUT_DIR, sprintf("%s_confusion_matrix_veg.csv", lab_clean))
+          write.csv(veg_matrix, file = veg_csv, row.names = TRUE)
+          cat(sprintf("[SAVE] Wrote %s\n", veg_csv))
+        }
+
+        if (requireNamespace("ggplot2", quietly = TRUE)) {
+          plot_mat <- function(mat, title_text, fname) {
+            df_plot <- as.data.frame(as.table(mat))
+            names(df_plot) <- c("True", "Predicted", "Frac")
+            p <- ggplot2::ggplot(df_plot, ggplot2::aes(x = Predicted, y = True, fill = Frac)) +
+                 ggplot2::geom_tile() +
+                 ggplot2::geom_text(ggplot2::aes(label = round(Frac,3)), color = "black", size = 3) +
+                 ggplot2::scale_fill_gradient(low = "white", high = "steelblue") +
+                 ggplot2::theme_minimal() +
+                 ggplot2::labs(title = title_text, x = "Predicted", y = "True")
+            ggplot2::ggsave(fname, plot = p, width = 6, height = 5, dpi = 150)
+            cat(sprintf("[SAVE] Wrote confusion matrix plot to %s\n", fname))
+          }
+          png_all <- file.path(OUTPUT_DIR, sprintf("%s_confusion_matrix_all.png", lab_clean))
+          plot_mat(avg_pred_frac, sprintf("%s Confusion Matrix (all classes)", label), png_all)
+          if (length(veg_rows) > 0 && length(veg_cols) > 0) {
+            png_veg <- file.path(OUTPUT_DIR, sprintf("%s_confusion_matrix_veg.png", lab_clean))
+            plot_mat(veg_matrix, sprintf("%s Confusion Matrix (vegetation only)", label), png_veg)
+          }
+        } else {
+          cat("[WARN] ggplot2 not available; skipping confusion matrix plots\n")
+        }
+      }
     }, error = function(e) {
       cat(sprintf("[CONFUSION MATRIX] Error computing %s confusion matrix: %s\n", label, e$message))
     })
@@ -5464,305 +5463,6 @@ sample_oob_residual <- function(dominant_class) {
   names(residual) <- colnames(resid_mat)
 
   return(residual)
-}
-
-# ============================================================================
-# CLASSIFICATION UNCERTAINTY: DIRICHLET PERTURBATION
-# Propagates classification/misclassification uncertainty through bootstrap by
-# resampling fractional covers from a Dirichlet distribution whose mean is
-# derived from the confusion matrix.
-#
-# IMPORTANT: This implementation is mixture-aware: it does NOT condition on a
-# single dominant/true class. Instead, it uses the current fraction vector as
-# weights over confusion-matrix rows.
-# ============================================================================
-
-# Global storage for confusion matrix and validation sample sizes
-.CONFUSION_MATRIX <- NULL
-.VALIDATION_SAMPLE_SIZES <- NULL
-
-# Store the confusion matrix for use in Dirichlet perturbation
-# Called after validation accuracy is computed
-store_confusion_matrix <- function(conf_matrix, sample_sizes = NULL) {
-  if (!is.matrix(conf_matrix) || nrow(conf_matrix) != ncol(conf_matrix)) {
-    stop("[DIRICHLET] Invalid confusion matrix - must be square matrix")
-  }
-
-  # Ensure row-normalized (each row sums to 1)
-  row_sums <- rowSums(conf_matrix, na.rm = TRUE)
-  conf_matrix_norm <- conf_matrix
-  for (i in seq_len(nrow(conf_matrix_norm))) {
-    if (row_sums[i] > 1e-9) {
-      conf_matrix_norm[i, ] <- conf_matrix_norm[i, ] / row_sums[i]
-    }
-  }
-
-  assign(".CONFUSION_MATRIX", conf_matrix_norm, envir = globalenv())
-
-  if (!is.null(sample_sizes)) {
-    assign(".VALIDATION_SAMPLE_SIZES", sample_sizes, envir = globalenv())
-  }
-
-  if (isTRUE(DEBUG_UNCERTAINTY)) {
-    cat(sprintf("[DIRICHLET] Stored %dx%d confusion matrix for classification uncertainty\n",
-                nrow(conf_matrix_norm), ncol(conf_matrix_norm)))
-    cat(sprintf("[DIRICHLET] Classes: %s\n", paste(rownames(conf_matrix_norm), collapse = ", ")))
-    if (!is.null(sample_sizes)) {
-      cat(sprintf("[DIRICHLET] Validation sample sizes: %s\n",
-                  paste(sprintf("%s=%d", names(sample_sizes), sample_sizes), collapse = ", ")))
-    }
-  }
-
-  return(invisible(TRUE))
-}
-
-# Apply Dirichlet perturbation to fractional covers based on true class
-# This simulates classification uncertainty by drawing from a Dirichlet
-# distribution centered on the confusion matrix row for the true class
-#
-# Parameters:
-#   fractions: Named numeric vector of fractional covers (must sum to ~1)
-#   true_class: The true vegetation class for this location
-#   conf_matrix: Row-normalized confusion matrix (optional, uses global if NULL)
-#   sample_sizes: Named vector of validation sample sizes per class (optional)
-#   concentration_scale: Multiplier for sample size to get Dirichlet alpha
-#
-# Returns:
-#   Perturbed fractional covers (same names, still sum to 1)
-#
-apply_dirichlet_perturbation <- function(fractions, true_class,
-                                          conf_matrix = NULL,
-                                          sample_sizes = NULL,
-                                          concentration_scale = DIRICHLET_CONCENTRATION_SCALE) {
-  # Use global confusion matrix if not provided
- if (is.null(conf_matrix)) {
-    if (exists(".CONFUSION_MATRIX", envir = globalenv())) {
-      conf_matrix <- get(".CONFUSION_MATRIX", envir = globalenv())
-    } else {
-      stop("[DIRICHLET] No confusion matrix available")
-    }
-  }
-
-  if (is.null(sample_sizes) && exists(".VALIDATION_SAMPLE_SIZES", envir = globalenv())) {
-    sample_sizes <- get(".VALIDATION_SAMPLE_SIZES", envir = globalenv())
-  }
-
-  # Validate inputs
-  if (is.null(conf_matrix) || !is.matrix(conf_matrix)) {
-    stop("[DIRICHLET] Invalid confusion matrix")
-  }
-
-  # Match true_class to confusion matrix row (case-insensitive)
-  row_names <- tolower(rownames(conf_matrix))
-  true_class_lower <- tolower(true_class)
-  row_idx <- which(row_names == true_class_lower)
-
-  if (length(row_idx) == 0) {
-    stop(sprintf("[DIRICHLET] True class '%s' not found in confusion matrix", as.character(true_class)))
-  }
-
-  # Get the confusion row for the true class (this is our Dirichlet mean)
-  mu <- as.numeric(conf_matrix[row_idx, ])
-  class_names <- colnames(conf_matrix)
-
-  # Ensure mu sums to 1 and has no zeros (add small epsilon for stability)
-  mu[mu < 1e-6] <- 1e-6
-  mu <- mu / sum(mu)
-
-  # Determine concentration parameter alpha
-  # Higher alpha = tighter concentration around mean = less noise
-  if (!is.null(sample_sizes) && true_class_lower %in% tolower(names(sample_sizes))) {
-    n_val <- sample_sizes[tolower(names(sample_sizes)) == true_class_lower]
-    alpha <- concentration_scale * n_val
-  } else {
-    # Default: assume moderate validation sample size
-    alpha <- concentration_scale * 20
-  }
-
-  # Ensure minimum alpha for numerical stability
-  alpha <- max(alpha, 5)
-
-  # Dirichlet parameter vector
-  alpha_vec <- alpha * mu
-
-  # Draw from Dirichlet distribution
-  # Using the gamma distribution method: X_i ~ Gamma(alpha_i, 1), then normalize
-  gamma_draws <- rgamma(length(alpha_vec), shape = alpha_vec, rate = 1)
-
-  # Handle edge case where all draws are zero
-  if (sum(gamma_draws) < 1e-10) {
-    gamma_draws <- mu  # Fall back to mean
-  }
-
-  perturbed <- gamma_draws / sum(gamma_draws)
-
-  # Map back to original fraction names
-  # The confusion matrix classes may not exactly match the fraction names
-  result <- fractions
-  frac_names_lower <- tolower(names(fractions))
-
-  for (i in seq_along(class_names)) {
-    class_lower <- tolower(class_names[i])
-    # Find matching fraction column (handle "frac_" prefix)
-    match_idx <- which(frac_names_lower == class_lower |
-                       frac_names_lower == paste0("frac_", class_lower))
-    if (length(match_idx) > 0) {
-      result[match_idx[1]] <- perturbed[i]
-    }
-  }
-
-  # Re-normalize to ensure sum = 1 (in case of partial matching)
-  if (sum(result) > 0) {
-    result <- result / sum(result)
-  }
-
-  return(result)
-}
-
-# Apply mixture-aware Dirichlet perturbation to fractional covers.
-#
-# Instead of conditioning on a single "true" class, this builds a Dirichlet mean
-# as a weighted mixture of confusion-matrix rows using the current fraction
-# vector as weights.
-apply_dirichlet_perturbation_mixture <- function(fractions,
-                                                 conf_matrix = NULL,
-                                                 sample_sizes = NULL,
-                                                 concentration_scale = DIRICHLET_CONCENTRATION_SCALE,
-                                                 min_weight = 1e-6) {
-  if (is.null(conf_matrix)) {
-    if (exists(".CONFUSION_MATRIX", envir = globalenv())) {
-      conf_matrix <- get(".CONFUSION_MATRIX", envir = globalenv())
-    } else {
-      stop("[DIRICHLET] No confusion matrix available")
-    }
-  }
-
-  if (is.null(sample_sizes) && exists(".VALIDATION_SAMPLE_SIZES", envir = globalenv())) {
-    sample_sizes <- get(".VALIDATION_SAMPLE_SIZES", envir = globalenv())
-  }
-
-  if (is.null(conf_matrix) || !is.matrix(conf_matrix) || nrow(conf_matrix) != ncol(conf_matrix)) {
-    stop("[DIRICHLET] Invalid confusion matrix")
-  }
-
-  if (is.null(fractions) || length(fractions) == 0) {
-    return(fractions)
-  }
-
-  fracs <- as.numeric(fractions)
-  names(fracs) <- names(fractions)
-  fracs[!is.finite(fracs)] <- 0
-  fracs[fracs < 0] <- 0
-
-  frac_sum <- sum(fracs)
-  if (!is.finite(frac_sum) || frac_sum <= 0) {
-    return(fractions)
-  }
-  fracs <- fracs / frac_sum
-
-  row_names <- tolower(rownames(conf_matrix))
-  col_names <- colnames(conf_matrix)
-  frac_names_lower <- tolower(names(fracs))
-
-  # Map fraction names to confusion-matrix rows (support 'frac_' prefix)
-  mapped_row <- rep(NA_character_, length(fracs))
-  for (i in seq_along(fracs)) {
-    nm <- frac_names_lower[i]
-    nm2 <- sub("^frac_", "", nm)
-    if (nm %in% row_names) {
-      mapped_row[i] <- nm
-    } else if (nm2 %in% row_names) {
-      mapped_row[i] <- nm2
-    }
-  }
-
-  keep <- is.finite(fracs) & fracs > 0 & !is.na(mapped_row) & (fracs >= min_weight)
-  if (!any(keep)) {
-    # No overlap with confusion matrix; leave unchanged
-    return(fracs)
-  }
-
-  w <- fracs[keep]
-  w <- w / sum(w)
-  rows <- mapped_row[keep]
-  row_idx <- match(rows, row_names)
-
-  # Weighted mean confusion row
-  mu <- rep(0, ncol(conf_matrix))
-  for (k in seq_along(row_idx)) {
-    mu <- mu + w[k] * as.numeric(conf_matrix[row_idx[k], ])
-  }
-
-  mu[!is.finite(mu)] <- 0
-  mu[mu < 1e-6] <- 1e-6
-  mu <- mu / sum(mu)
-
-  # Concentration based on validation support (fraction-weighted)
-  n_eff <- 20
-  if (!is.null(sample_sizes) && length(sample_sizes) > 0) {
-    ss_names <- tolower(names(sample_sizes))
-    ss <- as.numeric(sample_sizes)
-    ss[!is.finite(ss) | ss < 0] <- 0
-    ss_match <- ss[match(rows, ss_names)]
-    ss_match[is.na(ss_match)] <- 0
-    if (sum(ss_match) > 0) {
-      n_eff <- sum(w * ss_match)
-    }
-  }
-
-  alpha <- max(concentration_scale * n_eff, 5)
-  alpha_vec <- alpha * mu
-  gamma_draws <- rgamma(length(alpha_vec), shape = alpha_vec, rate = 1)
-  if (sum(gamma_draws) < 1e-10) {
-    gamma_draws <- mu
-  }
-  perturbed <- gamma_draws / sum(gamma_draws)
-
-  # Map back to original fraction names
-  result <- fracs
-  for (i in seq_along(col_names)) {
-    class_lower <- tolower(col_names[i])
-    match_idx <- which(frac_names_lower == class_lower |
-                         frac_names_lower == paste0("frac_", class_lower))
-    if (length(match_idx) > 0) {
-      result[match_idx[1]] <- perturbed[i]
-    }
-  }
-
-  if (sum(result) > 0) {
-    result <- result / sum(result)
-  }
-
-  return(result)
-}
-
-# Batch apply mixture-aware Dirichlet perturbation to a data frame of fractions.
-# Useful for resampling location-level results without requiring class labels.
-apply_dirichlet_perturbation_batch <- function(coef_df, frac_cols, true_class_col = NULL) {
-  if (!isTRUE(ENABLE_CLASSIFICATION_UNCERTAINTY)) {
-    return(coef_df)
-  }
-
-  # Check if confusion matrix is available
-  if (!exists(".CONFUSION_MATRIX", envir = globalenv())) {
-    stop("[DIRICHLET] No confusion matrix available")
-  }
-
-  result_df <- coef_df
-
-  for (i in seq_len(nrow(coef_df))) {
-    # Extract current fractions
-    fracs <- as.numeric(coef_df[i, frac_cols])
-    names(fracs) <- frac_cols
-
-    # Apply mixture-aware perturbation
-    perturbed <- apply_dirichlet_perturbation_mixture(fracs)
-
-    # Store back
-    result_df[i, frac_cols] <- perturbed
-  }
-
-  return(result_df)
 }
 
 # Simple i.i.d. residual bootstrap
@@ -7275,15 +6975,7 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
       dplyr::distinct(.data$location_id)
     inference_locations$location_id <- trimws(as.character(inference_locations$location_id))
     
-    # Apply MAX_INFERENCE_LOCATIONS limit if set
-    if (exists("MAX_INFERENCE_LOCATIONS") && nrow(inference_locations) > MAX_INFERENCE_LOCATIONS) {
-      set.seed(get_mesma_seed(123)) # deterministic sampling for reproducibility
-      sampled_loc_ids <- sample(inference_locations$location_id, MAX_INFERENCE_LOCATIONS, replace = FALSE)
-      inference_locations <- inference_locations[inference_locations$location_id %in% sampled_loc_ids, , drop = FALSE]
-      df_tasks_inference_proc <- df_tasks_inference_proc[df_tasks_inference_proc$location_id %in% sampled_loc_ids, ]
-      cat(sprintf("[INFERENCE] Reduced to %d locations (random sample due to MAX_INFERENCE_LOCATIONS=%d)\n",
-                  nrow(inference_locations), MAX_INFERENCE_LOCATIONS))
-    }
+    # Do not re-sample here: MAX_INFERENCE_LOCATIONS is already applied once per inference file during loading.
 
     # Build inference_loc_years with defensive checks
     required_cols <- c("location_id", "pheno_year")
@@ -7440,6 +7132,17 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
     cat(sprintf("[INFERENCE] Processed %d inference coefficient rows\n",
                 if(!is.null(inference_coefs)) nrow(inference_coefs) else 0))
 
+    # Always export canonical long-format inference fractions for downstream scripts
+    tryCatch({
+      save_inference_results_csv(
+        inference_coefs,
+        out_csv = "inference_results/inference_results.csv",
+        source_csv = if (exists("INFERENCE_CSV")) INFERENCE_CSV else NA_character_
+      )
+    }, error = function(e) {
+      cat(sprintf("[INFERENCE] Failed to write canonical inference CSV: %s\n", e$message))
+    })
+
     # --- INFERENCE: PPI-based barren estimation (always enabled) ---
     if (!is.null(inference_coefs) && nrow(inference_coefs) > 0 && exists("df_tasks_inference_proc") && ("PPI" %in% names(df_tasks_inference_proc) || "PPI_raw" %in% names(df_tasks_inference_proc))) {
       cat("[INFERENCE] Running PPI-based barren estimation (inference mode)\n")
@@ -7486,7 +7189,7 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
       cat("[INFERENCE] NDVI data not available for inference; skipping NDVI aggregation.\n")
     }
 
-    # --- INFERENCE: Aggregate bootstrap (with Dirichlet perturbation) ---
+    # --- INFERENCE: Aggregate bootstrap ---
     if (!is.null(inference_coefs) && nrow(inference_coefs) > 0) {
       cat("[INFERENCE] Running aggregate bootstrap\n")
       aggregate_inf_full <- tryCatch({
@@ -7814,14 +7517,6 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
                         all_classes[i], diag_vals[i], diag_vals[i] * 100))
           }
 
-          # Store confusion matrix for Dirichlet perturbation in bootstrap
-          # Compute validation sample sizes per class
-          val_sample_sizes <- table(val_coefs_veg$true_veg)
-          val_sample_sizes <- setNames(as.numeric(val_sample_sizes), names(val_sample_sizes))
-
-          store_confusion_matrix(mat_rownorm, sample_sizes = val_sample_sizes)
-          cat(sprintf("\n[DIRICHLET] Confusion matrix stored for classification uncertainty propagation\n"))
-
           # Store OOB fraction residuals for MC uncertainty propagation
           # Residual = predicted_fraction - true_fraction (where true is 1 for own class, 0 for others)
           if (isTRUE(ENABLE_OOB_FRACTION_UNCERTAINTY)) {
@@ -7982,7 +7677,7 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
     cat("[WARNING] No validation coefficients available for accuracy computation\n")
   }
 
-  # --- VALIDATION: Aggregate bootstrap (with Dirichlet perturbation) ---
+  # --- VALIDATION: Aggregate bootstrap ---
   if (exists("validation_coefs") && !is.null(validation_coefs) && nrow(validation_coefs) > 0) {
     cat("[VALIDATION] Running aggregate bootstrap\n")
     aggregate_val_full <- tryCatch({

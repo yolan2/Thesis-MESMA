@@ -179,10 +179,9 @@ if (!"DVI" %in% names(df) && all(c("nir", "red") %in% names(df))) {
   cat("Calculated DVI from nir and red bands\n")
 }
 
-# Calculate DVI_max per location
-  if ("DVI" %in% names(df)) {
-  df <- df |> dplyr::group_by(location_id) |> dplyr::mutate(DVI_max = max(DVI, na.rm = TRUE)) |> dplyr::ungroup()
-  df$DVI_max[!is.finite(df$DVI_max)] <- NA_real_
+# Use fixed DVI max for all locations
+if ("DVI" %in% names(df)) {
+  df$DVI_max <- 0.7
 }
 
 # Zenith Angle
@@ -217,13 +216,8 @@ if ("DVI" %in% names(df) && "zenith.angle" %in% names(df) && "DVI_max" %in% name
     complete_idx <- complete.cases(df$DVI, df$zenith.angle, df$DVI_max)
     if (any(complete_idx)) {
         dsoil <- if (exists("PPI_DVI_SOIL", envir = .GlobalEnv)) get("PPI_DVI_SOIL", envir = .GlobalEnv) else 0.09
-        # Use fixed M=0.7 per standardized PPI implementation
-        M_val <- suppressWarnings(max(df$DVI[complete_idx], na.rm = TRUE))
-        if (is.finite(M_val)) {
-          df$PPI[complete_idx] <- ppi(df$DVI[complete_idx], df$zenith.angle[complete_idx], M = M_val, dvi.soil = dsoil)
-        } else {
-          df$PPI[complete_idx] <- NA_real_
-        }
+        M_val <- 0.7
+        df$PPI[complete_idx] <- ppi(df$DVI[complete_idx], df$zenith.angle[complete_idx], M = M_val, dvi.soil = dsoil)
     }
 }
 

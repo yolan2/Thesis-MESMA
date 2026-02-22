@@ -43,6 +43,7 @@ calculate_solar_zenith <- function(lat, doy, hour = 10.5) {
 # Default DVI soil baseline to use when no barren-derived baseline or explicit
 # parameter is provided. This value is a stable choice used in several experiments.
 DEFAULT_DVI_SOIL <- 0.0308
+PPI_DVI_MAX_DEFAULT <- 0.7
 
 ppi <- function(dvi, zenith.angle, M, dvi.soil, G = 0.5){
   # Strict parameter requirements: M and dvi.soil must be provided and finite.
@@ -114,7 +115,7 @@ add_ppi_columns <- function(df, dvi_soil = NULL) {
     stop(sprintf("[PPI ERROR] dvi_soil baseline not established for %d rows; provide explicit dvi_soil for these rows.\n", sum(need_idx)))
   }
 
-  # Note: Global PPI M computation has been removed. Per-location or per-call M is used instead; fallback M=0.7 will be applied only when necessary.
+  # Use a fixed DVI max default for all rows/locations.
 
 
   # Latitude Handling for SZA
@@ -146,40 +147,11 @@ add_ppi_columns <- function(df, dvi_soil = NULL) {
 
   # Only run if we have data
   if (any(calc_idx)) {
-    # Prefer per-location M: if location_id present, compute M as max DVI per location and call ppi per-location
-    if ("location_id" %in% names(df)) {
-      locs <- unique(df$location_id[calc_idx])
-      for (loc in locs) {
-        idx_loc <- calc_idx & df$location_id == loc
-        if (!any(idx_loc)) next
-        dvi_loc <- df$DVI[idx_loc]
-        zen_loc <- df$zenith.angle[idx_loc]
-        dsoil_loc <- df$dvi_soil[idx_loc]
-        # pick a single dvi_soil per location (use first finite)
-        dsoil_val <- dsoil_loc[is.finite(dsoil_loc)][1]
-        if (!is.finite(dsoil_val)) next
-        if (!any(is.finite(dvi_loc) & is.finite(zen_loc))) next
-        M_loc <- suppressWarnings(max(dvi_loc, na.rm = TRUE))
-        if (!is.finite(M_loc) || M_loc <= dsoil_val) {
-          # Fall back to just above the local soil baseline to avoid invalid denom
-          M_loc <- dsoil_val + 1e-3
-        } else {
-          # use M_loc (max DVI) silently
-        }
-        df$PPI[idx_loc] <- ppi(dvi_loc, zen_loc, M = M_loc, dvi.soil = dsoil_val)
-      }
-    } else {
-      # No location info: compute a single M from the available rows (no fallback constants)
-      M_global <- suppressWarnings(max(df$DVI[calc_idx], na.rm = TRUE))
-      if (!is.finite(M_global)) stop("[PPI ERROR] Cannot compute M (non-finite) for dataset without location_id.")
-      # Ensure M is above the soil baseline
-      min_dsoil <- suppressWarnings(min(df$dvi_soil[calc_idx], na.rm = TRUE))
-      if (is.finite(min_dsoil) && M_global <= min_dsoil) {
-        stop("[PPI ERROR] Computed M is not greater than dvi_soil baseline; cannot compute PPI.")
-      }
-      df$PPI[calc_idx] <- ppi(df$DVI[calc_idx], df$zenith.angle[calc_idx], M = M_global, dvi.soil = df$dvi_soil[calc_idx])
+    M_val <- PPI_DVI_MAX_DEFAULT
+    valid_m <- calc_idx & is.finite(df$dvi_soil) & (M_val > df$dvi_soil)
+    if (any(valid_m)) {
+      df$PPI[valid_m] <- ppi(df$DVI[valid_m], df$zenith.angle[valid_m], M = M_val, dvi.soil = df$dvi_soil[valid_m])
     }
-
   }
 
   df$lat_use <- NULL

@@ -1,4 +1,54 @@
 
+compute_soil_line_slope <- function(input_df, min_samples = NULL, assign_global_dvi = TRUE) {
+  if (is.null(min_samples)) {
+    if (exists("MIN_ENDMEMBER_SAMPLES", inherits = TRUE)) {
+      min_samples <- get("MIN_ENDMEMBER_SAMPLES", inherits = TRUE)
+    } else {
+      min_samples <- 5L
+    }
+  }
+
+  if (is.null(input_df) || nrow(input_df) == 0) {
+    stop("[SOIL LINE] No input data provided to compute_soil_line_slope")
+  }
+  if (!all(c("nir", "red", "Veg") %in% names(input_df))) {
+    stop("[SOIL LINE] Cannot compute soil line slope: required columns 'nir', 'red', and 'Veg' are missing")
+  }
+
+  veg_norm <- tolower(trimws(as.character(input_df$Veg)))
+  bare_soil_df <- input_df[veg_norm == "barren" & is.finite(input_df$nir) & is.finite(input_df$red), , drop = FALSE]
+
+  if (nrow(bare_soil_df) <= as.integer(min_samples)) {
+    stop(sprintf(
+      "[SOIL LINE] Not enough bare soil pixels to estimate SOIL_LINE_SLOPE (need > %d, have %d)",
+      as.integer(min_samples),
+      as.integer(nrow(bare_soil_df))
+    ))
+  }
+
+  soil_line_model <- tryCatch(lm(nir ~ red, data = bare_soil_df), error = function(e) e)
+  if (inherits(soil_line_model, "error")) {
+    stop("[SOIL LINE] Linear fit failed; cannot estimate SOIL_LINE_SLOPE")
+  }
+
+  slope <- as.numeric(coef(soil_line_model)[2])
+  if (!is.finite(slope)) {
+    stop("[SOIL LINE] Estimated slope is non-finite")
+  }
+
+  assign("SOIL_LINE_SLOPE", slope, envir = globalenv())
+  cat(sprintf("[SOIL LINE] Calculated SOIL_LINE_SLOPE=%.4f from %d bare soil pixels\n", slope, nrow(bare_soil_df)))
+
+  if (isTRUE(assign_global_dvi)) {
+    dvi_soil_calc <- mean(bare_soil_df$nir - bare_soil_df$red, na.rm = TRUE)
+    if (is.finite(dvi_soil_calc)) {
+      cat(sprintf("[SOIL LINE] Computed training DVI soil baseline (local only): dvi_soil = %.6f\n", dvi_soil_calc))
+    }
+  }
+
+  invisible(slope)
+}
+
 analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor, grid_type = "full") {
   cat("\n=== INTER-CLASS VARIANT SIMILARITY ANALYSIS ===\n")
 

@@ -178,7 +178,7 @@ train_feature_pipeline <- function(df, class_col, feature_cols, use_lda = TRUE) 
   traces <- unlist(traces_by_class, recursive = FALSE)
   cat("  Building trace matrix...\n")
   for(sub in traces) {
-    if(nrow(sub) < 5) next
+    if(nrow(sub) < MIN_PENTADS_PER_TRAIN_SAMPLE) next
     mat <- build_pentad_matrix(sub, feature_cols)
     if(is.null(mat)) next
     vec <- as.numeric(mat); vec[!is.finite(vec)] <- NA

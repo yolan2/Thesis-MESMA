@@ -23,6 +23,14 @@ if (!exists("write_debug", mode = "function")) {
   }
 }
 
+# === output directory setup ===
+# many later operations write files; define a sensible default up front so callers
+# can override by setting the variable before sourcing this script.
+if (!exists("output_dir")) {
+  output_dir <- "C:/MAP/january_averages_results"
+}
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
 # Raw spectral bands (optional - included if present)
 RAW_BANDS <- c("blue", "green", "red", "nir", "swir1", "swir2")
 # Indices we consider for FVC calibration & diagnostics
@@ -200,7 +208,11 @@ cat("Loading real phenology data to extract true endmembers...\n")
 # Try to load from common data file locations
 data_file <- NULL
 possible_paths <- c(
-  "C:\\Users\\yolan\\Downloads\\LS_S2_Harmonized_Timeseries.csv"
+  "C:\\Users\\yolan\\Downloads\\LS_S2_Harmonized_Timeseries.csv",
+  # some users (including Yolan) keep a labelled training split which also works
+  # for endmember extraction; include it as an alternative fallback
+  "C:\\Users\\yolan\\Downloads\\Landsat_Harmonized_Bands_1985_2025_train (2).csv",
+  "C:\\Users\\yolan\\Downloads\\Landsat_Harmonized_Bands_1985_2025_train.csv"
 )
 
 for (path in possible_paths) {
@@ -226,6 +238,31 @@ if ("vegetation" %in% names(df_raw) && !"Veg" %in% names(df_raw)) {
 }
 # If Veg already present, be explicit about skipping GeoJSON join
 if ("Veg" %in% names(df_raw)) {
+  df_raw$Veg <- tolower(trimws(as.character(df_raw$Veg)))
+  df_raw$Veg[df_raw$Veg %in% c("", "na", "null")] <- NA_character_
+  n_non_missing_veg <- sum(!is.na(df_raw$Veg))
+  n_barren_veg <- sum(df_raw$Veg == "barren", na.rm = TRUE)
+  cat(sprintf("[VEG DIAG] Non-missing Veg rows: %d/%d; barren rows: %d\n", n_non_missing_veg, nrow(df_raw), n_barren_veg))
+  if (n_non_missing_veg > 0) {
+    veg_tab <- sort(table(df_raw$Veg), decreasing = TRUE)
+    top_n <- min(10L, length(veg_tab))
+    cat(sprintf("[VEG DIAG] Top Veg labels: %s\n", paste(sprintf("%s=%d", names(veg_tab)[seq_len(top_n)], as.integer(veg_tab[seq_len(top_n)])), collapse = ", ")))
+  } else {
+    cat("[VEG DIAG] Veg column exists but is entirely empty/NA in the input CSV used for endmember extraction. Soil-line estimation from barren rows cannot run at this stage.\n")
+    # try loading a labelled training split if it's available and different from the current file
+    alt_path <- "C:\\Users\\yolan\\Downloads\\Landsat_Harmonized_Bands_1985_2025_train (2).csv"
+    if (file.exists(alt_path) && alt_path != data_file) {
+      cat(sprintf("[NOTICE] Reloading df_raw from alternate labelled file: %s\n", alt_path))
+      df_raw <- fread(alt_path)
+      df_raw <- normalize_band_names(df_raw)
+      if ("vegetation" %in% names(df_raw) && !"Veg" %in% names(df_raw)) df_raw$Veg <- df_raw$vegetation
+      df_raw$Veg <- tolower(trimws(as.character(df_raw$Veg)))
+      df_raw$Veg[df_raw$Veg %in% c("", "na", "null")] <- NA_character_
+      n_non_missing_veg <- sum(!is.na(df_raw$Veg))
+      n_barren_veg <- sum(df_raw$Veg == "barren", na.rm = TRUE)
+      cat(sprintf("[VEG DIAG] After reload: Non-missing Veg rows: %d/%d; barren rows: %d\n", n_non_missing_veg, nrow(df_raw), n_barren_veg))
+    }
+  }
   cat("[NOTICE] Found Veg values in input CSV; skipping GeoJSON join and using CSV-provided Veg values.\n")
 }
 
@@ -261,11 +298,17 @@ if ("NDDI" %in% names(df_raw)) {
 
   # Recalculate DVI soil baseline from the *filtered* training data so PPI computations use a post-filter baseline
   # This ensures that seasonal baselines and PPI soil references are not biased by dust or gross outliers.
-  tryCatch({
-    compute_soil_line_slope(df_raw, assign_global_dvi = TRUE)
-  }, error = function(e) {
-    cat(sprintf("[SOIL BASELINE] compute_soil_line_slope failed: %s\n", e$message))
-  })
+  veg_norm_raw <- if ("Veg" %in% names(df_raw)) tolower(trimws(as.character(df_raw$Veg))) else rep(NA_character_, nrow(df_raw))
+  n_barren_raw <- sum(veg_norm_raw == "barren" & is.finite(df_raw$nir) & is.finite(df_raw$red), na.rm = TRUE)
+  if (n_barren_raw > 5) {
+    tryCatch({
+      compute_soil_line_slope(df_raw, assign_global_dvi = TRUE)
+    }, error = function(e) {
+      cat(sprintf("[SOIL BASELINE] compute_soil_line_slope failed: %s\n", e$message))
+    })
+  } else {
+    cat(sprintf("[SOIL BASELINE] Skipping raw soil-line fit: only %d barren rows with finite nir/red in df_raw (need > 5).\n", n_barren_raw))
+  }
 }
 
 # Compute a per-location DVI soil baseline for PPI.
@@ -391,6 +434,19 @@ agg_group <- local({
 barren_rows <- agg_group |> dplyr::filter(tolower(Veg) == 'barren')
 if (nrow(barren_rows) == 0) stop("No barren location representatives found! Cannot extract true soil endmember.")
 cat(sprintf("Found %d barren location representatives\n", nrow(barren_rows)))
+
+# Refit soil-line slope from aggregated barren representatives (more reliable when raw Veg labels are sparse/missing)
+if (all(c("nir", "red") %in% names(barren_rows)) && nrow(barren_rows) >= 2) {
+  soil_line_model_agg <- tryCatch(lm(nir ~ red, data = barren_rows), error = function(e) e)
+  if (!inherits(soil_line_model_agg, "error")) {
+    slope_agg <- suppressWarnings(as.numeric(coef(soil_line_model_agg)[2]))
+    if (is.finite(slope_agg)) {
+      assign("SOIL_LINE_SLOPE", slope_agg, envir = globalenv())
+      cat(sprintf("[SOIL BASELINE] Updated SOIL_LINE_SLOPE=%.4f from %d aggregated barren representatives\n", slope_agg, nrow(barren_rows)))
+    }
+  }
+}
+
 # Use a random subset of barren representatives as soil endmembers (do NOT average across all barren locations)
 # This allows variability in soil endmembers per run; configure sample size with FVC_SOIL_SAMPLE_SIZE (global) and seed with FVC_SAMPLING_SEED
 n_barren <- nrow(barren_rows)
@@ -540,8 +596,7 @@ calculate_indices <- function(df) {
         zenith_rad <- calculate_solar_zenith(lat = 40, doy = 180, hour = 10.5)
 
         # Calculate PPI using ppi() function
-        M_val <- suppressWarnings(max(df$DVI, na.rm = TRUE))
-        if (!is.finite(M_val)) stop("[PPI] Synthetic mixing: cannot compute finite M")
+        M_val <- 0.7
         df$PPI <- ppi(dvi = df$DVI, zenith.angle = zenith_rad, M = M_val, dvi.soil = dvi_soil_val)
         cat(sprintf("Calculated PPI for synthetic mixing (dvi_soil=%.6f, zenith=%.4f rad)\n", dvi_soil_val, zenith_rad))
       }
@@ -666,8 +721,7 @@ if (!"PPI" %in% names(df_raw) || all(!is.finite(df_raw$PPI))) {
   }
   if (!is.finite(dvi_soil_val)) stop("Cannot determine dvi_soil baseline for PPI detrending; provide barren samples or set 'dvi_soil' explicitly")
   zenith_rad <- calculate_solar_zenith(lat = 40, doy = 180, hour = 10.5)
-  M_val <- suppressWarnings(max(df_raw$DVI, na.rm = TRUE))
-  if (!is.finite(M_val)) stop("[PPI] Cannot compute finite M for df_raw")
+  M_val <- 0.7
   df_raw$PPI <- ppi(df_raw$DVI, zenith.angle = zenith_rad, M = M_val, dvi.soil = dvi_soil_val)
 }
 
@@ -859,8 +913,7 @@ if ("DVI" %in% names(mixtures)) {
     idxs <- mixtures$pair_id == pid
     dvi_soil_val <- mixtures$DVI[idxs & mixtures$fraction_veg == 0][1]
     if (!is.finite(dvi_soil_val)) next
-    M_val <- suppressWarnings(max(mixtures$DVI[idxs], na.rm = TRUE))
-    if (!is.finite(M_val)) next
+    M_val <- 0.7
     mixtures$PPI[idxs] <- ppi(dvi = mixtures$DVI[idxs], zenith.angle = zenith_rad, M = M_val, dvi.soil = dvi_soil_val)
   }
   cat(sprintf("Calculated PPI for synthetic mixtures across %d pairs\n", length(pair_ids)))
@@ -1331,7 +1384,7 @@ build_models_for_soil_veg <- function(soil_rows, veg_rows, veg_label) {
       psub <- mixtures[mixtures$pair_id == pid, , drop = FALSE]
       soil_dvi <- psub$DVI[which(psub$fraction_veg == 0)[1]]
       if (!is.finite(soil_dvi)) soil_dvi <- NA_real_
-      M_val <- suppressWarnings(max(psub$DVI, na.rm = TRUE))
+      M_val <- 0.7
       if (!is.finite(M_val) || !is.finite(soil_dvi)) {
         mixtures$PPI[mixtures$pair_id == pid] <- NA_real_
       } else {
@@ -1369,36 +1422,18 @@ build_models_for_soil_veg <- function(soil_rows, veg_rows, veg_label) {
   return(list(models = fmodels, mixtures = mixtures))
 }
 
-# Build a full set of synthetic mixtures using all vegetation representatives (agg_group)
-# for the purpose of coloring combined plots by Veg type. Keep the existing 'mixtures'
-# variable (populus-only) for the populus pipeline/plots.
-if (exists("agg_group") && nrow(agg_group) > 0) {
-  veg_pool <- as.data.frame(agg_group)
-  veg_pool$Veg <- tolower(trimws(as.character(veg_pool$Veg)))
-  cat(sprintf("Building full mixtures using %d veg representatives (for coloring only)\n", nrow(veg_pool)))
-  res_allveg <- build_models_for_soil_veg(barren_data, veg_pool, "allveg")
-  mixtures_allveg <- if (!is.null(res_allveg) && is.list(res_allveg) && !is.null(res_allveg$mixtures)) res_allveg$mixtures else NULL
-  if (!is.null(mixtures_allveg)) {
-    mixtures_allveg$Veg <- as.character(veg_pool$Veg[mixtures_allveg$veg_idx])
-    mixtures_allveg$Veg[is.na(mixtures_allveg$Veg)] <- NA_character_
-    mixtures_allveg$Veg <- tolower(trimws(as.character(mixtures_allveg$Veg)))
-    cat(sprintf("Annotated full mixtures with Veg labels (unique: %s)\n", paste(sort(unique(na.omit(mixtures_allveg$Veg))), collapse = ", ")))
-  } else {
-    cat("Warning: failed to build full mixtures for all veg types; combined plots will use the current mixtures variable (populus-only).\n")
-    mixtures_allveg <- NULL
-  }
-} else {
-  mixtures_allveg <- NULL
-  cat("agg_group not available; cannot build full veg mixtures for coloring.\n")
-}
+# We no longer build synthetic mixtures across *all* vegetation types;
+# downstream plots simply use the `mixtures` variable already generated
+# (which for this run contains the veg subset of interest, e.g. populus).
+# The previous "allveg" pipeline was removed per user request.
 
 # Decide which indices to plot: use FVC_DIAGNOSTICS (already computed) but skip PPI/NDVI/EVI
 skip_idxs <- c(if (exists("ppi_col")) ppi_col else NA_character_, if (exists("ndvi_col")) ndvi_col else NA_character_, if (exists("evi_col")) evi_col else NA_character_)
 skip_idxs <- na.omit(skip_idxs)
 plot_candidates <- setdiff(FVC_DIAGNOSTICS, skip_idxs)
 
-# Use mixtures_allveg if available for combined plots; else fall back to mixtures
-mixtures_for_plots <- if (!is.null(mixtures_allveg)) mixtures_allveg else mixtures
+# For plotting we simply operate on the existing mixtures data frame
+mixtures_for_plots <- mixtures
 
 # Prepare color mapping from mixtures_for_plots
 if (exists("VEG_CALIBRATION_COLORS", envir = globalenv())) {
@@ -1474,9 +1509,9 @@ for (idx in plot_candidates) {
   leg_pch <- c(rep(NA_integer_, length(legend_txt)), rep(20L, length(legend_labels)))
 
   # Open PNG device and create the plot
-  plot_file <- file.path(output_dir, sprintf("fvc_vs_%s_allveg.png", idx))
+  plot_file <- file.path(output_dir, sprintf("fvc_vs_%s.png", idx))
   png(plot_file, width = 800, height = 600)
-  plot(plot_df[[idx]], plot_df$fraction_veg, pch = 20, col = point_cols, xlab = idx, ylab = "Fraction vegetation (ground truth)", main = sprintf("FVC vs %s (all veg types)", idx), ylim = c(0,1), xlim = c(min(x_seq, na.rm=TRUE), max(x_seq, na.rm=TRUE)))
+  plot(plot_df[[idx]], plot_df$fraction_veg, pch = 20, col = point_cols, xlab = idx, ylab = "Fraction vegetation (ground truth)", main = sprintf("FVC vs %s", idx), ylim = c(0,1), xlim = c(min(x_seq, na.rm=TRUE), max(x_seq, na.rm=TRUE)))
   lines(x_seq, y_pred_grid, col = "blue", lwd = 2)
 
   if (length(all_leg) > 0) {
@@ -1487,7 +1522,7 @@ for (idx in plot_candidates) {
     }
   }
   if (dev.cur() > 1) dev.off() else warning(sprintf("No active device to close for %s plot", idx))
-  cat(sprintf("[FVC PLOT][allveg][%s] Saved combined plot: %s\n", idx, plot_file))
+  cat(sprintf("[FVC PLOT][%s] Saved plot: %s\n", idx, plot_file))
 }
 
 # --- PRINT: Location-level median indices + Veg + derived FVC (first 10 rows only) ---
@@ -2106,6 +2141,13 @@ if (file.exists(TRAINING_CSV)) {
 } else {
   cat("Training CSV not found at:", TRAINING_CSV, "- falling back to using inference CSV for statistics (not recommended).\n")
   training_df <- df
+  # make sure training_df has month and pheno_year fields even when we fall back
+  if (!"month" %in% names(training_df) && "date" %in% names(training_df)) {
+    training_df$month <- lubridate::month(training_df$date)
+  }
+  if (!"pheno_year" %in% names(training_df) && "date" %in% names(training_df)) {
+    training_df$pheno_year <- assign_pheno_year(training_df$date)
+  }
 }
 
 # Join df with gpts_map to add Veg column
@@ -2166,6 +2208,11 @@ if (!"zenith.angle" %in% names(df)) {
     if (!"doy" %in% names(df)) df$doy <- lubridate::yday(df$date)
     # calculate_solar_zenith returns radians
     df$zenith.angle <- calculate_solar_zenith(as.numeric(df$lat), df$doy)
+    if (!"zenith.angle" %in% names(df) || all(is.na(df$zenith.angle))) {
+      cat("[SZA] warning: zenith.angle column missing or all NA after computation\n")
+    } else {
+      cat(sprintf("[SZA] Computed %d zenith.angle values\n", sum(is.finite(df$zenith.angle))))
+    }
   } else {
     cat("No per-row 'lat' available; leaving 'zenith.angle' NA. PPI will not be computed without SZA.\n")
     df$zenith.angle <- NA_real_
@@ -2265,6 +2312,15 @@ if (is.na(dvi_soil_est) && "DVI" %in% names(df)) {
 }
 
 # Filter for January, July, September data from TRAINING data (not inference)
+# ensure month column is a simple integer (some prior operations may have turned it into a
+# list when training_df was aliased to df)
+if ("month" %in% names(training_df)) {
+  if (is.list(training_df$month)) training_df$month <- unlist(training_df$month)
+  training_df$month <- as.integer(training_df$month)
+} else if ("date" %in% names(training_df)) {
+  training_df$month <- lubridate::month(training_df$date)
+}
+
 january_data <- training_df |> dplyr::filter(month == 1)
 july_data <- training_df |> dplyr::filter(month == 7)
 september_data <- training_df |> dplyr::filter(month == 9)
@@ -2371,22 +2427,35 @@ doy_to_pentad <- function(doy) {
 # Function to bootstrap averages using location resampling
 # Resamples unique location_ids, then takes all observations for those locations
 bootstrap_hierarchical_means <- function(df, metrics = c("MSAVI", "NDVI", "PPI"), group_col = "location_id", B = 1000) {
+  metrics_req <- unique(as.character(metrics))
+  make_na_output <- function(metric_names, ci_names = c("ci_lower", "ci_upper")) {
+    out <- rep(NA_real_, length(metric_names) * 2)
+    names(out) <- paste(rep(metric_names, each = 2), rep(ci_names, times = length(metric_names)), sep = "_")
+    out
+  }
+
   # Validation
-  if (!group_col %in% names(df)) return(rep(NA, length(metrics) * 2))
+  if (!group_col %in% names(df)) return(make_na_output(metrics_req))
+
+  metrics_avail <- intersect(metrics_req, names(df))
+  if (length(metrics_avail) == 0) {
+    cat("[BOOTSTRAP] None of the requested metrics are present; returning NA CIs.\n")
+    return(make_na_output(metrics_req))
+  }
 
   # Work only with requested columns for speed
-  df <- df |> dplyr::select(all_of(c(group_col, metrics)))
+  df <- df |> dplyr::select(any_of(c(group_col, metrics_avail)))
   df[[group_col]] <- as.character(df[[group_col]])
   ids <- unique(df[[group_col]])
   n_ids <- length(ids)
-  if (n_ids < 2) return(rep(NA, length(metrics) * 2))
+  if (n_ids < 2) return(make_na_output(metrics_req))
 
   # Pre-split into matrices per location (faster than repeated dataframe subsetting)
   data_map <- lapply(ids, function(id) {
-    mat <- as.matrix(df[df[[group_col]] == id, metrics, drop = FALSE])
+    mat <- as.matrix(df[df[[group_col]] == id, metrics_avail, drop = FALSE])
     # Ensure matrix has correct number of columns even if single column was present
-    if (is.null(dim(mat))) mat <- matrix(mat, ncol = length(metrics))
-    colnames(mat) <- metrics
+    if (is.null(dim(mat))) mat <- matrix(mat, ncol = length(metrics_avail))
+    colnames(mat) <- metrics_avail
     mat
   })
   names(data_map) <- ids
@@ -2400,12 +2469,12 @@ bootstrap_hierarchical_means <- function(df, metrics = c("MSAVI", "NDVI", "PPI")
     # Stage 2: for each selected location matrix, resample rows and compute column means
     cluster_means <- vapply(selected_mats, function(mat) {
       n_obs <- nrow(mat)
-      if (is.na(n_obs) || n_obs <= 0) return(rep(NA_real_, length(metrics)))
+      if (is.na(n_obs) || n_obs <= 0) return(rep(NA_real_, length(metrics_avail)))
       rows <- sample.int(n_obs, n_obs, replace = TRUE)
       colMeans(mat[rows, , drop = FALSE], na.rm = TRUE)
-    }, numeric(length(metrics)))
+    }, numeric(length(metrics_avail)))
     # Ensure cluster_means is a matrix (metrics x n_clusters)
-    if (is.null(dim(cluster_means))) cluster_means <- matrix(cluster_means, nrow = length(metrics))
+    if (is.null(dim(cluster_means))) cluster_means <- matrix(cluster_means, nrow = length(metrics_avail))
 
     # Final statistic: mean across clusters (metrics x 1)
     rowMeans(cluster_means, na.rm = TRUE)
@@ -2413,16 +2482,17 @@ bootstrap_hierarchical_means <- function(df, metrics = c("MSAVI", "NDVI", "PPI")
 
   # boot_replicates is [num_metrics x B] (transpose if needed)
   if (is.null(dim(boot_replicates))) {
-    boot_replicates <- matrix(boot_replicates, nrow = length(metrics))
+    boot_replicates <- matrix(boot_replicates, nrow = length(metrics_avail))
   }
 
   cis <- apply(boot_replicates, 1, function(x) stats::quantile(x, probs = c(0.025, 0.975), na.rm = TRUE))
 
-  # Format output: metric_ci_lower, metric_ci_upper
-  output <- as.vector(cis)
-  metric_names <- rep(metrics, each = 2)
-  ci_types <- rep(c("ci_lower", "ci_upper"), times = length(metrics))
-  names(output) <- paste(metric_names, ci_types, sep = "_")
+  # Format output: metric_ci_lower, metric_ci_upper (preserve requested metric order)
+  output <- make_na_output(metrics_req)
+  cis_vals <- as.vector(cis)
+  cis_names <- paste(rep(metrics_avail, each = 2), rep(c("ci_lower", "ci_upper"), times = length(metrics_avail)), sep = "_")
+  names(cis_vals) <- cis_names
+  output[cis_names] <- cis_vals[cis_names]
 
   return(output)
 }
@@ -2430,18 +2500,31 @@ bootstrap_hierarchical_means <- function(df, metrics = c("MSAVI", "NDVI", "PPI")
 # Function to bootstrap medians using location resampling
 # Resamples unique location_ids, then takes all observations for those locations
 bootstrap_hierarchical_medians <- function(df, metrics = c("PPI"), group_col = "location_id", B = 1000) {
-  if (!group_col %in% names(df)) return(rep(NA, length(metrics) * 2))
+  metrics_req <- unique(as.character(metrics))
+  make_na_output <- function(metric_names, ci_names = c("lower", "upper")) {
+    out <- rep(NA_real_, length(metric_names) * 2)
+    names(out) <- paste(rep(metric_names, each = 2), rep(ci_names, times = length(metric_names)), sep = "_")
+    out
+  }
 
-  df <- df |> dplyr::select(all_of(c(group_col, metrics)))
+  if (!group_col %in% names(df)) return(make_na_output(metrics_req))
+
+  metrics_avail <- intersect(metrics_req, names(df))
+  if (length(metrics_avail) == 0) {
+    cat("[BOOTSTRAP] None of the requested median metrics are present; returning NA CIs.\n")
+    return(make_na_output(metrics_req))
+  }
+
+  df <- df |> dplyr::select(any_of(c(group_col, metrics_avail)))
   df[[group_col]] <- as.character(df[[group_col]])
   ids <- unique(df[[group_col]])
   n_ids <- length(ids)
-  if (n_ids < 2) return(rep(NA, length(metrics) * 2))
+  if (n_ids < 2) return(make_na_output(metrics_req))
 
   data_map <- lapply(ids, function(id) {
-    mat <- as.matrix(df[df[[group_col]] == id, metrics, drop = FALSE])
-    if (is.null(dim(mat))) mat <- matrix(mat, ncol = length(metrics))
-    colnames(mat) <- metrics
+    mat <- as.matrix(df[df[[group_col]] == id, metrics_avail, drop = FALSE])
+    if (is.null(dim(mat))) mat <- matrix(mat, ncol = length(metrics_avail))
+    colnames(mat) <- metrics_avail
     mat
   })
   names(data_map) <- ids
@@ -2452,24 +2535,25 @@ bootstrap_hierarchical_medians <- function(df, metrics = c("PPI"), group_col = "
 
     cluster_stats <- vapply(selected_mats, function(mat) {
       n_obs <- nrow(mat)
-      if (is.na(n_obs) || n_obs <= 0) return(rep(NA_real_, length(metrics)))
+      if (is.na(n_obs) || n_obs <= 0) return(rep(NA_real_, length(metrics_avail)))
       rows <- sample.int(n_obs, n_obs, replace = TRUE)
       apply(mat[rows, , drop = FALSE], 2, median, na.rm = TRUE)
-    }, numeric(length(metrics)))
+    }, numeric(length(metrics_avail)))
     # Ensure cluster_stats is a matrix (metrics x n_clusters)
-    if (is.null(dim(cluster_stats))) cluster_stats <- matrix(cluster_stats, nrow = length(metrics))
+    if (is.null(dim(cluster_stats))) cluster_stats <- matrix(cluster_stats, nrow = length(metrics_avail))
 
     # Aggregate across clusters by median
     apply(cluster_stats, 1, median, na.rm = TRUE)
   })
 
-  if (is.null(dim(boot_replicates))) boot_replicates <- matrix(boot_replicates, nrow = length(metrics))
+  if (is.null(dim(boot_replicates))) boot_replicates <- matrix(boot_replicates, nrow = length(metrics_avail))
 
   cis <- apply(boot_replicates, 1, function(x) stats::quantile(x, probs = c(0.025, 0.975), na.rm = TRUE))
-  output <- as.vector(cis)
-  metric_names <- rep(metrics, each = 2)
-  ci_types <- rep(c("lower", "upper"), times = length(metrics))
-  names(output) <- paste(metric_names, ci_types, sep = "_")
+  output <- make_na_output(metrics_req)
+  cis_vals <- as.vector(cis)
+  cis_names <- paste(rep(metrics_avail, each = 2), rep(c("lower", "upper"), times = length(metrics_avail)), sep = "_")
+  names(cis_vals) <- cis_names
+  output[cis_names] <- cis_vals[cis_names]
   return(output)
 }
 
@@ -2490,12 +2574,17 @@ B <- 1000  # Number of bootstrap replicates
 process_global_averages <- function(data, month_name) {
   cat(sprintf("Calculating Global %s Averages with Hierarchical Bootstrapping...\n", month_name))
   global_boot <- bootstrap_hierarchical_means(data, metrics = INDICES_OF_INTEREST, B = B)
+  metrics_avail <- intersect(INDICES_OF_INTEREST, names(data))
+  metrics_missing <- setdiff(INDICES_OF_INTEREST, metrics_avail)
+  if (length(metrics_missing) > 0) {
+    cat(sprintf("[GLOBAL %s] Missing metrics in input data: %s\n", month_name, paste(metrics_missing, collapse = ", ")))
+  }
   
   avg_stats <- data |> 
     dplyr::summarize(
       n_observations = dplyr::n(),
       n_locations = dplyr::n_distinct(location_id),
-      across(all_of(INDICES_OF_INTEREST), ~ mean_of_means(.x, location_id), .names = "avg_{.col}")
+      across(any_of(INDICES_OF_INTEREST), ~ mean_of_means(.x, location_id), .names = "avg_{.col}")
     )
   
   # Bind CIs
@@ -2632,7 +2721,9 @@ sept_global_avg_nonbarren <- if (nrow(nonbarren_sept) > 0) process_global_averag
 create_summary_entry <- function(idx_name, bias_info, jan_row, july_row, sept_row) {
   # Helper to format mean +/- margin
   fmt_val <- function(mean_val, lower, upper) {
-    if (is.na(mean_val)) return("NA")
+    # Guard against missing or zero-length inputs
+    if (length(mean_val) == 0 || is.na(mean_val)) return("NA")
+    if (length(lower) == 0 || length(upper) == 0 || is.na(lower) || is.na(upper)) return("NA")
     margin <- (upper - lower) / 2
     # Format with comma decimal
     m_str <- format(round(mean_val, 3), nsmall=3, decimal.mark=",")
@@ -2640,9 +2731,22 @@ create_summary_entry <- function(idx_name, bias_info, jan_row, july_row, sept_ro
     sprintf("%s (+/-%s)*", m_str, e_str)
   }
   
-  jan_str <- fmt_val(jan_row[[paste0("avg_", idx_name)]], jan_row[[paste0(idx_name, "_ci_lower")]], jan_row[[paste0(idx_name, "_ci_upper")]])
-  july_str <- fmt_val(july_row[[paste0("avg_", idx_name)]], july_row[[paste0(idx_name, "_ci_lower")]], july_row[[paste0(idx_name, "_ci_upper")]])
-  sept_str <- fmt_val(sept_row[[paste0("avg_", idx_name)]], sept_row[[paste0(idx_name, "_ci_lower")]], sept_row[[paste0(idx_name, "_ci_upper")]])
+  # helper to safely pull a value from a row (returns NA_real_ if missing/zero-length)
+  get_val <- function(row, name) {
+    if (is.null(row) || !(name %in% names(row))) return(NA_real_)
+    val <- row[[name]]
+    if (length(val) == 0) return(NA_real_)
+    val
+  }
+  jan_str <- fmt_val(get_val(jan_row, paste0("avg_", idx_name)),
+                     get_val(jan_row, paste0(idx_name, "_ci_lower")),
+                     get_val(jan_row, paste0(idx_name, "_ci_upper")))
+  july_str <- fmt_val(get_val(july_row, paste0("avg_", idx_name)),
+                      get_val(july_row, paste0(idx_name, "_ci_lower")),
+                      get_val(july_row, paste0(idx_name, "_ci_upper")))
+  sept_str <- fmt_val(get_val(sept_row, paste0("avg_", idx_name)),
+                      get_val(sept_row, paste0(idx_name, "_ci_lower")),
+                      get_val(sept_row, paste0(idx_name, "_ci_upper")))
   
   # Format Bias with CI
   if (!is.null(bias_info) && is.finite(bias_info$bias)) {

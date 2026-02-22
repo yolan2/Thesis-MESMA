@@ -56,6 +56,15 @@ INPUT_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_train 
                                  # Path to the input CSV used for training. Replace with your own file path.
 INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_mid (1).csv"
                                  # Path for spatial inference input (set to NA to disable inference steps).
+                                 #
+                                 # When the script is invoked with an environment variable
+                                 # MESMA_INFERENCE_CSV, that path will override this value.
+                                 # You may also provide a directory path or a comma-separated
+                                 # list of CSV files; the pipeline will treat each file as a
+                                 # separate inference run and process them sequentially.  An
+                                 # alternate environment variable MESMA_INFERENCE_DIR may be
+                                 # used to specify a folder containing CSVs.  This makes
+                                 # "batch mode" the default when working with multiple inputs.
 
 
 # Training year selection
@@ -126,7 +135,7 @@ COMBO_ABORT_LIMIT <- 5e7          # Hard abort threshold: if combos exceed this,
 
 # Bootstrap / inference sizing
 BOOTSTRAP_B <- 200L              # Number of bootstrap iterations (location-level). Higher -> more stable CIs but slower. 100-500 typical.
-MAX_INFERENCE_LOCATIONS <- 2000L    # TEMP DEBUG: Reduce to e.g. 2 locations to reproduce/inspect issue quickly
+MAX_INFERENCE_LOCATIONS <- 2000L # Max locations processed per inference CSV file (single-file run cap)
 
 # Spatial dependence handling in bootstrap
 # NOTE: The default location bootstrap resamples locations i.i.d., which can
@@ -144,12 +153,6 @@ BOOTSTRAP_BLOCK_MAX_MISSING_FRAC <- 0.20  # If > this fraction of locations lack
 ENABLE_UNCERTAINTY <- TRUE       # Turn off to skip expensive uncertainty estimation (bootstrap, MC propagation) for faster runs.
 ENABLE_MULTI_YEAR_BOOTSTRAP <- FALSE # If TRUE, run per-location multi-year bootstrap; set FALSE to skip for speed/stability.
 DEBUG_UNCERTAINTY <- TRUE        # Verbose diagnostics for uncertainty steps; set FALSE for quiet production runs.
-
-# Classification uncertainty propagation (Dirichlet perturbation)
-ENABLE_CLASSIFICATION_UNCERTAINTY <- TRUE  # If TRUE, apply Dirichlet perturbation based on confusion matrix during bootstrap.
-DIRICHLET_CONCENTRATION_SCALE <- 10.0      # Multiplier for validation sample size to set Dirichlet concentration (alpha).
-                                           # Higher values = tighter concentration = less classification noise.
-                                           # Lower values = more spread = larger classification uncertainty.
 
 # MC propagation
 ENABLE_MONTE_CARLO <- TRUE       # Propagate observation noise into coefficient uncertainty via repeated unmixing draws. Disable to save time.
@@ -181,6 +184,7 @@ FEATURE_PRUNING_THRESHOLD <- 0.95 # Correlation threshold above which a feature 
 MIN_OBS_PER_LOC_YEAR <- 3L      # Minimum rows required per location-year for processing. Increase to be stricter on noisy cases.
 MIN_UNIQUE_DOY_DEFAULT <- 5L    # Minimum unique DOYs per loc-year during training to consider time-series adequate.
 MIN_UNIQUE_DOY_INFERENCE <- 3L  # Less strict for inference to allow sparse inputs.
+MIN_PENTADS_PER_TRAIN_SAMPLE <- 10L  # Minimum observations required per location-year trace to construct a training sample.
 
 # Modeling/algorithmic caps and defaults
 ENABLE_LDA_L2_NORMALIZATION <- TRUE # L2-normalize training samples to focus on temporal shape rather than amplitude.

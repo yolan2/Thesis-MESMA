@@ -278,8 +278,7 @@ calculate_indices <- function(df) {
         zenith_rad <- calculate_solar_zenith(lat = 40, doy = 180, hour = 10.5)
 
         # Calculate PPI using ppi() function
-        M_val <- suppressWarnings(max(df$DVI, na.rm = TRUE))
-        if (!is.finite(M_val)) stop("[PPI] Cannot compute finite M for synthetic mixing")
+        M_val <- 0.7
         df$PPI <- ppi(dvi = df$DVI, zenith.angle = zenith_rad, M = M_val, dvi.soil = dvi_soil_val)
         cat(sprintf("Calculated PPI for synthetic mixing (dvi_soil=%.6f, zenith=%.4f rad)\n", dvi_soil_val, zenith_rad))
       }
