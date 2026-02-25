@@ -5384,7 +5384,7 @@ print_weights_summary <- function(stage_name, params) {
   # === Shared confusion matrix function (used for both training and validation) ===
   # Pipeline: OPTIMIZED_LIBRARY endmembers -> energy normalization -> batch FCLS
   # with feature weights. Observations: z-score -> prune to match library.
-  compute_confusion_matrix <- function(df_data, label = "Training") {
+  compute_confusion_matrix <- function(df_data, label = "Training", interpolate = TRUE) {
     if (is.null(df_data) || nrow(df_data) == 0) return(invisible(NULL))
     if (!exists("OPTIMIZED_LIBRARY") || is.null(OPTIMIZED_LIBRARY)) return(invisible(NULL))
     if (is.null(MESMA_PARAMS) || is.null(MESMA_PARAMS$weights)) return(invisible(NULL))
@@ -5434,7 +5434,7 @@ print_weights_summary <- function(stage_name, params) {
         true_cls <- traces$target_class[j]
 
         sub <- df_cm[df_cm$location_id == lid & df_cm$pheno_year == pyr, ]
-        mat <- build_pentad_matrix(sub, base_indices_cm)
+        mat <- build_pentad_matrix(sub, base_indices_cm, interpolate = isTRUE(interpolate))
         if (!is.null(mat)) {
           vec <- as.numeric(mat)
           vec <- mesma_apply_representation_vec(vec, n_base_idx_cm, TEMPORAL_BUDGET, l2_normalize_cm)
@@ -5572,7 +5572,11 @@ print_weights_summary <- function(stage_name, params) {
   # === STEP 4: Compute Training Confusion Matrix ===
   if (exists("df_train") && !is.null(df_train) && nrow(df_train) > 0) {
     cat("\n=== STEP 4: Computing Confusion Matrix with Final Weights (All Training Data) ===\n")
-    compute_confusion_matrix(df_train, "Training")
+    # Original (interpolated) training confusion matrix for backwards compatibility
+    compute_confusion_matrix(df_train, "Training (interpolated)", interpolate = TRUE)
+
+    # Additional confusion matrix computed using non-interpolated pentad data
+    compute_confusion_matrix(df_train, "Training (non-interpolated)", interpolate = FALSE)
   }
 
   
