@@ -2,7 +2,6 @@
 # Correlate annual inference results with groundwater depths (Alagan, Yingsu)
 # - inspects Excel sheets `Alagan` and `Yingsu` at runtime
 # - implements delayed response (lag in years; default = 1)
-# - finds nearest inference `location_id` by lat/lon when possible
 # - outputs lag-wise correlations, regression stats and plots
 
 # -------- USER CONFIG --------
@@ -23,12 +22,12 @@ out_dir <- "temp_results/gw_correlation"  # output CSVs + plots
 # -----------------------------
 
 # Required packages
-pkgs <- c("readxl", "dplyr", "lubridate", "ggplot2", "broom", "tidyr", "geosphere", "writexl")
+pkgs <- c("readxl", "dplyr", "lubridate", "ggplot2", "broom", "tidyr", "writexl")
 inst <- pkgs[!pkgs %in% installed.packages()[,"Package"]]
 if(length(inst)) install.packages(inst, repos = "https://cloud.r-project.org")
 
 library(readxl); library(dplyr); library(lubridate); library(ggplot2)
-library(broom); library(tidyr); library(geosphere)
+library(broom); library(tidyr)
 
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 # remove any pre-existing outputs for excluded vegetation classes (keeps output folder clean)
@@ -121,17 +120,6 @@ gw_to_yearly <- function(df) {
               n_obs = sum(!is.na(!!rlang::sym(cols$depth_col)))) %>%
     ungroup()
   df2
-}
-
-# Find nearest inference location by lat/lon
-find_nearest_location <- function(inf_df, well_df, well_lat_col=NULL, well_lon_col=NULL) {
-  # treat NA and NULL the same
-  if(is.null(well_lat_col) || is.null(well_lon_col) || is.na(well_lat_col) || is.na(well_lon_col)) return(NULL)
-  well_lat <- well_df[[well_lat_col]][1]
-  well_lon <- well_df[[well_lon_col]][1]
-  dists <- geosphere::distHaversine(matrix(c(inf_df$lon, inf_df$lat), ncol=2), c(well_lon, well_lat))
-  i <- which.min(dists)
-  list(location_id = inf_df$location_id[i], lat = inf_df$lat[i], lon = inf_df$lon[i], distance_m = dists[i])
 }
 
 # Compute lagged correlations between annual inference and groundwater
@@ -255,8 +243,8 @@ plot_dual_axis_time_series <- function(inf_yearly_df, gw_yearly_df, sheet, id_ta
   joined <- joined %>% mutate(gw_scaled = (gw_mean - min_gw) * scale_factor + min_inf)
 
   p <- ggplot(joined, aes(x = pheno_year)) +
-    geom_line(aes(y = inf_metric, color = 'veg'), size = 0.9) + geom_point(aes(y = inf_metric, color = 'veg')) +
-    geom_line(aes(y = gw_scaled, color = 'gw'), size = 0.9, linetype = 'dashed') + geom_point(aes(y = gw_scaled, color = 'gw')) +
+    geom_line(aes(y = inf_metric, color = 'veg'), linewidth = 0.9) + geom_point(aes(y = inf_metric, color = 'veg')) +
+    geom_line(aes(y = gw_scaled, color = 'gw'), linewidth = 0.9, linetype = 'dashed') + geom_point(aes(y = gw_scaled, color = 'gw')) +
     scale_y_continuous(name = 'vegetation fraction', sec.axis = sec_axis(~ (. - min_inf)/scale_factor + min_gw, name = 'groundwater depth (m)')) +
     scale_color_manual('', values = c('veg' = '#1f77b4', 'gw' = '#d62728'), labels = c('vegetation', 'groundwater')) +
     labs(x = 'year') +
@@ -341,32 +329,19 @@ for(sheet in sheets_to_use) {
     cols <- list(date_col = NULL, year_col = '.gw_year', depth_col = 'gw_mean', lat_col = NULL, lon_col = NULL)
   }
 
-  # attempt to find matching inference location
-  nearest <- NULL
-  if(!is.null(cols$lat_col) && !is.null(cols$lon_col)) {
-    nearest <- find_nearest_location(inf, gw_raw, cols$lat_col, cols$lon_col)
-    if(!is.null(nearest)) message(sprintf('Nearest inference location: id=%s, lat=%.6f lon=%.6f dist=%.0fm', nearest$location_id, nearest$lat, nearest$lon, nearest$distance_m))
-  } else {
-    message('No lat/lon in sheet — will use manual mapping (sheet_loc_map) or regional mean fallback')
-  }
-
-  # Determine analysis mode: per-location (nearest or mapping) OR regional timeseries
+  # Determine analysis mode: per-location (mapping) OR regional timeseries
   mapped_loc <- NULL
   if(!is.null(sheet_loc_map) && !is.null(sheet_loc_map[[sheet]])) mapped_loc <- sheet_loc_map[[sheet]]
 
   # decide chosen location id (if any) and id base tag
   chosen_loc <- NULL
-  if(!is.null(nearest)) {
-    chosen_loc <- nearest$location_id
-    message(sprintf('Using nearest inference location_id = %s for sheet %s', chosen_loc, sheet))
-    id_base <- paste0('loc', chosen_loc)
-  } else if(!is.null(mapped_loc)) {
+  if(!is.null(mapped_loc)) {
     chosen_loc <- mapped_loc
     message(sprintf('Using manual mapping: location_id = %s for sheet %s', chosen_loc, sheet))
     id_base <- paste0('loc', chosen_loc)
   } else {
     id_base <- 'regional_mean'
-    message(sprintf('No lat/lon or manual mapping for sheet %s — will use regional mean of inference metric', sheet))
+    message(sprintf('No manual mapping for sheet %s — will use regional mean of inference metric', sheet))
   }
 
   # determine list of vegetation targets to evaluate

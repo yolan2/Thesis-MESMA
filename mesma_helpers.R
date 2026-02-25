@@ -331,11 +331,21 @@ analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor,
 
 
 
+# global flag controlling whether years 1992-1999 (and their shading)
+# should be treated as 'excluded'.  By default we now leave this FALSE so that
+# plots and analyses include all years; set EXCLUDE_PRE2000 <- TRUE in your
+# environment to restore the original exclusions.
+if (!exists("EXCLUDE_PRE2000", inherits = TRUE)) EXCLUDE_PRE2000 <- FALSE
+
 # Helper: add a shaded rectangle covering excluded years (1992-1999) for ggplot2 time-series plots.
 # Usage: + add_excluded_years_shade(is_date = TRUE)  # x axis is Date
 #        + add_excluded_years_shade(is_date = FALSE) # x axis is numeric (year)
 add_excluded_years_shade <- function(start_year = 1992, end_year = 1999, is_date = FALSE, fill = "grey70", alpha = 0.35) {
-  if (!requireNamespace("ggplot2", quietly = TRUE)) return(NULL)
+  if (!requireNamespace("ggplot2", quietly = TRUE)) return(list())
+  if (!isTRUE(EXCLUDE_PRE2000)) {
+    # shading disabled by global flag; return empty list so callers can concatenate safely
+    return(list())
+  }
   # Two shaded regions: 1992-1999 and 2007-2009
   if (is_date) {
     xmin1 <- as.Date(paste0(start_year, "-01-01"))

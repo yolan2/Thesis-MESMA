@@ -142,7 +142,7 @@ MAX_INFERENCE_LOCATIONS <- 2000L # Max locations processed per inference CSV fil
 #       underestimate long-distance spatial correlation and therefore understate
 #       uncertainty of spatial aggregates.
 #       When enabled, we resample *spatial blocks* of locations instead.
-#       Block size is determined from the data via empirical variogram fitting
+#       BloALSEck size is determined from the data via empirical variogram fitting
 #       (estimate_autocorrelation_range). BOOTSTRAP_BLOCK_KM serves only as a
 #       fallback when the variogram cannot be estimated (too few locations, etc.).
 ENABLE_SPATIAL_BLOCK_BOOTSTRAP <- TRUE
@@ -173,6 +173,53 @@ HUBER_DELTA <- 1.345             # Huber delta parameter (threshold for switchin
                                  # Lower values = more robust but less efficient. Higher = closer to RMSE.
 HUBER_MAX_ITER <- 20             # Max iterations for IRLS (iteratively reweighted least squares)
 HUBER_TOL <- 1e-4                # Convergence tolerance for IRLS
+
+# --- LDA and PCA space solver options ---------------------------------------
+#
+# USE_LDA_SPACE_SOLVER: If TRUE, projects both observations and endmembers into the LDA discriminant subspace and runs unmixing there. Component weights are the percent-of-explained between-class variance for each discriminant axis. Disables per-feature weighting in favor of LDA component weights. Mutually exclusive with USE_PCA_SPACE_SOLVER.
+#
+# USE_PCA_SPACE_SOLVER: If TRUE, projects both observations and endmembers into the PCA subspace and runs unmixing there. Component weights are the percent-of-explained variance for each principal component. Disables per-feature weighting in favor of PCA component weights. Mutually exclusive with USE_LDA_SPACE_SOLVER.
+#
+# Only one of USE_LDA_SPACE_SOLVER or USE_PCA_SPACE_SOLVER should be TRUE at a time. If both are FALSE, unmixing is performed in the original feature space with per-feature weights.
+#
+# When projecting into the LDA subspace and some input features are missing, the pipeline automatically computes a per-sample reliability weight for each discriminant axis. This downweights axes that depend heavily on unavailable features so that missing data cannot spuriously drive unmixing. This behaviour is always active whenever LDA-space solving is used.
+#
+USE_LDA_SPACE_SOLVER <- TRUE    # Toggle LDA-space unmixing on/off (default FALSE)
+ENABLE_LDA_RELIABILITY <- TRUE   # legacy synonym; no longer required
+# --- IWLMM (Iteratively Weighted Linear Mixing Model) ---
+# Experimental alternate unmixing solver that perturbs endmembers within
+# bounds derived from within-class variance (Li et al. 2021).  Enabling this
+# mode may improve robustness to endmember variability but increases
+# computational cost.  This mode can now be used together with sparse
+# unmixing; when both flags are TRUE the pipeline will run a combined solver
+# that alternates perturbation updates with a sparse coefficient solver.
+USE_IWLMM <- TRUE            # Set TRUE to enable IWLMM unmixing during MESMA
+IWLMM_MAX_ITER <- 15            # Maximum alternating optimization iterations
+IWLMM_TOL <- 1e-4               # Convergence tolerance on coefficients
+IWLMM_BOUND_SIGMA <- 2.0        # Multiplier on per-feature sigma to bound perturbations
+IWLMM_REGULARIZE_DELTA <- 0.0   # Optional L2 regularization on endmember perturbations
+
+# Solver selection
+# The unmixing solver can be chosen per-run via MESMA_PARAMS$solver or the
+# environment/config variable DEFAULT_UNMIX_SOLVER.  Supported modes are:
+#   "fcls"   - standard fully constrained least squares (default)
+#   "sparse" - sparse solver retains only top-k endmembers per sample
+#   "iwlmm"  - iterative weighted linear mixing model (experimental)
+# These options may also be controlled indirectly by the flags below.
+DEFAULT_UNMIX_SOLVER <- "fcls"   # fallback solver when MESMA_PARAMS$solver unset
+
+# Sparse mixing controls (subset selection + sparsity-aware model score)
+# When performing per-sample unmixing the default constrained QP solver may be
+# replaced by an L1-penalized regression.  The flag below controls that
+# behaviour; it is separate from the higher-level ENABLE_SPARSE_MIXING which
+# governs library search/selection.
+USE_SPARSE_UNMIXING <- TRUE     # Set TRUE to apply L1-penalized solver to every unmixing call.
+ENABLE_SPARSE_MIXING <- TRUE    # If TRUE, allow MESMA to fit sparse subsets of classes instead of forcing all classes in every mix.
+SPARSE_MIXING_LAMBDA <- 0.01     # Sparsity penalty added to score as: rmse + lambda * n_active_components.
+SPARSE_MIN_COMPONENTS <- 1L      # Minimum number of active classes allowed in sparse subset search.
+SPARSE_MAX_COMPONENTS <- 4L      # Maximum number of active classes allowed in sparse subset search.
+SPARSE_COEF_THRESHOLD <- 0.02    # Coefficients > threshold are counted as active components for sparsity penalty.
+SPARSE_UNMIX_K <- 3L              # Number of nonzero endmembers to keep per-sample when using sparse solver
 
 # Feature selection / pruning
 ENABLE_FEATURE_PRUNING <- TRUE  # Automatically drop highly correlated features before training?
@@ -218,7 +265,7 @@ TEMPORAL_BUDGET <- ceiling(365 / TEMPORAL_AGGREGATION_DAYS)  # Number of tempora
 
 # Variant / clustering settings
 MIN_CLUSTER_SIZE <- 4L           # Minimum cluster size to accept a variant prototype
-INTERPOLATE_INFERENCE <- TRUE   # If TRUE, linearly interpolate missing pentads for inference/validation (default: FALSE — preserves validation integrity)
+INTERPOLATE_INFERENCE <- FALSE   # If TRUE, linearly interpolate missing pentads for inference/validation (default: FALSE — preserves validation integrity)
 PCA_VARIANCE_THRESHOLD <- 0.95    # PCA energy to retain when reducing endmember dimensionality prior to clustering
 
 # Whether to prune features with zero LDA weight from optimized libraries
@@ -238,7 +285,7 @@ PERMUTATION_N_ITER <- 400            # Number of permutations per feature for si
 PERMUTATION_MIN_SAMPLES <- 20       # Minimum OOB samples required for testing
 
 # Endmember selection tuning
-MAX_K_EAR <- 7L                  # Maximum number of endmembers to consider per vegetation class in EAR selection (conservative increase to explore one more k).
+MAX_K_EAR <- 8L                  # Maximum number of endmembers to consider per vegetation class in EAR selection (conservative increase to explore one more k).
 CLUSTER_COMPLEXITY_LAMBDA <- 0.005  # Complexity penalty per total endmember: S = min(R_oob, R_train) - λ * sum(k)
 BARREN_SIM_THRESHOLD <- 0.75     # Pre-filter: drop vegetation training observations whose cosine similarity to barren mean exceeds this threshold
 

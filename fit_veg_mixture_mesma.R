@@ -1,3 +1,23 @@
+
+# --- Feature pipeline: now supports PCA-only mode for direct PCA-space unmixing ---
+train_feature_pipeline <- function(df, class_col, feature_cols, mode = c("default", "lda-space", "pca-space")) {
+  mode <- match.arg(mode)
+  X <- as.matrix(df[, feature_cols, drop = FALSE])
+  y <- if (!missing(class_col)) df[[class_col]] else NULL
+  pca <- prcomp(X, center = TRUE, scale. = TRUE)
+  explained_var <- (pca$sdev^2) / sum(pca$sdev^2)
+  if (mode == "pca-space") {
+    # Return PCA basis and explained variance weights
+    return(list(
+      pca = pca,
+      explained_var = explained_var,
+      mode = "pca-space"
+    ))
+  }
+  # ...existing code for LDA and default modes...
+  # If mode == "lda-space", run LDA on PCA scores, return LDA basis and weights
+  # If mode == "default", return standard pipeline
+}
 filter_variants_by_min_samples <- function(variants, min_samples = MIN_ENDMEMBER_SAMPLES, veg = NULL, raw_template = NULL) {
   if (is.null(variants) || length(variants) == 0) return(list())
   keep_mask <- sapply(variants, function(v) {
@@ -1833,32 +1853,94 @@ train_feature_pipeline <- function(df, class_col, feature_cols) {
     stop(sprintf("[LDA] Not enough degrees of freedom for LDA (n_pcs=%d < min_required=%d, n_min=%d). Need more samples in smallest class.", n_pcs, min_pcs_for_lda, n_min))
   }
 
+  # perform LDA on selected principal components
   lda_res <- safe_lda_call(pca_res$x[, 1:n_pcs, drop=FALSE], as.factor(y_labels), min_n_pcs = min_pcs_for_lda)
 
   if (is.null(lda_res)) {
     stop("[LDA] LDA could not be computed (collinearity / too few samples / invalid feature space)")
   }
-  
+
+  # determine how much each PC contributes to the discriminant space.  We use
+  # the squared magnitude of the LDA scaling coefficients as a proxy for how
+  # informative a given PC is for class separation.  Then retain the smallest
+  # set of PCs whose contributions sum to at least 95% of the total.
+  pc_contribs <- rowSums(lda_res$scaling^2)
+  total_contrib <- sum(pc_contribs)
+  if (total_contrib > 0) {
+    ord <- order(pc_contribs, decreasing = TRUE)
+    cum_pc <- cumsum(pc_contribs[ord]) / total_contrib
+    n_keep_pc <- which(cum_pc >= 0.95)[1]
+    if (is.na(n_keep_pc)) n_keep_pc <- length(ord)
+    # enforce minimum PCs required for LDA stability
+    n_keep_pc <- max(n_keep_pc, min_pcs_for_lda)
+  } else {
+    ord <- seq_len(length(pc_contribs))
+    n_keep_pc <- length(ord)
+  }
+
+  if (n_keep_pc < n_pcs) {
+    cat(sprintf("  PC reduction: keeping %d of %d PCs to retain 95%% LDA separability\n",
+                n_keep_pc, n_pcs))
+    kept_idx <- sort(ord[1:n_keep_pc])
+    n_pcs <- n_keep_pc
+    # recompute LDA on reduced PC set
+    lda_res <- safe_lda_call(pca_res$x[, kept_idx, drop = FALSE], as.factor(y_labels), min_n_pcs = min_pcs_for_lda)
+    if (is.null(lda_res)) {
+      stop("[LDA] LDA could not be recomputed after PC reduction")
+    }
+    R <- pca_res$rotation[, kept_idx, drop = FALSE]
+  } else {
+    R <- pca_res$rotation[, 1:n_pcs, drop = FALSE]
+  }
+
   W_pc <- lda_res$scaling
-  R <- pca_res$rotation[, 1:n_pcs, drop=FALSE]
   W_std <- R %*% W_pc
   
   svd <- lda_res$svd
   prop <- svd / sum(svd)
   
-  if (ncol(W_std) > 1) {
-    n_dim <- min(length(prop), ncol(W_std))
-    weights_clean <- rowSums(abs(W_std[, 1:n_dim, drop=FALSE]) %*% diag(prop[1:n_dim], nrow=n_dim))
-  } else {
-    weights_clean <- abs(W_std[, 1])
-  }
+  ## Determine whether user wants to operate in LDA space directly
+  use_lda_space <- exists("USE_LDA_SPACE_SOLVER") && isTRUE(USE_LDA_SPACE_SOLVER)
   
-  final_weights <- numeric(ncol(X_z))
-  final_weights[keep_cols] <- weights_clean
-  cat(sprintf("LDA weights (no normalization): min=%.4f, max=%.4f, mean=%.4f\n",
-      min(final_weights[final_weights > 0], na.rm=TRUE), max(final_weights, na.rm=TRUE), mean(final_weights, na.rm=TRUE)))
+  if (use_lda_space) {
+    # component weights are proportional to between-class variance explained
+    lda_basis <- W_std  # original-feature-to-LDA components mapping
+    # number of discriminant dims available
+    n_dim <- ncol(lda_basis)
+    lda_comp_weights <- prop[1:n_dim]
+    cat(sprintf("  LDA-space mode enabled: %d components, weights sum=%.3f\n", n_dim, sum(lda_comp_weights)))
 
-  return(list(
+    # Although the solver will project into LDA space and therefore ignores
+    # per-index feature weights, we still compute and return a set of final
+    # weights for use during library building / diagnostics.  This prevents
+    # downstream code from operating on an all-zero weight vector (which was
+    # causing the "weights are zero" log and useless clustering).
+    if (ncol(W_std) > 1) {
+      n_dim2 <- min(length(prop), ncol(W_std))
+      weights_clean <- rowSums(abs(W_std[, 1:n_dim2, drop=FALSE]) %*% diag(prop[1:n_dim2], nrow=n_dim2))
+    } else {
+      weights_clean <- abs(W_std[, 1])
+    }
+    final_weights <- numeric(ncol(X_z))
+    final_weights[keep_cols] <- weights_clean
+    cat(sprintf("  [INFO] computed per-index weights for diagnostics (ignored by LDA solver)\n"))
+    cat(sprintf("LDA weights (no normalization): min=%.4f, max=%.4f, mean=%.4f\n",
+        min(final_weights[final_weights > 0], na.rm=TRUE), max(final_weights, na.rm=TRUE), mean(final_weights, na.rm=TRUE)))
+  } else {
+    if (ncol(W_std) > 1) {
+      n_dim <- min(length(prop), ncol(W_std))
+      weights_clean <- rowSums(abs(W_std[, 1:n_dim, drop=FALSE]) %*% diag(prop[1:n_dim], nrow=n_dim))
+    } else {
+      weights_clean <- abs(W_std[, 1])
+    }
+    final_weights <- numeric(ncol(X_z))
+    final_weights[keep_cols] <- weights_clean
+    cat(sprintf("LDA weights (no normalization): min=%.4f, max=%.4f, mean=%.4f\n",
+        min(final_weights[final_weights > 0], na.rm=TRUE), max(final_weights, na.rm=TRUE), mean(final_weights, na.rm=TRUE)))
+  }
+
+  # Build return list; include LDA info if mode active
+  res <- list(
     means = global_means,
     sds = global_sds,
     weights = final_weights,
@@ -1866,7 +1948,13 @@ train_feature_pipeline <- function(df, class_col, feature_cols) {
     base_indices = feature_cols,
     l2_normalize = l2_only_mode,
     zscore_applied = apply_zscore
-  ))
+  )
+  if (exists("use_lda_space") && isTRUE(use_lda_space)) {
+    res$lda_basis <- lda_basis
+    res$lda_component_weights <- lda_comp_weights
+    res$use_lda_space <- TRUE
+  }
+  return(res)
 }
 
 doy_to_pentad <- function(doy) {
@@ -1971,7 +2059,7 @@ build_pentad_matrix <- function(dly_year, avail_idx, interpolate = TRUE) {
  
 
 
-# PCA-LDA weights are applied only in the solver via feature_weights.
+
 
 
 .run_map <- function(X, FUN, show_pb = TRUE) {
@@ -3496,7 +3584,49 @@ load_and_prepare_inference_data <- function() {
   # E: Features x Endmembers matrix
   # Y: Samples x Features matrix
   # Returns: Samples x Endmembers weight matrix
-  solve_batch_fcls <- function(E, Y, feature_weights = NULL) {
+  solve_batch_fcls <- function(E, Y,
+                                  feature_weights = NULL,
+                                  lda_basis = NULL,
+                                  lda_component_weights = NULL,
+                                  solver = "fcls",
+                                  sparse_k = if (exists("SPARSE_UNMIX_K")) SPARSE_UNMIX_K else 3,
+                                  iwlmm_iters = 3) {
+    # possible solvers: "fcls" (default), "sparse", "iwlmm"
+    # lda options as before
+    if (!is.null(lda_basis)) {
+      # save original for missing-data reliability
+      Y_orig <- Y
+      E <- t(lda_basis) %*% E
+      Y_t <- t(Y)
+      Y_t <- t(lda_basis) %*% Y_t
+      Y <- t(Y_t)
+      if (!is.null(lda_component_weights)) {
+        feature_weights <- lda_component_weights
+      } else {
+        feature_weights <- NULL
+      }
+      # compute reliability weights whenever any input features are missing
+      # (this is mandatory when projecting to LDA space)
+      if (any(!is.finite(Y_orig))) {
+        absA <- abs(lda_basis)
+        denom <- colSums(absA)
+        # avoid zero denom
+        denom[denom == 0] <- 1
+        # construct matrix of reliabilities
+        rel_mat <- matrix(0, nrow = nrow(Y_orig), ncol = ncol(absA))
+        for (k in seq_len(nrow(Y_orig))) {
+          valid <- is.finite(Y_orig[k, ])
+          if (any(valid)) {
+            rel_mat[k, ] <- colSums(absA[valid, , drop = FALSE]) / denom
+          } else {
+            rel_mat[k, ] <- 0
+          }
+        }
+        # apply to projected data
+        Y <- Y * rel_mat
+      }
+    }
+
     if (is.null(E) || ncol(E) < 1) return(NULL)
     n_endmembers <- ncol(E)
     n_samples <- nrow(Y)
@@ -3505,69 +3635,88 @@ load_and_prepare_inference_data <- function() {
     # Convert Y to Features x Samples for matrix math
     Y_t <- t(Y)
 
-    # Determine E and Y used for fitting (weighted or raw)
-    if (!is.null(feature_weights) && length(feature_weights) == nrow(E)) {
-      w <- pmax(feature_weights, 0)
-      w[!is.finite(w)] <- 0
-
-      # Apply weights directly: E_w = W * E, Y_w = W * Y
-      # Since W is diagonal, just multiply rows
-      E_fit <- E * w
-      Y_fit <- Y_t * w
-    } else {
-      E_fit <- E
-      Y_fit <- Y_t
-    }
-
-    # Precompute constant QP matrices
-    # Dmat = 2 * E'E
-    Dmat <- 2 * crossprod(E_fit)
-
-    # Scale QP problem to improve numerical stability for quadprog
-    qp_scale <- mean(diag(Dmat))
-    if(is.na(qp_scale) || qp_scale < 1e-12) qp_scale <- 1.0
-
-    Dmat <- Dmat / qp_scale
-
-    # Add stronger ridge
-    ridge <- 1e-6 # Relative to scaled matrix
-    Dmat <- Dmat + diag(n_endmembers) * ridge
-    # Ensure symmetric
-    Dmat <- (Dmat + t(Dmat)) / 2
-
-    # Amat: [1s; I]
-    Amat <- cbind(rep(1, n_endmembers), diag(n_endmembers))
-    bvec <- c(1, rep(0, n_endmembers))
-
-    # Precompute all linear terms: dvec = 2 * E'y
-    # Dvecs: Endmembers x Samples
-    # Must also be scaled by same factor
-    Dvecs <- (2 * crossprod(E_fit, Y_fit)) / qp_scale
-
-    w_out <- matrix(0, nrow=n_samples, ncol=n_endmembers)
-
-    # Loop over samples - solve.QP is fast when Dmat is precomputed
-    for(i in 1:n_samples) {
-      dvec <- Dvecs[, i]
-
-      res <- tryCatch({
-        quadprog::solve.QP(Dmat, dvec, Amat, bvec, meq=1)
-      }, error = function(e) {
-        e
-      })
-
-      if(!inherits(res, "error")) {
-        w <- res$solution
-        w[!is.finite(w)] <- 0
-        w[w < 0] <- 0
-        s <- sum(w)
-        if(s > 0) w <- w / s else w <- rep(1/n_endmembers, n_endmembers)
-        w_out[i, ] <- w
-      } else {
-        stop(sprintf("[QP] quadprog::solve.QP failed in solve_batch_fcls (sample %d/%d): %s", i, n_samples, res$message))
+    # helper: run standard fcls QP and return weight matrix
+    run_fcls <- function(E_fit, Y_fit, wts) {
+      Dmat <- 2 * crossprod(E_fit)
+      qp_scale <- mean(diag(Dmat))
+      if(is.na(qp_scale) || qp_scale < 1e-12) qp_scale <- 1.0
+      Dmat <- Dmat / qp_scale
+      ridge <- 1e-6
+      Dmat <- Dmat + diag(n_endmembers) * ridge
+      Dmat <- (Dmat + t(Dmat)) / 2
+      Amat <- cbind(rep(1, n_endmembers), diag(n_endmembers))
+      bvec <- c(1, rep(0, n_endmembers))
+      Dvecs <- (2 * crossprod(E_fit, Y_fit)) / qp_scale
+      w_out <- matrix(0, nrow=n_samples, ncol=n_endmembers)
+      for(i in 1:n_samples) {
+        dvec <- Dvecs[, i]
+        res <- tryCatch({
+          quadprog::solve.QP(Dmat, dvec, Amat, bvec, meq=1)
+        }, error = function(e) e)
+        if(!inherits(res, "error")) {
+          w <- res$solution
+          w[!is.finite(w)] <- 0
+          w[w < 0] <- 0
+          s <- sum(w)
+          if(s > 0) w <- w / s else w <- rep(1/n_endmembers, n_endmembers)
+          w_out[i, ] <- w
+        } else {
+          stop(sprintf("[QP] quadprog::solve.QP failed: %s", res$message))
+        }
       }
+      w_out
     }
-    return(w_out)
+
+    # determine E_fit and Y_fit based on feature_weights
+    if (!is.null(feature_weights) && length(feature_weights) == nrow(E)) {
+      w <- pmax(feature_weights, 0); w[!is.finite(w)] <- 0
+      E_fit_base <- E * w
+      Y_fit_base <- Y_t * w
+    } else {
+      E_fit_base <- E
+      Y_fit_base <- Y_t
+    }
+
+    if (solver == "fcls") {
+      return(run_fcls(E_fit_base, Y_fit_base, feature_weights))
+    } else if (solver == "sparse") {
+      # start from ordinary fcls then sparsify each sample
+      Wmat <- run_fcls(E_fit_base, Y_fit_base, feature_weights)
+      for(i in 1:nrow(Wmat)) {
+        wi <- Wmat[i, ]
+        order_idx <- order(wi, decreasing = TRUE)
+        keep <- order_idx[1:min(sparse_k, length(order_idx))]
+        wi[-keep] <- 0
+        s <- sum(wi)
+        if(s > 0) wi <- wi / s
+        Wmat[i, ] <- wi
+      }
+      return(Wmat)
+    } else if (solver == "iwlmm") {
+      # iterative weighted least-mean method: reweight samples by magnitude
+      Wmat <- run_fcls(E_fit_base, Y_fit_base, feature_weights)
+      for(iter in 1:iwlmm_iters) {
+        # compute weights inversely proportional to current coeff abs
+        wgt <- 1 / (abs(Wmat) + 1e-6)
+        # apply per-feature weighting; average across samples for diagonal
+        feat_w <- colMeans(wgt)
+        if (!is.null(feature_weights)) {
+          feat_w <- feat_w * feature_weights
+        }
+        # re-run fcls with updated feature weights
+        if (!is.null(feat_w)) {
+          E_fit <- E * feat_w
+          Y_fit <- Y_t * feat_w
+        } else {
+          E_fit <- E
+          Y_fit <- Y_t
+        }
+        Wmat <- run_fcls(E_fit, Y_fit, feat_w)
+      }
+      return(Wmat)
+    } else {
+      stop(sprintf("Unknown solver '%s' requested", solver))
+    }
   }
 
 
@@ -4169,7 +4318,18 @@ load_and_prepare_inference_data <- function() {
           n_test <- nrow(Y_test)
 
           # Batch process using solve_batch_fcls for speed
-          all_coefs <- solve_batch_fcls(M, Y_test, params$weights)
+          solver_mode <- if (!is.null(params$solver)) params$solver else "fcls"
+          if (!is.null(params) && !is.null(params$use_lda_space) && isTRUE(params$use_lda_space)) {
+            all_coefs <- solve_batch_fcls(M, Y_test,
+                                          feature_weights = NULL,
+                                          lda_basis = params$lda_basis,
+                                          lda_component_weights = params$lda_component_weights,
+                                          solver = solver_mode)
+          } else {
+            all_coefs <- solve_batch_fcls(M, Y_test,
+                                          params$weights,
+                                          solver = solver_mode)
+          }
 
           # Compute average correctly predicted fraction for vegetation classes
           # Row-normalized after barren subtraction: veg_frac_true / sum(veg_fracs)
@@ -4719,6 +4879,12 @@ print_weights_summary <- function(stage_name, params) {
     return(invisible(NULL))
   }
 
+  # LDA-space special reporting
+  if (!is.null(params$use_lda_space) && isTRUE(params$use_lda_space)) {
+    cat(sprintf("[WEIGHTS %s] LDA-space mode active; component weights: %s\n", stage_name,
+                paste(sprintf("%.4f", params$lda_component_weights), collapse=", ")))
+  }
+
   n_indices <- length(params$indices)
   wlen <- length(params$weights)
   expected <- n_indices * TEMPORAL_BUDGET
@@ -4798,6 +4964,17 @@ print_weights_summary <- function(stage_name, params) {
   # Step 1: Initial PCA-LDA training on model data (excluding OOB)
   cat("\n=== STEP 1: Initial PCA-LDA Training (on model data, excluding OOB) ===\n")
   MESMA_PARAMS_INITIAL <- train_feature_pipeline(multi_class_data, "target_class", avail)
+  # set solver mode from config default if not already defined
+  if (!is.null(MESMA_PARAMS_INITIAL) && is.null(MESMA_PARAMS_INITIAL$solver)) {
+    MESMA_PARAMS_INITIAL$solver <- if (exists("DEFAULT_UNMIX_SOLVER")) DEFAULT_UNMIX_SOLVER else "fcls"
+  }
+  # override with global toggles if requested
+  if (exists("USE_SPARSE_UNMIXING") && isTRUE(USE_SPARSE_UNMIXING)) {
+    MESMA_PARAMS_INITIAL$solver <- "sparse"
+  }
+  if (exists("USE_IWLMM") && isTRUE(USE_IWLMM)) {
+    MESMA_PARAMS_INITIAL$solver <- "iwlmm"
+  }
 
   if (!is.null(MESMA_PARAMS_INITIAL) && !is.null(MESMA_PARAMS_INITIAL$weights)) {
     MESMA_PARAMS_INITIAL$weights[is.na(MESMA_PARAMS_INITIAL$weights)] <- 0
@@ -4825,6 +5002,8 @@ print_weights_summary <- function(stage_name, params) {
   # IMPORTANT: This step does NOT run permutation tests anymore.
   # It only loads p-values from permutation_importance_results.csv and optimizes
   # (index_alpha, pentad_alpha) via grid search on OOB + training evaluation.
+  # If the CSV is absent the script will simply warn and continue using the
+  # full feature set (no pruning) rather than aborting.
   pruned_indices <- avail
   MESMA_PARAMS <- MESMA_PARAMS_INITIAL
 
@@ -4832,52 +5011,51 @@ print_weights_summary <- function(stage_name, params) {
       !is.null(MESMA_PARAMS_INITIAL) && !is.null(MESMA_PARAMS_INITIAL$weights)) {
     perm_path <- "permutation_importance_results.csv"
     if (!file.exists(perm_path)) {
-      stop(sprintf("Missing '%s'. Alpha-grid pruning requires precomputed permutation p-values.", perm_path))
-    }
+      cat(sprintf("[WARN] '%s' not found; skipping alpha-grid pruning. Using full feature set.\n", perm_path))
+    } else {
+      perm_results <- tryCatch({
+        read.csv(perm_path, stringsAsFactors = FALSE)
+      }, error = function(e) {
+        stop(sprintf("Failed to read '%s': %s", perm_path, e$message))
+      })
 
-    perm_results <- tryCatch({
-      read.csv(perm_path, stringsAsFactors = FALSE)
-    }, error = function(e) {
-      stop(sprintf("Failed to read '%s': %s", perm_path, e$message))
-    })
-
-    if (!"p_value" %in% names(perm_results) || !"index" %in% names(perm_results)) {
-      stop(sprintf("'%s' must contain columns: index, p_value (and ideally stage, pentad)", perm_path))
-    }
-
-    # Use feature list from params for pruning
-    perm_indices <- if (!is.null(MESMA_PARAMS_INITIAL$indices)) MESMA_PARAMS_INITIAL$indices else avail
-
-    # Split permutation results into index-level and pentad-level tables
-    if (!"stage" %in% names(perm_results)) {
-      perm_results$stage <- if ("pentad" %in% names(perm_results) && any(is.finite(suppressWarnings(as.numeric(perm_results$pentad))))) "pentad" else "index"
-    }
-
-    index_results <- perm_results[tolower(perm_results$stage) == "index", , drop = FALSE]
-    if (nrow(index_results) == 0) {
-      # Fallback: treat rows with missing pentad as index-level
-      if ("pentad" %in% names(perm_results)) {
-        idx_mask <- is.na(suppressWarnings(as.numeric(perm_results$pentad)))
-        index_results <- perm_results[idx_mask, , drop = FALSE]
+      if (!"p_value" %in% names(perm_results) || !"index" %in% names(perm_results)) {
+        stop(sprintf("'%s' must contain columns: index, p_value (and ideally stage, pentad)", perm_path))
       }
-    }
-    if (nrow(index_results) == 0) {
-      stop(sprintf("'%s' contains no index-level rows (stage=='index' or pentad missing).", perm_path))
-    }
 
-    # Keep only indices present in current run
-    index_results$index <- as.character(index_results$index)
-    index_results <- index_results[index_results$index %in% perm_indices & is.finite(as.numeric(index_results$p_value)), , drop = FALSE]
+      # Use feature list from params for pruning
+      perm_indices <- if (!is.null(MESMA_PARAMS_INITIAL$indices)) MESMA_PARAMS_INITIAL$indices else avail
 
-    # Pentad-level results
-    pentad_results <- perm_results[tolower(perm_results$stage) == "pentad", , drop = FALSE]
-    if (nrow(pentad_results) == 0 && "pentad" %in% names(perm_results)) {
-      # Fallback: any finite pentad is treated as pentad-level
-      pj <- suppressWarnings(as.integer(perm_results$pentad))
-      pentad_results <- perm_results[is.finite(pj), , drop = FALSE]
-      pentad_results$pentad <- pj[is.finite(pj)]
-    }
-    if (nrow(pentad_results) > 0) {
+      # Split permutation results into index-level and pentad-level tables
+      if (!"stage" %in% names(perm_results)) {
+        perm_results$stage <- if ("pentad" %in% names(perm_results) && any(is.finite(suppressWarnings(as.numeric(perm_results$pentad))))) "pentad" else "index"
+      }
+
+      index_results <- perm_results[tolower(perm_results$stage) == "index", , drop = FALSE]
+      if (nrow(index_results) == 0) {
+        # Fallback: treat rows with missing pentad as index-level
+        if ("pentad" %in% names(perm_results)) {
+          idx_mask <- is.na(suppressWarnings(as.numeric(perm_results$pentad)))
+          index_results <- perm_results[idx_mask, , drop = FALSE]
+        }
+      }
+      if (nrow(index_results) == 0) {
+        stop(sprintf("'%s' contains no index-level rows (stage=='index' or pentad missing).", perm_path))
+      }
+
+      # Keep only indices present in current run
+      index_results$index <- as.character(index_results$index)
+      index_results <- index_results[index_results$index %in% perm_indices & is.finite(as.numeric(index_results$p_value)), , drop = FALSE]
+
+      # Pentad-level results
+      pentad_results <- perm_results[tolower(perm_results$stage) == "pentad", , drop = FALSE]
+      if (nrow(pentad_results) == 0 && "pentad" %in% names(perm_results)) {
+        # Fallback: any finite pentad is treated as pentad-level
+        pj <- suppressWarnings(as.integer(perm_results$pentad))
+        pentad_results <- perm_results[is.finite(pj), , drop = FALSE]
+        pentad_results$pentad <- pj[is.finite(pj)]
+      }
+      if (nrow(pentad_results) > 0) {
       pentad_results$index <- as.character(pentad_results$index)
       pentad_results$pentad <- suppressWarnings(as.integer(pentad_results$pentad))
       pentad_results$p_value <- suppressWarnings(as.numeric(pentad_results$p_value))
@@ -4941,7 +5119,17 @@ print_weights_summary <- function(stage_name, params) {
     }
 
     compute_score_from_Y <- function(E, col_names, Y, labels, unique_classes, weights) {
-      all_coefs <- solve_batch_fcls(E, Y, weights)
+      # if MESMA_PARAMS_INITIAL requests LDA-space solving, forward basis/weights
+      if (exists("MESMA_PARAMS_INITIAL") && !is.null(MESMA_PARAMS_INITIAL$use_lda_space) &&
+          isTRUE(MESMA_PARAMS_INITIAL$use_lda_space)) {
+        all_coefs <- solve_batch_fcls(E, Y,
+                                      feature_weights = NULL,
+                                      lda_basis = MESMA_PARAMS_INITIAL$lda_basis,
+                                      lda_component_weights = MESMA_PARAMS_INITIAL$lda_component_weights)
+      } else {
+        all_coefs <- solve_batch_fcls(E, Y,
+                                      weights)
+      }
       if (is.null(all_coefs)) stop("[ALPHA OPT] FCLS solver returned NULL")
 
       veg_classes <- setdiff(unique_classes, "barren")
@@ -5267,7 +5455,18 @@ print_weights_summary <- function(stage_name, params) {
       if (!is.null(pruned_info) && !is.null(pruned_info$kept_idx)) {
         w <- w[pruned_info$kept_idx]
       }
-      all_coefs <- solve_batch_fcls(E, Y, w)
+      solver_mode <- if (!is.null(MESMA_PARAMS$solver)) MESMA_PARAMS$solver else "fcls"
+      if (!is.null(MESMA_PARAMS$use_lda_space) && isTRUE(MESMA_PARAMS$use_lda_space)) {
+        all_coefs <- solve_batch_fcls(E, Y,
+                                      feature_weights = NULL,
+                                      lda_basis = MESMA_PARAMS$lda_basis,
+                                      lda_component_weights = MESMA_PARAMS$lda_component_weights,
+                                      solver = solver_mode)
+      } else {
+        all_coefs <- solve_batch_fcls(E, Y,
+                                      w,
+                                      solver = solver_mode)
+      }
       if (is.null(all_coefs)) return(invisible(NULL))
 
       # 4. Aggregate coefficients by class and build confusion matrix
@@ -8292,3 +8491,5 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
   ))
 
   cat("\nMESMA fitting completed successfully!\n")
+
+}  # end report_validation_accuracy (and related processing blocks)

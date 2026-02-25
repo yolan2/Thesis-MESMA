@@ -70,20 +70,30 @@ if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
 # Load the phenology data
 cat("Loading data from:", INPUT_CSV, "\n")
 df <- readr::read_csv(INPUT_CSV, show_col_types = FALSE)
-# Exclude years 1992-1999 from plotting and analysis (if present)
-if ("date" %in% names(df)) {
-  if (!lubridate::is.Date(df$date)) df$date <- as.Date(df$date)
-  n_before <- nrow(df)
-  years_to_drop <- 1992:1999
-  df <- df[!(lubridate::year(df$date) %in% years_to_drop), , drop = FALSE]
-  if (n_before != nrow(df)) cat(sprintf("[DATA FILTER] Dropped %d rows from years %d-%d from input in plotting script\n", n_before - nrow(df), min(years_to_drop), max(years_to_drop)))
-} else if ("year" %in% names(df)) {
-  n_before <- nrow(df)
-  years_to_drop <- 1992:1999
-  df <- df[!(as.integer(df$year) %in% years_to_drop), , drop = FALSE]
-  if (n_before != nrow(df)) cat(sprintf("[DATA FILTER] Dropped %d rows from years %d-%d from input in plotting script (using 'year' column)\n", n_before - nrow(df), min(years_to_drop), max(years_to_drop)))
+# optionally filter out the problematic pre-2000 interval.  controlled by
+# the same global variable used by january_averages.R; define it here if
+# missing so the script can run standalone.  The default is now FALSE so all
+# years appear in plots unless the user explicitly opts in to exclusion.
+if (!exists("EXCLUDE_PRE2000", inherits = TRUE)) EXCLUDE_PRE2000 <- FALSE
+
+if (isTRUE(EXCLUDE_PRE2000)) {
+  # Exclude years 1992-1999 from plotting and analysis (if present)
+  if ("date" %in% names(df)) {
+    if (!lubridate::is.Date(df$date)) df$date <- as.Date(df$date)
+    n_before <- nrow(df)
+    years_to_drop <- 1992:1999
+    df <- df[!(lubridate::year(df$date) %in% years_to_drop), , drop = FALSE]
+    if (n_before != nrow(df)) cat(sprintf("[DATA FILTER] Dropped %d rows from years %d-%d from input in plotting script\n", n_before - nrow(df), min(years_to_drop), max(years_to_drop)))
+  } else if ("year" %in% names(df)) {
+    n_before <- nrow(df)
+    years_to_drop <- 1992:1999
+    df <- df[!(as.integer(df$year) %in% years_to_drop), , drop = FALSE]
+    if (n_before != nrow(df)) cat(sprintf("[DATA FILTER] Dropped %d rows from years %d-%d from input in plotting script (using 'year' column)\n", n_before - nrow(df), min(years_to_drop), max(years_to_drop)))
+  } else {
+    # No date/year column available; nothing to drop
+  }
 } else {
-  # No date/year column available; nothing to drop
+  cat("[DATA FILTER] EXCLUDE_PRE2000 is FALSE; plotting will include all years\n")
 }
 
 # --- Location ID and Join Logic (Copied from january_averages.R) ---
@@ -250,7 +260,7 @@ cat("Generating plot...\n")
 
 p <- ggplot(ppi_summary, aes(x = date, y = mean_PPI, color = Veg, fill = Veg)) +
   add_excluded_years_shade(is_date = TRUE) + add_year_lines(is_date = TRUE) +
-  geom_line(size = 1) +
+  geom_line(linewidth = 1) +
   geom_ribbon(aes(ymin = mean_PPI - se_PPI, ymax = mean_PPI + se_PPI), alpha = 0.2, color = NA) +
   labs(title = "Average Plant Phenology Index (PPI) over Time by Vegetation Type",
        subtitle = "Shaded area represents Standard Error",
