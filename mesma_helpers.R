@@ -62,7 +62,6 @@ analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor,
   all_vecs <- list()
   all_nsamples <- numeric()
 
-  diag_count <- 0
   for (veg in names(mesma_lib)) {
     if (is.null(mesma_lib[[veg]])) next
     # Try to access raw_lib_templates from global environment for fallback
@@ -118,14 +117,6 @@ analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor,
          vec[!is.finite(vec)] <- NA_real_
       }
 
-      # Diagnostic for the first few attempts
-      if (diag_count < 5 && exists("TESTING_MODE") && isTRUE(TESTING_MODE)) {
-         cat(sprintf("[DIAGNOSTIC] Checking veg='%s', vid='%s' -> Found? %s\n", veg, vid, !is.null(vec)))
-         if (is.na(vid) || vid == "NA") {
-             cat(sprintf("   [DEBUG] variant class: %s, names: %s\n", class(variant), paste(names(variant), collapse=", ")))
-         }
-         diag_count <- diag_count + 1
-      }
 
       if (!is.null(vec) && length(vec) > 0 && !is.na(vid)) {
         all_vecs[[length(all_vecs) + 1]] <- as.numeric(vec)
@@ -262,55 +253,6 @@ analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor,
   }, error = function(e) {
     cat(sprintf("[ERROR] Failed to generate similarity heatmap: %s\n", e$message))
   })
-
-  # --- Detect high-similarity populus/tamarix variants (cross-class similarity > 0.95) ---
-  # These variants are spectrally indistinguishable and should be labeled as "woody_unknown"
-  WOODY_CROSS_SIM_THRESHOLD <- 0.95
-  populus_indices <- which(tolower(all_vegs) == "populus")
-  tamarix_indices <- which(tolower(all_vegs) == "tamarix")
-
-  woody_unknown_variants <- character(0)
-
-  if (length(populus_indices) > 0 && length(tamarix_indices) > 0) {
-    cat(sprintf("\n[CROSS-CLASS SIMILARITY] Checking %d populus vs %d tamarix variants (threshold: %.2f)\n",
-                length(populus_indices), length(tamarix_indices), WOODY_CROSS_SIM_THRESHOLD))
-
-    # Extract cross-class similarities from the similarity matrix
-    for (p_idx in populus_indices) {
-      for (t_idx in tamarix_indices) {
-        sim_val <- sim_mat[p_idx, t_idx]
-        if (!is.na(sim_val) && sim_val > WOODY_CROSS_SIM_THRESHOLD) {
-          # Both variants are indistinguishable - add both to woody_unknown list
-          p_id <- all_ids[p_idx]
-          t_id <- all_ids[t_idx]
-          if (!(p_id %in% woody_unknown_variants)) {
-            woody_unknown_variants <- c(woody_unknown_variants, p_id)
-            cat(sprintf("  - %s (populus) has similarity %.3f with %s (tamarix)\n", p_id, sim_val, t_id))
-          }
-          if (!(t_id %in% woody_unknown_variants)) {
-            woody_unknown_variants <- c(woody_unknown_variants, t_id)
-            cat(sprintf("  - %s (tamarix) has similarity %.3f with %s (populus)\n", t_id, sim_val, p_id))
-          }
-        }
-      }
-    }
-
-    if (length(woody_unknown_variants) > 0) {
-      cat(sprintf("[CROSS-CLASS SIMILARITY] Found %d variants with cross-class similarity > %.2f\n",
-                  length(woody_unknown_variants), WOODY_CROSS_SIM_THRESHOLD))
-      cat(sprintf("  Variants: %s\n", paste(woody_unknown_variants, collapse = ", ")))
-    } else {
-      cat(sprintf("[CROSS-CLASS SIMILARITY] No populus/tamarix variants exceed similarity threshold of %.2f\n",
-                  WOODY_CROSS_SIM_THRESHOLD))
-    }
-  } else {
-    cat("[CROSS-CLASS SIMILARITY] Skipping: need both populus and tamarix variants present\n")
-  }
-
-  # Store in global environment for use during MESMA fitting
-  assign("WOODY_UNKNOWN_VARIANTS", woody_unknown_variants, envir = globalenv())
-  cat(sprintf("[CROSS-CLASS SIMILARITY] Assigned WOODY_UNKNOWN_VARIANTS to global env (%d variants)\n",
-              length(woody_unknown_variants)))
 
   # == AGENT FIX: Print #loc-years per variant ==
   cat("\n=== VARIANT SAMPLE SIZES (Loc-Years) ===\n")
@@ -464,8 +406,8 @@ set_mesma_seed <- function(base = NULL, announce = TRUE, set_env_vars = TRUE) {
   try({ RNGkind("L'Ecuyer-CMRG") }, silent = TRUE)
   set.seed(base)
 
+  # record seed in options and a global variable for compatibility
   options(mesma.seed = base)
-  # keep legacy code working: many places check for a global 'seed'
   assign("seed", base, envir = globalenv())
 
   # Ensure common env vars used by scripts are seeded (if not explicitly provided)
@@ -530,23 +472,6 @@ canonicalize_veg_labels <- function(df, veg_col = NULL) {
   df
 }
 
-# --- Woody aggregation helper for bootstrap results --------------------------
-# Sums bootstrap matrices for populus + tamarix + woody_unknown into a "woody" category.
-# `veg_boot_res` is a named list of [B x n_years] matrices. Modifies in place and returns.
-aggregate_woody_bootstrap <- function(veg_boot_res, label = "BOOTSTRAP") {
-  woody_types <- c("populus", "tamarix", "woody_unknown")
-  woody_mats <- veg_boot_res[tolower(names(veg_boot_res)) %in% woody_types]
-  if (length(woody_mats) >= 1) {
-    woody_mat <- Reduce(`+`, lapply(woody_mats, function(m) { m[is.na(m)] <- 0; m }))
-    all_na_mask <- Reduce(`&`, lapply(woody_mats, is.na))
-    woody_mat[all_na_mask] <- NA_real_
-    colnames(woody_mat) <- colnames(woody_mats[[1]])
-    veg_boot_res[["woody"]] <- woody_mat
-    cat(sprintf("[%s] Added 'woody' category (populus + tamarix + woody_unknown) with combined bootstrap CIs\n", label))
-  }
-  veg_boot_res
-}
-
 # --- Bootstrap results compilation helper ------------------------------------
 # Compiles a list of [B x n_years] bootstrap matrices into a single data.frame
 # with columns: year, Veg, global_coef, se, coef_025, coef_975, method, n_locations.
@@ -598,3 +523,39 @@ backup_and_normalize_ppi <- function(df, ppi_max, label = "") {
   df
 }
 
+
+# Compute a per-location DVI soil baseline for PPI.
+# Baseline is defined as the median of the lowest quantile_p fraction of DVI
+# observations within each location. This is deterministic, per-location,
+# and avoids any constant/default soil baseline.
+compute_dvi_soil_per_location <- function(df, quantile_p = 0.10, min_samples = 5L) {
+  stopifnot(!is.null(df), nrow(df) > 0L, "location_id" %in% names(df))
+  if (!"DVI" %in% names(df) && all(c("nir", "red") %in% names(df))) {
+    df <- df %>% dplyr::mutate(DVI = as.numeric(nir) - as.numeric(red))
+  }
+  stopifnot("DVI" %in% names(df))
+
+  soil_df <- df %>%
+    dplyr::filter(is.finite(DVI)) %>%
+    dplyr::group_by(location_id) %>%
+    dplyr::filter(dplyr::n() >= min_samples) %>%
+    dplyr::summarise(
+      dvi_soil = {
+        vals <- DVI
+        q <- suppressWarnings(quantile(vals, probs = quantile_p,
+                                       na.rm = TRUE, names = FALSE, type = 7))
+        median(vals[vals <= q], na.rm = TRUE)
+      },
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(is.finite(dvi_soil))
+
+  out <- df %>% dplyr::left_join(soil_df, by = "location_id") %>% dplyr::pull(dvi_soil)
+  if (any(is.na(out) & is.finite(df$DVI))) {
+    bad_locs <- unique(as.character(df$location_id[is.na(out) & is.finite(df$DVI)]))
+    stop(sprintf("[PPI] Cannot compute per-location dvi_soil for %d rows across %d locations (example locs: %s)",
+                 sum(is.na(out) & is.finite(df$DVI)), length(bad_locs),
+                 paste(head(bad_locs, 10), collapse = ", ")))
+  }
+  out
+}

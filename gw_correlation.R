@@ -466,12 +466,6 @@ if(length(corr_list) > 0) {
   message('No correlation tables to write to Excel.')
 }
 
-# remove legacy per-variable trend plots if present (user requested removal of trend_gw / trend_inf)
-legacy_trend_files <- list.files(out_dir, pattern = '^trend_(gw|inf)_', full.names = TRUE)
-if(length(legacy_trend_files) > 0) {
-  file.remove(legacy_trend_files)
-  message('Removed legacy trend files: ', paste(basename(legacy_trend_files), collapse = ', '))
-}
 
 # list generated files for user convenience
 files <- list.files(out_dir, full.names = TRUE)

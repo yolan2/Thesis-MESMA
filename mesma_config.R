@@ -4,8 +4,6 @@
 # This file is sourced early in the pipeline and provides all tunable parameters,
 # logging, and parallel backend setup used by downstream modules.
 
-# Debug logging stub (no-op; legacy call sites remain harmless)
-write_debug <- function(...) { invisible(NULL) }
 
 # --- Logging ---
 log_msg <- function(...) {
@@ -52,25 +50,16 @@ setup_parallel_backend <- function(workers = NULL) {
 # GLOBAL CONSTANTS
 # =============================================================================
 
-INPUT_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_train (2).csv"
+INPUT_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_train (3).csv"
                                  # Path to the input CSV used for training. Replace with your own file path.
-INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_mid (1).csv"
+INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_low (3).csv"
                                  # Path for spatial inference input (set to NA to disable inference steps).
-                                 #
-                                 # When the script is invoked with an environment variable
-                                 # MESMA_INFERENCE_CSV, that path will override this value.
-                                 # You may also provide a directory path or a comma-separated
-                                 # list of CSV files; the pipeline will treat each file as a
-                                 # separate inference run and process them sequentially.  An
-                                 # alternate environment variable MESMA_INFERENCE_DIR may be
-                                 # used to specify a folder containing CSVs.  This makes
-                                 # "batch mode" the default when working with multiple inputs.
 
 
 # Training year selection
 # If you only want to build variants using the most recent data, set TRAIN_YEARS to a single year (e.g., 2024) or a vector of years.
-TRAIN_YEARS <- 2024  # Years to use for training (inclusive)
-# Quiet mode suppresses verbose informational/debug printing when TRUE
+TRAIN_YEARS <- c(2023, 2024)  # Years to use for training (inclusive)
+# Quiet mode suppresses verbose informational printing when TRUE
 # Set to TRUE to reduce console noise (useful for CI or large runs)
 QUIET_MODE <- TRUE
 
@@ -94,11 +83,11 @@ ALLOWED_VEG <- c("populus", "tamarix", "herbs")
 
 # Index defaults
 OPTIMAL_INDICES <- c(
-  "PSRI", "NDMI", "EVI",
-  "NDTI", "BSI", "TCW", "TCB",
-  # Complementary indices (measure different properties than the core set)
-  "MSI",   # moisture stress (SWIR1/NIR)
-  "SIPI"  # pigment ratio (structure-insensitive)
+  "EVI",      # Enhanced Vegetation Index (requires blue)
+  "PSRI",     # Plant Senescence Reflectance Index (requires blue)
+  "NDMI",     # moisture / water index (NIR-SWIR1)
+  "NDTI",     # SWIR1-SWIR2 difference
+  "MSI"       # moisture stress (SWIR1/NIR)
 )
                                  # Suggested default indices to include in fitting; add or remove indices depending on sensor and quality.
 
@@ -108,16 +97,15 @@ OUTLIER_MAD_THRESHOLD <- 3.5     # How aggressively to trim outliers (higher -> 
 OUTLIER_SPLINE_MAX_DF <- 10L     # Max degrees-of-freedom for spline trend in outlier detection (caps wiggliness)
 
 # Prototype plot options
+# When feature_weights are provided during plotting, the background of each
+# temporal bin will be shaded darker proportional to the relative weight
+# (higher weight = darker).  This highlights the most significant bins.
 GENERATE_PROTO_PLOTS <- TRUE     # Turn on to save one plot per prototype (useful for inspection; can generate many files)
 GENERATE_PROTO_PLOTS_VARIANTS_ONLY <- TRUE  # Also save a variants-only version (no median overlays)
 
 # Run / testing flags
 # Training enabled by default (do not permanently disable training here)
-# Testing mode disabled for production runs: TESTING_MODE set to FALSE
-TESTING_MODE <- FALSE  # Do not set to TRUE in production; reserved for manual debugging only
 
-# Explicitly disable DEBUG to prevent accidental verbose debugging in production
-DEBUG <- FALSE
 
 
 # -----------------------------------------------------------------------------
@@ -147,12 +135,11 @@ MAX_INFERENCE_LOCATIONS <- 2000L # Max locations processed per inference CSV fil
 #       fallback when the variogram cannot be estimated (too few locations, etc.).
 ENABLE_SPATIAL_BLOCK_BOOTSTRAP <- TRUE
 BOOTSTRAP_BLOCK_KM <- 30.0            # Fallback block width (km) used only when variogram estimation fails.
-BOOTSTRAP_BLOCK_MAX_MISSING_FRAC <- 0.20  # If > this fraction of locations lack coords, fall back to i.i.d. bootstrap.
+BOOTSTRAP_BLOCK_MAX_MISSING_FRAC <- 0.30  # If > this fraction of locations lack coords, fall back to i.i.d. bootstrap.
 
 # Uncertainty handling
 ENABLE_UNCERTAINTY <- TRUE       # Turn off to skip expensive uncertainty estimation (bootstrap, MC propagation) for faster runs.
 ENABLE_MULTI_YEAR_BOOTSTRAP <- FALSE # If TRUE, run per-location multi-year bootstrap; set FALSE to skip for speed/stability.
-DEBUG_UNCERTAINTY <- TRUE        # Verbose diagnostics for uncertainty steps; set FALSE for quiet production runs.
 
 # MC propagation
 ENABLE_MONTE_CARLO <- TRUE       # Propagate observation noise into coefficient uncertainty via repeated unmixing draws. Disable to save time.
@@ -166,26 +153,20 @@ ENABLE_ENDMEMBER_BUNDLES <- TRUE # If TRUE, represent endmember variability as a
 # Uses the OOB validation residuals (predicted - true fractions) to add systematic prediction bias/error to MC draws
 ENABLE_OOB_FRACTION_UNCERTAINTY <- TRUE  # If TRUE, add OOB-derived fraction errors to MC draws
 
-# Huber loss for FCLS (robust to outliers)
-USE_HUBER_LOSS <- TRUE         # If TRUE, use Huber loss instead of RMSE in FCLS solver (more robust to outliers)
-HUBER_DELTA <- 1.345             # Huber delta parameter (threshold for switching from L2 to L1).
-                                 # 1.345 * sigma gives 95% efficiency for Gaussian data.
-                                 # Lower values = more robust but less efficient. Higher = closer to RMSE.
-HUBER_MAX_ITER <- 20             # Max iterations for IRLS (iteratively reweighted least squares)
-HUBER_TOL <- 1e-4                # Convergence tolerance for IRLS
+# (Removed) Huber loss options for FCLS were deprecated; the solver now
+# always uses standard RMSE. The corresponding constants and flags have been
+# cleaned up to simplify configuration.
 
 # --- LDA and PCA space solver options ---------------------------------------
 #
 # USE_LDA_SPACE_SOLVER: If TRUE, projects both observations and endmembers into the LDA discriminant subspace and runs unmixing there. Component weights are the percent-of-explained between-class variance for each discriminant axis. Disables per-feature weighting in favor of LDA component weights. Mutually exclusive with USE_PCA_SPACE_SOLVER.
 #
-# USE_PCA_SPACE_SOLVER: If TRUE, projects both observations and endmembers into the PCA subspace and runs unmixing there. Component weights are the percent-of-explained variance for each principal component. Disables per-feature weighting in favor of PCA component weights. Mutually exclusive with USE_LDA_SPACE_SOLVER.
-#
 # Only one of USE_LDA_SPACE_SOLVER or USE_PCA_SPACE_SOLVER should be TRUE at a time. If both are FALSE, unmixing is performed in the original feature space with per-feature weights.
 #
 # When projecting into the LDA subspace and some input features are missing, the pipeline automatically computes a per-sample reliability weight for each discriminant axis. This downweights axes that depend heavily on unavailable features so that missing data cannot spuriously drive unmixing. This behaviour is always active whenever LDA-space solving is used.
 #
-USE_LDA_SPACE_SOLVER <- TRUE    # Toggle LDA-space unmixing on/off (default FALSE)
-ENABLE_LDA_RELIABILITY <- TRUE   # legacy synonym; no longer required
+USE_LDA_SPACE_SOLVER <- FALSE   # Toggle LDA-space unmixing on/off (default FALSE)
+# Note: LDA reliability is enabled automatically when using LDA-space solver.
 # --- IWLMM (Iteratively Weighted Linear Mixing Model) ---
 # Experimental alternate unmixing solver that perturbs endmembers within
 # bounds derived from within-class variance (Li et al. 2021).  Enabling this
@@ -193,28 +174,29 @@ ENABLE_LDA_RELIABILITY <- TRUE   # legacy synonym; no longer required
 # computational cost.  This mode can now be used together with sparse
 # unmixing; when both flags are TRUE the pipeline will run a combined solver
 # that alternates perturbation updates with a sparse coefficient solver.
-USE_IWLMM <- TRUE            # Set TRUE to enable IWLMM unmixing during MESMA
-IWLMM_MAX_ITER <- 15            # Maximum alternating optimization iterations
+USE_IWLMM <- FALSE        # Set TRUE to enable IWLMM unmixing during MESMA
+IWLMM_MAX_ITER <- 5            # Maximum alternating optimization iterations
 IWLMM_TOL <- 1e-4               # Convergence tolerance on coefficients
 IWLMM_BOUND_SIGMA <- 2.0        # Multiplier on per-feature sigma to bound perturbations
 IWLMM_REGULARIZE_DELTA <- 0.0   # Optional L2 regularization on endmember perturbations
 
+# When the iterative solver computes feature weights it can produce extreme
+# values that destabilise the QP.  These limits are applied after the normal
+# inverse-coefficient update.  Setting either bound to NA disables clamping.
+IWLMM_FEAT_W_MIN <- 0.1           # minimum allowed weight (use NA for no lower bound)
+IWLMM_FEAT_W_MAX <- 10.0          # maximum allowed weight (use NA for no upper bound)
+
 # Solver selection
-# The unmixing solver can be chosen per-run via MESMA_PARAMS$solver or the
-# environment/config variable DEFAULT_UNMIX_SOLVER.  Supported modes are:
-#   "fcls"   - standard fully constrained least squares (default)
-#   "sparse" - sparse solver retains only top-k endmembers per sample
-#   "iwlmm"  - iterative weighted linear mixing model (experimental)
-# These options may also be controlled indirectly by the flags below.
-DEFAULT_UNMIX_SOLVER <- "fcls"   # fallback solver when MESMA_PARAMS$solver unset
+DEFAULT_UNMIX_SOLVER <- "fcls"   # default fallback when MESMA_PARAMS$solver unset if IWLMM and PSRASE are not selected
 
 # Sparse mixing controls (subset selection + sparsity-aware model score)
 # When performing per-sample unmixing the default constrained QP solver may be
 # replaced by an L1-penalized regression.  The flag below controls that
-# behaviour; it is separate from the higher-level ENABLE_SPARSE_MIXING which
-# governs library search/selection.
-USE_SPARSE_UNMIXING <- TRUE     # Set TRUE to apply L1-penalized solver to every unmixing call.
-ENABLE_SPARSE_MIXING <- TRUE    # If TRUE, allow MESMA to fit sparse subsets of classes instead of forcing all classes in every mix.
+# behaviour; sparse library search/selection used to be governed by
+# ENABLE_SPARSE_MIXING, which has been removed because it had no effect.
+# Sparse subset behaviour is now driven entirely by the parameters below.
+USE_SPARSE_UNMIXING <- TRUE    # Set TRUE to apply L1-penalized solver to every unmixing call.
+# (removed) ENABLE_SPARSE_MIXING <- FALSE
 SPARSE_MIXING_LAMBDA <- 0.01     # Sparsity penalty added to score as: rmse + lambda * n_active_components.
 SPARSE_MIN_COMPONENTS <- 1L      # Minimum number of active classes allowed in sparse subset search.
 SPARSE_MAX_COMPONENTS <- 4L      # Maximum number of active classes allowed in sparse subset search.
@@ -228,7 +210,7 @@ FEATURE_PRUNING_THRESHOLD <- 0.95 # Correlation threshold above which a feature 
 
 
 # Data quality thresholds (filtering / skipping)
-MIN_OBS_PER_LOC_YEAR <- 3L      # Minimum rows required per location-year for processing. Increase to be stricter on noisy cases.
+MIN_OBS_PER_LOC_YEAR <- 8L      # Minimum rows required per location-year for processing (raised from 3). Increase to be stricter on noisy cases.
 MIN_UNIQUE_DOY_DEFAULT <- 5L    # Minimum unique DOYs per loc-year during training to consider time-series adequate.
 MIN_UNIQUE_DOY_INFERENCE <- 3L  # Less strict for inference to allow sparse inputs.
 MIN_PENTADS_PER_TRAIN_SAMPLE <- 10L  # Minimum observations required per location-year trace to construct a training sample.
@@ -265,11 +247,27 @@ TEMPORAL_BUDGET <- ceiling(365 / TEMPORAL_AGGREGATION_DAYS)  # Number of tempora
 
 # Variant / clustering settings
 MIN_CLUSTER_SIZE <- 4L           # Minimum cluster size to accept a variant prototype
-INTERPOLATE_INFERENCE <- FALSE   # If TRUE, linearly interpolate missing pentads for inference/validation (default: FALSE — preserves validation integrity)
+# Temporal-filling method used during inference/validation (and in any
+# functions that accept an `interpolate` argument).  Accepted values are:
+#   * "linear" (or TRUE)   - linearly interpolate missing pentads (legacy default)
+#   * "whittaker"          - apply Whittaker penalized smoothing (fills gaps and
+#                             smooths the resulting pentad series)
+#   * "none" (or FALSE)    - leave missing pentads as NA
+# The value may also be specified via `MESMA_PARAMS$interpolate_inference`.
+INTERPOLATE_INFERENCE <- "linear"
+# Smoothing penalty parameter used by Whittaker smoothing when
+# INTERPOLATE_INFERENCE == "linear".  Larger values produce smoother curves.
+WHITTAKER_LAMBDA <- 1600
+
 PCA_VARIANCE_THRESHOLD <- 0.95    # PCA energy to retain when reducing endmember dimensionality prior to clustering
 
-# Whether to prune features with zero LDA weight from optimized libraries
-# Disabled for now - diagnostics only, no actual pruning applied
+# Whether to prune library features whose LDA-derived weight is exactly zero.
+# When TRUE, features (temporal bins) with zero weight are removed from each
+# vegetation matrix during `precompute_optimized_library_weighted()` and the
+# same pruning is repeated during inference so that the solver works on the
+# reduced feature set. Pruned columns are recorded in `pruned_info` for
+# diagnostics and bookkeeping. See PRUNE_ZERO_WEIGHT_MAX_FRAC and
+# PRUNE_ZERO_MIN_FEATURES for guards that prevent over‑pruning.
 PRUNE_ZERO_WEIGHT_FEATURES <- TRUE
 # If fraction of zeroed features exceeds this, skip pruning to avoid degenerate libraries
 PRUNE_ZERO_WEIGHT_MAX_FRAC <- 0.8
@@ -281,11 +279,12 @@ PRUNE_ZERO_MIN_FEATURES <- 3
 # Features whose permutation doesn't significantly degrade performance are pruned.
 OOB_TUNING_FRACTION <- 0.15         # Fraction held out from training data for cluster optimization evaluation
 VALIDATION_FRACTION <- 0.20         # Fraction held out for validation (stratified by location/Veg)
-PERMUTATION_N_ITER <- 400            # Number of permutations per feature for significance testing
+PERMUTATION_N_ITER <- 500            # Number of permutations per feature for significance testing
 PERMUTATION_MIN_SAMPLES <- 20       # Minimum OOB samples required for testing
+PERMUTATION_ALPHA <- 0.4          # Significance level for permutation p-values (features with p >= alpha are pruned)
 
 # Endmember selection tuning
-MAX_K_EAR <- 8L                  # Maximum number of endmembers to consider per vegetation class in EAR selection (conservative increase to explore one more k).
+MAX_K_EAR <- 7L                  # Maximum number of endmembers to consider per vegetation class in EAR selection (conservative increase to explore one more k).
 CLUSTER_COMPLEXITY_LAMBDA <- 0.005  # Complexity penalty per total endmember: S = min(R_oob, R_train) - λ * sum(k)
 BARREN_SIM_THRESHOLD <- 0.75     # Pre-filter: drop vegetation training observations whose cosine similarity to barren mean exceeds this threshold
 
@@ -294,7 +293,18 @@ BARREN_SIM_THRESHOLD <- 0.75     # Pre-filter: drop vegetation training observat
 PROGRESS_LOG_TO_FILE <- FALSE
 LOG_FILE <- "mesma_progress.log"
 
+# -----------------------------------------------------------------------------
+# Spectral band configuration
+# 
+# NEW LOGIC: We include "blue" in RAW_BANDS for index calculation (EVI, PSRI, etc.).
+# Historically the band was removed after preprocessing to avoid sensor
+# inconsistencies (OLI vs ETM+ cross‑calibration), but bias correction is now
+# applied to all raw bands before any indices are computed.  Set
+# EXCLUDE_BLUE_BAND <- FALSE when you want to retain blue for fitting and
+# downstream MESMA features.
 RAW_BANDS <- c("blue", "green", "red", "nir", "swir1", "swir2")
+EXCLUDE_BLUE_BAND <- FALSE  # If TRUE, 'blue' is dropped AFTER index computation.
+
 
 OUTPUT_DIR <- "C:/MAP/phenology_results"
 OUT_DIR <- file.path(OUTPUT_DIR, "veg_mixture_fit")

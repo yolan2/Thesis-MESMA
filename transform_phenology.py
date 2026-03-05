@@ -112,7 +112,7 @@ class PhenologyTransformer:
                 df[band] = pd.to_numeric(df[band], errors="coerce")
 
         # Verify that we have at least the necessary bands to compute indices
-        if not ("nir" in df.columns and "red" in df.columns and "green" in df.columns and "blue" in df.columns and "swir1" in df.columns and "swir2" in df.columns):
+        if not ("nir" in df.columns and "red" in df.columns and "green" in df.columns and "swir1" in df.columns and "swir2" in df.columns):
             missing = [b for b in bands if b not in df.columns]
             raise RuntimeError(f"Missing required spectral band columns to compute indices: {missing}")
 
@@ -120,17 +120,13 @@ class PhenologyTransformer:
         eps = 1e-9
         df["DVI"] = df["nir"] - df["red"]
         df["OSAVI"] = (df["nir"] - df["red"]) / (df["nir"] + df["red"] + 0.16)
-        # MCARI: ((R - G) - 0.2*(R - B)) * (R / (G + eps))
-        df["MCARI"] = ((df["red"] - df["green"]) - 0.2 * (df["red"] - df["blue"])) * (df["red"] / (df["green"] + eps))
         #df["CRI"] = (1.0 / (df["green"] + eps)) - (1.0 / (df["red"] + eps))
         df["PRI"] = (df["green"] - df["red"]) / (df["green"] + df["red"] + eps)
         df["NIRv"] = df["nir"] * ((df["nir"] - df["red"]) / (df["nir"] + df["red"] + eps))
-        df["PSRI"] = (df["red"] - df["blue"]) / (df["nir"] + eps)
         df["NBR"] = (df["nir"] - df["swir2"]) / (df["nir"] + df["swir2"] + eps)
         df["TCW"] = (df["swir1"] - df["swir2"]) / (df["swir1"] + df["swir2"] + eps)
         df["TCG"] = (df["green"] - df["red"]) / (df["green"] + df["red"] + eps)
         df["MNDWI"] = (df["green"] - df["swir1"]) / (df["green"] + df["swir1"] + eps)
-        df["DUSTI"] = (df["red"] - df["blue"]) / (df["red"] + df["blue"] + eps)
 
         # MSAVI: stable formulation (MSAVI2)
         # MSAVI = (2*N + 1 - sqrt((2N + 1)^2 - 8(N - R))) / 2
@@ -143,21 +139,25 @@ class PhenologyTransformer:
         
         # NDMI
         df["NDMI"] = (df["nir"] - df["swir1"]) / (df["nir"] + df["swir1"] + eps)
+
+        # Blue-dependent indices
+        if "blue" in df.columns:
+            df["EVI"] = 2.5 * (df["nir"] - df["red"]) / (df["nir"] + 6*df["red"] - 7.5*df["blue"] + 1)
+            df["PSRI"] = (df["red"] - df["blue"]) / (df["nir"] + eps)
+            df["MCARI"] = ((df["red"] - df["green"]) - 0.2*(df["red"] - df["blue"])) * (df["red"] / (df["green"] + eps))
+            df["TCB"] = 0.3029 * df["blue"] + 0.2786 * df["green"] + 0.4733 * df["red"] + 0.5599 * df["nir"] + 0.508 * df["swir1"] + 0.1872 * df["swir2"]
+            df["GVI"] = -0.2941 * df["blue"] - 0.243 * df["green"] - 0.5424 * df["red"] + 0.7276 * df["nir"] + 0.0713 * df["swir1"] - 0.1608 * df["swir2"]
+            
+            # Post-index calculation: drop blue to avoid sensor inconsistencies if requested
+            # Note: We hardcode the drop here or check a flag if passed in. 
+            # In the R scripts we use EXCLUDE_BLUE_BAND.
+            # df = df.drop(columns=["blue"])
+            # print("✓ Dropped blue band after computing EVI, PSRI, MCARI, TCB, and GVI")
         
-        # TCB (Tasseled Cap Brightness - Landsat 8)
-        df["TCB"] = 0.3029 * df["blue"] + 0.2786 * df["green"] + 0.4733 * df["red"] + 0.5599 * df["nir"] + 0.508 * df["swir1"] + 0.1872 * df["swir2"]
-        
-        # GVI (Tasseled Cap Greenness - Linear)
-        df["GVI"] = -0.2941 * df["blue"] - 0.243 * df["green"] - 0.5424 * df["red"] + 0.7276 * df["nir"] + 0.0713 * df["swir1"] - 0.1608 * df["swir2"]
 
         # Apply small correction to NIRv (as in your snippet)
         df["NIRv"] = df["NIRv"] * 1.3
 
-        # DUSTI filtering
-        dusti_threshold = 0.5
-        n_before = len(df)
-        df = df[df["DUSTI"] <= dusti_threshold]
-        n_after = len(df)
         if n_before > n_after:
             print(f"✓ Applied DUSTI filter: removed {n_before - n_after} observations with DUSTI > {dusti_threshold}")
 

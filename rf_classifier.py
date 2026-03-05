@@ -37,9 +37,7 @@ def collect_training_data(downloads_dir="downloads", spatial_reference_list=None
     
     print(f"Scanning {len(sample_folders)} folders for training data...")
     
-    # Pre-calculate pure point coordinates for debugging
     pure_coords = [p for p in spatial_reference_list if p[2] == 1]
-    print(f"DEBUG: Tracking {len(pure_coords)} pure points from SHP for matching issues.")
 
     for folder in sample_folders:
         parts = folder.split('_')
@@ -78,7 +76,7 @@ def collect_training_data(downloads_dir="downloads", spatial_reference_list=None
 
         allowed_classes = ['populus', 'barren', 'tamarix', 'herbs']
         
-        # Check spatial match BEFORE type filtering for debug purposes
+        # Check spatial match BEFORE type filtering
         is_pure = False
         matched_purity = 0
         match_found = False

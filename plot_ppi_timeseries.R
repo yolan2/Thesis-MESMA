@@ -167,8 +167,6 @@ if (file.exists(MAPPING_CSV)) {
     if ("location_id" %in% names(map_df)) {
       if (!"Veg" %in% names(map_df)) map_df$Veg <- NA_character_
       cat("Mapping CSV will NOT be joined into the main observations data; it will only be used for Veg mapping and summaries.\n")
-      cat("DEBUG: Unique Veg types in mapping CSV:\n")
-      print(table(map_df$Veg, useNA = "ifany"))
     } else {
       cat("Warning: mapping CSV lacks 'location_id' and 'lon'/'lat'; cannot use location-level mapping.\n")
     }
@@ -237,7 +235,7 @@ cat("Aggregating data...\n")
 
 # Filter out rows with missing PPI or Veg
 # And filter for specific vegetation types: barren, herbs, populus, tamarix
-target_veg <- c("barren", "herbs", "populus", "tamarix", "woody_unknown")
+target_veg <- c("barren", "herbs", "populus", "tamarix")
 
 plot_data <- df |> 
   dplyr::filter(!is.na(PPI), !is.na(Veg)) |> 
