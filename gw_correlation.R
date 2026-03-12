@@ -5,7 +5,7 @@
 # - outputs lag-wise correlations, regression stats and plots
 
 # -------- USER CONFIG --------
-inference_csv <- "inference_results/inference_results.csv"   # relative to project root
+inference_csv <- "inference_results/inference_results_Landsat_Harmonized_Bands_1985_2025_low_3_.csv"   # relative to project root
 gw_xlsx <- "C:/Users/yolan/OneDrive/Documenten/UGENT/Master/masterproef/GIS/groundwater_depths (1).xlsx"
 sheets_to_use <- c("Alagan", "Yingsu")
 # Optional manual mapping: set sheet name -> inference `location_id` (numeric). If NULL, will use regional mean for that sheet.
@@ -16,9 +16,11 @@ veg_to_use <- "all"            # change to the veg/label you want to correlate (
 # Vegetation classes to exclude from plotting/analysis (e.g. 'barren')
 exclude_vegs <- c('barren')
 metric_col <- "coef"               # column in `inference_csv` to correlate (must be numeric)
+# evaluate lags from min_lag_years through max_lag_years; negative values allowed
+min_lag_years <- -2                # include additional lags down to -2 (GW leads by two years)
 max_lag_years <- 3                   # evaluate lags 0..max_lag_years (default includes 1-year lag)
 default_lag <- 1                     # used for plotting / example output
-out_dir <- "temp_results/gw_correlation"  # output CSVs + plots
+out_dir <- "gw_correlation"  # output CSVs + plots
 # -----------------------------
 
 # Required packages
@@ -28,6 +30,51 @@ if(length(inst)) install.packages(inst, repos = "https://cloud.r-project.org")
 
 library(readxl); library(dplyr); library(lubridate); library(ggplot2)
 library(broom); library(tidyr)
+
+# define a lightweight ggplot2 theme used across MESMA scripts, with a
+# fallback in case the function isn't provided elsewhere (e.g. when this
+# script is run standalone.
+if (!exists("theme_mesma", mode = "function")) {
+  theme_mesma <- function(base_size = 9, base_family = "") {
+    ggplot2::theme_minimal(base_size = base_size, base_family = base_family) +
+      ggplot2::theme(
+        axis.title = element_text(size = base_size),
+        legend.position = "bottom",
+        panel.grid.minor = element_blank()
+      )
+  }
+}
+
+# helper: construct a vegetation color palette matching the logic used by
+# fit_veg_mixture_mesma.R. This ensures correlation plots use the same base
+# colours as the fitting workflow (responds to VEG_CALIBRATION_COLORS or
+# falls back to RColorBrewer Set1).
+build_veg_palette <- function(veg_levels) {
+  pal <- NULL
+  if (exists("VEG_CALIBRATION_COLORS", inherits = TRUE)) {
+    supplied <- get("VEG_CALIBRATION_COLORS", inherits = TRUE)
+    matched <- sapply(veg_levels, function(v) {
+      nm <- names(supplied)
+      im <- which(tolower(nm) == tolower(v))
+      if (length(im) > 0) supplied[im[1]] else NA_character_
+    }, USE.NAMES = FALSE)
+    if (!all(is.na(matched))) pal <- setNames(matched, veg_levels)
+  }
+  if (is.null(pal) || any(is.na(pal))) {
+    if (!requireNamespace("RColorBrewer", quietly = TRUE)) {
+      stop("RColorBrewer required for default veg palette")
+    }
+    nveg <- max(3, length(veg_levels))
+    brewer_cols <- RColorBrewer::brewer.pal(n = nveg, name = "Set1")
+    brewer_cols <- brewer_cols[seq_len(length(veg_levels))]
+    names(brewer_cols) <- veg_levels
+    if (is.null(pal)) pal <- brewer_cols else {
+      na_idx <- which(is.na(pal))
+      if (length(na_idx) > 0) pal[na_idx] <- brewer_cols[na_idx]
+    }
+  }
+  pal
+}
 
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 # remove any pre-existing outputs for excluded vegetation classes (keeps output folder clean)
@@ -123,7 +170,7 @@ gw_to_yearly <- function(df) {
 }
 
 # Compute lagged correlations between annual inference and groundwater
-compute_lagged_stats <- function(inf_df, gw_yearly_df, location_id, veg=NULL, metric_col = "coef", max_lag = 3) {
+compute_lagged_stats <- function(inf_df, gw_yearly_df, location_id, veg=NULL, metric_col = "coef", min_lag = -2, max_lag = 3) {
   inf_sub <- inf_df %>% filter(location_id == !!location_id)
   if(!is.null(veg)) inf_sub <- inf_sub %>% filter(Veg == veg)
   if(nrow(inf_sub) == 0) stop('No inference rows for chosen location_id / veg')
@@ -132,9 +179,10 @@ compute_lagged_stats <- function(inf_df, gw_yearly_df, location_id, veg=NULL, me
   inf_sub <- inf_sub %>% mutate(pheno_year = as.integer(pheno_year)) %>% select(location_id, pheno_year, !!rlang::sym(metric_col))
   names(inf_sub)[names(inf_sub)==metric_col] <- 'inf_metric'
 
-  out <- tibble(lag = 0:max_lag, n = NA_integer_, pearson_r = NA_real_, p_value = NA_real_, lm_slope = NA_real_, lm_p = NA_real_, r2 = NA_real_)
+  lags <- seq(min_lag, max_lag)
+  out <- tibble(lag = lags, n = NA_integer_, pearson_r = NA_real_, p_value = NA_real_, lm_slope = NA_real_, lm_p = NA_real_, r2 = NA_real_)
 
-  for(L in 0:max_lag) {
+  for(L in lags) {
     # assume groundwater at year Y-L influences pheno in year Y -> join on pheno_year == gw_year + L
     gw_lagged <- gw_yearly_df %>% mutate(pheno_year = .data$.gw_year + L)
     joined <- inner_join(inf_sub, gw_lagged, by = 'pheno_year')
@@ -154,11 +202,12 @@ compute_lagged_stats <- function(inf_df, gw_yearly_df, location_id, veg=NULL, me
 }
 
 # Compute lagged stats when `inf_yearly_df` is already an annual time-series (pheno_year, inf_metric)
-compute_lagged_stats_timeseries <- function(inf_yearly_df, gw_yearly_df, metric_col = 'inf_metric', max_lag = 3) {
+compute_lagged_stats_timeseries <- function(inf_yearly_df, gw_yearly_df, metric_col = 'inf_metric', min_lag = -2, max_lag = 3) {
   # inf_yearly_df: columns pheno_year, inf_metric
   if(!("pheno_year" %in% names(inf_yearly_df)) || !(metric_col %in% names(inf_yearly_df))) stop('inf_yearly_df must contain pheno_year and inf_metric')
-  out <- tibble(lag = 0:max_lag, n = NA_integer_, pearson_r = NA_real_, p_value = NA_real_, lm_slope = NA_real_, lm_p = NA_real_, r2 = NA_real_)
-  for(L in 0:max_lag) {
+  lags <- seq(min_lag, max_lag)
+  out <- tibble(lag = lags, n = NA_integer_, pearson_r = NA_real_, p_value = NA_real_, lm_slope = NA_real_, lm_p = NA_real_, r2 = NA_real_)
+  for(L in lags) {
     gw_lagged <- gw_yearly_df %>% mutate(pheno_year = .data$.gw_year + L)
     joined <- inner_join(inf_yearly_df %>% mutate(pheno_year = as.integer(pheno_year)), gw_lagged, by = 'pheno_year')
     out$n[out$lag==L] <- nrow(joined)
@@ -194,11 +243,19 @@ compute_trend_stats <- function(df, x_col, y_col) {
 
 # Plot time-series trends for groundwater+inference (combined only)
 # Note: single-variable 'mean' trend plots have been removed per request.
-plot_trends_for_sheet <- function(inf_yearly_df, gw_yearly_df, joined_df, sheet, id_tag, veg, out_dir, default_lag) {
-  # combined z-scored series (use joined_df which already aligns years unlagged)
+plot_trends_for_sheet <- function(inf_yearly_df, gw_yearly_df, joined_df, sheet, id_tag, veg, out_dir, default_lag, veg_color = '#1f77b4', restrict01 = TRUE) {
+  # use joined_df which already aligns years unlagged, scale groundwater to fit on same axis
   if(!is.null(joined_df) && nrow(joined_df) >= 3) {
-    comb <- joined_df %>% arrange(pheno_year) %>% mutate(z_inf = as.numeric(scale(inf_metric)), z_gw = as.numeric(scale(gw_mean)))
-    # compute simple linear trend stats for annotations (do not save separate 'mean' trend plots)
+    comb <- joined_df %>% arrange(pheno_year)
+    
+    # Scale groundwater to overlay on the same axis as the vegetation fraction
+    min_inf <- min(comb$inf_metric, na.rm = TRUE); max_inf <- max(comb$inf_metric, na.rm = TRUE)
+    min_gw  <- min(comb$gw_mean, na.rm = TRUE);  max_gw  <- max(comb$gw_mean, na.rm = TRUE)
+    if(abs(max_gw - min_gw) < .Machine$double.eps) scale_factor <- 1 else scale_factor <- (max_inf - min_inf) / (max_gw - min_gw)
+    
+    comb <- comb %>% mutate(gw_scaled = (gw_mean - min_gw) * scale_factor + min_inf)
+
+    # compute simple linear trend stats for annotations 
     tg_inf <- tryCatch(compute_trend_stats(comb %>% rename(year = pheno_year), 'year', 'inf_metric'), error = function(e) NULL)
     tg_gw  <- tryCatch(compute_trend_stats(comb %>% rename(year = pheno_year), 'year', 'gw_mean'), error = function(e) NULL)
 
@@ -206,14 +263,20 @@ plot_trends_for_sheet <- function(inf_yearly_df, gw_yearly_df, joined_df, sheet,
     if(!is.null(tg_inf)) ann_txt <- c(ann_txt, sprintf('inf slope=%.3g (p=%.2g)', tg_inf$slope, tg_inf$p_value))
     if(!is.null(tg_gw))  ann_txt <- c(ann_txt, sprintf('gw slope=%.3g (p=%.2g)', tg_gw$slope, tg_gw$p_value))
 
+    y_pad <- (max_inf - min_inf) * 0.08
     p_comb <- ggplot(comb, aes(x = pheno_year)) +
-      geom_line(aes(y = z_inf, color = 'inf')) + geom_point(aes(y = z_inf, color = 'inf')) +
-      geom_line(aes(y = z_gw, color = 'gw')) + geom_point(aes(y = z_gw, color = 'gw')) +
-      geom_smooth(aes(y = z_inf), method = 'lm', se = FALSE, color = '#1f77b4') +
-      geom_smooth(aes(y = z_gw), method = 'lm', se = FALSE, color = '#d62728') +
-      scale_color_manual(name = '', values = c('inf' = '#1f77b4', 'gw' = '#d62728'), labels = c('inference (z)', 'gw (z)')) +
-      labs(x = 'year', y = 'z-score') +
-      annotate('text', x = min(comb$pheno_year, na.rm = TRUE), y = max(c(comb$z_inf, comb$z_gw), na.rm = TRUE), hjust = 0, label = paste(ann_txt, collapse = '; '), size = 3) +
+      geom_line(aes(y = inf_metric, color = 'inf')) + geom_point(aes(y = inf_metric, color = 'inf')) +
+      geom_line(aes(y = gw_scaled, color = 'gw'), linetype = 'dashed') + geom_point(aes(y = gw_scaled, color = 'gw')) +
+      geom_smooth(aes(y = inf_metric), method = 'lm', se = FALSE, color = veg_color) +
+      geom_smooth(aes(y = gw_scaled), method = 'lm', se = FALSE, color = '#d62728', linetype = 'dashed') +
+      coord_cartesian(ylim = c(min_inf - y_pad, max_inf + y_pad * 4)) +
+      scale_y_continuous(
+        name = 'vegetation fraction',
+        sec.axis = sec_axis(~ (. - min_inf)/scale_factor + min_gw, name = 'groundwater depth (m)')
+      ) +
+      scale_color_manual(name = '', values = c('inf' = veg_color, 'gw' = '#d62728'), labels = c('inference', 'gw')) +
+      labs(x = 'year') +
+      annotate('text', x = min(comb$pheno_year, na.rm = TRUE), y = max_inf + y_pad * 3.5, hjust = 0, label = paste(ann_txt, collapse = '\n'), size = 3) +
       theme_mesma()
 
     fc <- file.path(out_dir, sprintf('trend_combined_%s_%s_%s.png', sheet, id_tag, veg))
@@ -225,7 +288,8 @@ plot_trends_for_sheet <- function(inf_yearly_df, gw_yearly_df, joined_df, sheet,
 }
 
 # Plot dual-axis time series (veg fraction vs GW level)
-plot_dual_axis_time_series <- function(inf_yearly_df, gw_yearly_df, sheet, id_tag, veg, out_dir) {
+# veg_color: colour to use for the vegetation series (should match fit script palette)
+plot_dual_axis_time_series <- function(inf_yearly_df, gw_yearly_df, sheet, id_tag, veg, out_dir, veg_color = '#1f77b4') {
   if(is.null(inf_yearly_df) || nrow(inf_yearly_df) < 2 || is.null(gw_yearly_df) || nrow(gw_yearly_df) < 2) {
     message('Skipping dual-axis plot (insufficient data): ', sheet, ' / ', veg)
     return(invisible(NULL))
@@ -245,17 +309,15 @@ plot_dual_axis_time_series <- function(inf_yearly_df, gw_yearly_df, sheet, id_ta
   p <- ggplot(joined, aes(x = pheno_year)) +
     geom_line(aes(y = inf_metric, color = 'veg'), linewidth = 0.9) + geom_point(aes(y = inf_metric, color = 'veg')) +
     geom_line(aes(y = gw_scaled, color = 'gw'), linewidth = 0.9, linetype = 'dashed') + geom_point(aes(y = gw_scaled, color = 'gw')) +
-    scale_y_continuous(name = 'vegetation fraction', sec.axis = sec_axis(~ (. - min_inf)/scale_factor + min_gw, name = 'groundwater depth (m)')) +
-    scale_color_manual('', values = c('veg' = '#1f77b4', 'gw' = '#d62728'), labels = c('vegetation', 'groundwater')) +
+    scale_y_continuous(name = 'vegetation fraction', limits = c(0,1), sec.axis = sec_axis(~ (. - min_inf)/scale_factor + min_gw, name = 'groundwater depth (m)')) +
+    scale_color_manual('', values = c('veg' = veg_color, 'gw' = '#d62728'), labels = c('vegetation', 'groundwater')) +
     labs(x = 'year') +
     theme_mesma()
-  # CSV suppressed by user request — joined timeseries not written to CSV
-  message('(CSV suppressed) joined timeseries would have been: ', jf)
   invisible(joined)
 }
 
 # Scatter GW (year t) vs vegetation (year t+lag) — default lag = 1
-plot_scatter_lagged <- function(inf_yearly_df, gw_yearly_df, lag = 1, sheet, id_tag, veg, out_dir) {
+plot_scatter_lagged <- function(inf_yearly_df, gw_yearly_df, lag = 1, sheet, id_tag, veg, out_dir, veg_color = '#1f77b4', restrict01 = TRUE) {
   if(is.null(inf_yearly_df) || nrow(inf_yearly_df) < 2 || is.null(gw_yearly_df) || nrow(gw_yearly_df) < 2) {
     message('Skipping lagged scatter (insufficient data): ', sheet, ' / ', veg)
     return(invisible(NULL))
@@ -267,10 +329,11 @@ plot_scatter_lagged <- function(inf_yearly_df, gw_yearly_df, lag = 1, sheet, id_
   ct <- cor.test(joined$gw_mean, joined$inf_metric, method = 'pearson')
   lm_mod <- lm(inf_metric ~ gw_mean, data = joined)
   p <- ggplot(joined, aes(x = gw_mean, y = inf_metric)) +
-    geom_point() + geom_smooth(method = 'lm', se = TRUE) +
+    geom_point(color = veg_color) + geom_smooth(method = 'lm', se = TRUE, color = veg_color) +
+    { if(restrict01) scale_y_continuous(limits = c(0,1)) else scale_y_continuous() } +
     labs(x = 'GW mean (year t)', y = 'vegetation fraction (year t+lag)') +
     annotate('text', x = Inf, y = Inf, hjust = 1, vjust = 1, size = 3,
-             label = sprintf('r=%.2f, p=%.2g, n=%d', ct$estimate, ct$p.value, nrow(joined))) +
+             label = sprintf('r=%.2f, p=%.2g', ct$estimate, ct$p.value)) +
     theme_mesma()
   # CSV suppressed by user request — lagged pair table not written to CSV
   message('(CSV suppressed) lagged pairs would have been (not written)')
@@ -280,54 +343,45 @@ plot_scatter_lagged <- function(inf_yearly_df, gw_yearly_df, lag = 1, sheet, id_
 # ------------------- Run analysis -------------------
 message('Reading inference results...')
 inf <- readr::read_csv(inference_csv, show_col_types = FALSE)
+# restrict satellite/inference data to years after 2000
+if('pheno_year' %in% names(inf)) {
+  inf <- inf %>% mutate(pheno_year = as.integer(pheno_year)) %>% filter(pheno_year > 2000)
+  message(sprintf('Filtered inference to pheno_year > 2000; remaining rows: %d', nrow(inf)))
+}
 message(sprintf('Inference rows: %d, columns: %d', nrow(inf), ncol(inf)))
 
 if(!is.null(veg_to_use)) {
   if(!('Veg' %in% names(inf))) stop('`Veg` column not found in inference CSV')
-  if(!any(inf$Veg == veg_to_use)) warning(sprintf('veg "%s" not found in inference data — results may be empty', veg_to_use))
+  # only warn when the user specified a concrete veg that doesn't exist;
+  # the special value 'all' (case-insensitive) is handled later and should
+  # not trigger a warning even though no row equals "all".
+  if(!identical(tolower(veg_to_use), 'all') && !any(inf$Veg == veg_to_use)) {
+    warning(sprintf('veg "%s" not found in inference data — results may be empty', veg_to_use))
+  }
 }
 
 # For each groundwater sheet: inspect structure, convert to yearly, try to match, compute lags
-# If both Alagan and Yingsu are requested, treat them as a single combined groundwater series
-if(all(c('Alagan','Yingsu') %in% sheets_to_use)) {
-  message('Treating Alagan and Yingsu as the same location — combining their groundwater series')
-  sheets_to_use <- unique(c(setdiff(sheets_to_use, c('Alagan','Yingsu')), 'Alagan_Yingsu'))
-}
+# NOTE: combined Alagan+Yingsu support removed; each sheet is processed separately.
+# Users who want to analyse both should include them individually in `sheets_to_use`.
 final_reports <- list()
 corr_list <- list()   # accumulate all lagged correlation tables for final Excel
 for(sheet in sheets_to_use) {
   message('\n---- Sheet: ', sheet, ' ----')
-  if(sheet == 'Alagan_Yingsu') {
-    # read both sheets and combine into an annual series
-    gw1 <- tryCatch(safe_read_sheet(gw_xlsx, 'Alagan'), error = function(e) { message('Alagan read failed: ', e$message); NULL })
-    gw2 <- tryCatch(safe_read_sheet(gw_xlsx, 'Yingsu'), error = function(e) { message('Yingsu read failed: ', e$message); NULL })
-    if(is.null(gw1) && is.null(gw2)) { message('Neither Alagan nor Yingsu could be read; skipping'); next }
-    gw1y <- if(!is.null(gw1)) tryCatch(gw_to_yearly(gw1), error = function(e) { message('gw_to_yearly failed for Alagan: ', e$message); NULL }) else NULL
-    gw2y <- if(!is.null(gw2)) tryCatch(gw_to_yearly(gw2), error = function(e) { message('gw_to_yearly failed for Yingsu: ', e$message); NULL }) else NULL
-    gw_yearly <- bind_rows(gw1y, gw2y) %>% group_by(.gw_year) %>% summarize(gw_mean = mean(gw_mean, na.rm = TRUE), gw_median = mean(gw_median, na.rm = TRUE), n_wells = n()) %>% ungroup()
-    message(sprintf('Combined Alagan+Yingsu -> %d annual rows (years %s-%s)', nrow(gw_yearly), min(gw_yearly$.gw_year, na.rm=TRUE), max(gw_yearly$.gw_year, na.rm=TRUE)))
-  } else {
-    gw_raw <- tryCatch(safe_read_sheet(gw_xlsx, sheet), error = function(e) { message(e$message); return(NULL) })
-    if(is.null(gw_raw)) next
-    gw_yearly <- tryCatch({ gw_to_yearly(gw_raw) }, error = function(e) { message('Could not convert groundwater to yearly: ', e$message); return(NULL) })
-    if(is.null(gw_yearly)) next
-  }
+  gw_raw <- tryCatch(safe_read_sheet(gw_xlsx, sheet), error = function(e) { message(e$message); return(NULL) })
+  if(is.null(gw_raw)) next
+  gw_yearly <- tryCatch({ gw_to_yearly(gw_raw) }, error = function(e) { message('Could not convert groundwater to yearly: ', e$message); return(NULL) })
+  if(is.null(gw_yearly)) next
 
-  if(sheet != 'Alagan_Yingsu') {
-    message('Columns (first 12): ', paste(head(names(gw_raw), 12), collapse = ', '))
-    print(utils::head(gw_raw, 6))
+  message('Columns (first 12): ', paste(head(names(gw_raw), 12), collapse = ', '))
+  print(utils::head(gw_raw, 6))
 
-    # detect columns and convert to yearly
-    cols <- detect_gw_columns(gw_raw)
-    message('Detected - date_col: ', cols$date_col %||% 'NONE', '; year_col: ', cols$year_col %||% 'NONE', '; depth_col: ', cols$depth_col %||% 'NONE')
+  # detect columns and convert to yearly
+  cols <- detect_gw_columns(gw_raw)
+  message('Detected - date_col: ', cols$date_col %||% 'NONE', '; year_col: ', cols$year_col %||% 'NONE', '; depth_col: ', cols$depth_col %||% 'NONE')
 
-    gw_yearly <- tryCatch({ gw_to_yearly(gw_raw) }, error = function(e) { message('Could not convert groundwater to yearly: ', e$message); return(NULL) })
-    if(is.null(gw_yearly)) next
-    gw_yearly <- gw_yearly %>% rename(.gw_year = .data$.gw_year)  # keep consistent name inside function
-  } else {
-    # combined Alagan+Yingsu: no single `gw_raw` available — set safe `cols` (no lat/lon)
-    cols <- list(date_col = NULL, year_col = '.gw_year', depth_col = 'gw_mean', lat_col = NULL, lon_col = NULL)
-  }
+  gw_yearly <- tryCatch({ gw_to_yearly(gw_raw) }, error = function(e) { message('Could not convert groundwater to yearly: ', e$message); return(NULL) })
+  if(is.null(gw_yearly)) next
+  gw_yearly <- gw_yearly %>% rename(.gw_year = .data$.gw_year)  # keep consistent name inside function
 
   # Determine analysis mode: per-location (mapping) OR regional timeseries
   mapped_loc <- NULL
@@ -360,24 +414,40 @@ for(sheet in sheets_to_use) {
       veg_list <- setdiff(veg_list, skip)
     }
   }
+  # build palette for all vegs we will loop over
+  veg_palette <- build_veg_palette(veg_list)
 
   veg_results <- list()
+  # prepare common label formatter for lag axis (numeric only)
+  label_fun <- function(x) {
+    as.character(x)
+  }
+
   for(veg in veg_list) {
     message(sprintf('\nProcessing sheet=%s, veg=%s, id=%s', sheet, veg, id_base))
+    # pick colour for this vegetation class (fallback to blue if somehow missing)
+    veg_color <- if (!is.null(veg_palette) && veg %in% names(veg_palette)) veg_palette[[veg]] else '#1f77b4'
     if(!is.null(chosen_loc)) {
-      stats_tbl <- compute_lagged_stats(inf, gw_yearly, chosen_loc, veg = veg, metric_col = metric_col, max_lag = max_lag_years)
+      stats_tbl <- compute_lagged_stats(inf, gw_yearly, chosen_loc, veg = veg, metric_col = metric_col,
+                                       min_lag = min_lag_years, max_lag = max_lag_years)
       joined_def <- inner_join(inf %>% filter(location_id==chosen_loc, Veg==veg) %>% mutate(pheno_year = as.integer(pheno_year)) %>% select(pheno_year, inf_metric = !!rlang::sym(metric_col)), gw_yearly %>% mutate(pheno_year = .data$.gw_year + default_lag), by='pheno_year')
       inf_yearly_for_trend <- inf %>% filter(location_id==chosen_loc, Veg==veg) %>% group_by(pheno_year) %>% summarize(inf_metric = mean(!!rlang::sym(metric_col), na.rm = TRUE), n_sites = n()) %>% ungroup()
       id_tag <- paste0(id_base, '_', veg)
     } else {
       # regional aggregated timeseries for this veg
       inf_yearly_for_trend <- inf %>% filter(Veg == veg) %>% group_by(pheno_year) %>% summarize(inf_metric = mean(!!rlang::sym(metric_col), na.rm = TRUE), n_sites = n()) %>% ungroup()
-      stats_tbl <- compute_lagged_stats_timeseries(inf_yearly_for_trend, gw_yearly, metric_col = 'inf_metric', max_lag = max_lag_years)
+      stats_tbl <- compute_lagged_stats_timeseries(inf_yearly_for_trend, gw_yearly, metric_col = 'inf_metric',
+                                                     min_lag = min_lag_years, max_lag = max_lag_years)
       joined_def <- inner_join(inf_yearly_for_trend %>% mutate(pheno_year = as.integer(pheno_year)), gw_yearly %>% mutate(pheno_year = .data$.gw_year + default_lag), by='pheno_year')
       id_tag <- paste0(id_base, '_', veg)
     }
 
-    stats_tbl <- stats_tbl %>% arrange(lag)
+    stats_tbl <- stats_tbl %>%
+      arrange(lag)
+    # sanity check: ensure requested minimum lag is actually present
+    if(exists('min_lag_years') && min(stats_tbl$lag, na.rm = TRUE) > min_lag_years) {
+      warning(sprintf('Computed lags did not include min_lag_years (%s); check configuration', min_lag_years))
+    }
     out_csv <- file.path(out_dir, sprintf('gw_correlation_%s_%s.csv', sheet, id_tag))
     # CSV suppressed by user request — lagged summary not written to CSV
     message('(CSV suppressed) lagged summary would have been: ', out_csv)
@@ -387,11 +457,12 @@ for(sheet in sheets_to_use) {
 
     # plot correlation vs lag (report lagged correlations numerically)
     p1 <- ggplot(stats_tbl, aes(x = lag, y = pearson_r)) +
-      geom_point(size = 3) + geom_line() +
-      # place labels slightly closer to the point and give extra vertical room so they are not clipped
-      geom_text(aes(label = ifelse(n >= 3, sprintf('r=%.2f\\n n=%d', pearson_r, n), 'n<3')), vjust = -0.5, size = 3) +
-      scale_y_continuous(expand = expansion(mult = c(0.05, 0.25))) +
+        geom_point(size = 3, color = veg_color) + geom_line(color = veg_color) +
+        # place labels slightly closer to the point and give extra vertical room so they are not clipped
+        geom_text(aes(label = ifelse(n >= 3, sprintf('r=%.2f\n p=%.3f', pearson_r, p_value), 'n<3')), vjust = -0.5, size = 3) +
+        scale_y_continuous(limits = c(-1,1), expand = expansion(mult = c(0.05, 0.25))) +
       coord_cartesian(clip = 'off') +
+      scale_x_continuous(breaks = stats_tbl$lag, labels = label_fun) +
       labs(x = 'lag (years)', y = 'Pearson r') +
       theme_minimal() +
       theme(plot.margin = margin(t = 14, r = 8, b = 8, l = 8))
@@ -406,11 +477,18 @@ for(sheet in sheets_to_use) {
       # CSV suppressed by user request — unlagged joined timeseries not written to CSV
       message('(CSV suppressed) joined timeseries (unlagged) would have been: ', jf_unlag)
     }
+    # compute general (no-lag) correlation p-value for this veg
+    if(nrow(joined_unlagged) >= 3) {
+      ct_gen <- cor.test(joined_unlagged$inf_metric, joined_unlagged$gw_mean, method = 'pearson')
+      p_gen <- ct_gen$p.value
+    } else {
+      p_gen <- NA_real_
+    }
 
     # UNLAGGED scatter plot (GW year t vs veg year t) — plots must be unlagged per request
     tryCatch({
       if(nrow(joined_unlagged) >= 3) {
-        plot_scatter_lagged(inf_yearly_for_trend, gw_yearly, lag = 0, sheet = sheet, id_tag = id_tag, veg = veg, out_dir = out_dir)
+        plot_scatter_lagged(inf_yearly_for_trend, gw_yearly, lag = 0, sheet = sheet, id_tag = id_tag, veg = veg, out_dir = out_dir, veg_color = veg_color)
       } else {
         message('Not enough paired years for unlagged scatter (need >=3) for veg ', veg)
       }
@@ -418,24 +496,40 @@ for(sheet in sheets_to_use) {
 
     # Combined z-scored trend plot (unlagged pairing)
     tryCatch({
-      plot_trends_for_sheet(if(nrow(inf_yearly_for_trend)>0) inf_yearly_for_trend else NULL, gw_yearly, if(nrow(joined_unlagged)>0) joined_unlagged else NULL, sheet, id_tag, veg, out_dir, default_lag)
-      message('Saved combined trend plot for: ', paste0(sheet, ' / ', id_tag, ' / ', veg))
+      if(!grepl("Alagan_Yingsu", sheet)) {
+        plot_trends_for_sheet(if(nrow(inf_yearly_for_trend)>0) inf_yearly_for_trend else NULL, gw_yearly, if(nrow(joined_unlagged)>0) joined_unlagged else NULL, sheet, id_tag, veg, out_dir, default_lag, veg_color = veg_color)
+        message('Saved combined trend plot for: ', paste0(sheet, ' / ', id_tag, ' / ', veg))
+      } else {
+        message('Skipping trend plot for combined sheet: ', sheet)
+      }
     }, error = function(e) message('Trend plotting skipped for ', sheet, ': ', e$message))
 
     # dual-axis time series: vegetation fraction (primary) and groundwater (secondary) — UNLAGGED
     tryCatch({
-      plot_dual_axis_time_series(if(nrow(inf_yearly_for_trend)>0) inf_yearly_for_trend else NULL, gw_yearly, sheet, id_tag, veg, out_dir)
+      plot_dual_axis_time_series(if(nrow(inf_yearly_for_trend)>0) inf_yearly_for_trend else NULL, gw_yearly, sheet, id_tag, veg, out_dir, veg_color = veg_color)
     }, error = function(e) message('Dual-axis plot skipped for ', sheet, ': ', e$message))
 
-    veg_results[[veg]] <- list(stats = stats_tbl, joined_unlagged = joined_unlagged) 
-
-    # dual-axis time series: vegetation fraction (primary) and groundwater (secondary) — UNLAGGED
-    tryCatch({
-      plot_dual_axis_time_series(if(nrow(inf_yearly_for_trend)>0) inf_yearly_for_trend else NULL, gw_yearly, sheet, id_tag, veg, out_dir)
-    }, error = function(e) message('Dual-axis plot skipped for ', sheet, ': ', e$message))
-
-    veg_results[[veg]] <- list(stats = stats_tbl, joined_unlagged = joined_unlagged)
+    veg_results[[veg]] <- list(stats = stats_tbl, joined_unlagged = joined_unlagged, p_overall = p_gen)
   }
+
+  # after processing all vegs for this sheet, create combined overlay plots
+  if(length(veg_results) > 0 && !grepl("Alagan_Yingsu", sheet)) {
+    combined <- bind_rows(lapply(veg_results, function(x) x$stats), .id = 'veg')
+    if(nrow(combined) > 0) {
+      p_all <- ggplot(combined, aes(x = lag, y = pearson_r, color = veg, group = veg)) +
+        geom_line() + geom_point() +
+        geom_text(data = subset(combined, lag == 0), aes(label = sprintf("r=%.2f\np=%.3f", pearson_r, p_value)), vjust = -0.5, hjust = 0.5, size = 3) +
+        scale_color_manual(values = veg_palette) +
+          scale_y_continuous(limits = c(-1,1)) +
+        scale_x_continuous(breaks = unique(combined$lag), labels = label_fun(unique(combined$lag))) +
+        labs(x = 'lag (years)', y = 'Pearson r', title = paste('All Vegs:', sheet)) +
+        theme_minimal() + theme(plot.margin = margin(t = 14, r = 8, b = 8, l = 8))
+      fp <- file.path(out_dir, sprintf('r_vs_lag_%s_allvegs.png', sheet))
+      ggsave(fp, plot = p_all, width = 6, height = 4)
+      message('Saved combined correlation overview: ', fp)
+    }
+  }
+
   final_reports[[sheet]] <- list(chosen_location = if(!is.null(chosen_loc)) chosen_loc else id_base, veg_results = veg_results)
 }
 
@@ -450,9 +544,14 @@ for(sheet in names(final_reports)) {
     u_r <- if(nrow(unlag) == 1) unlag$pearson_r else NA_real_
     u_p <- if(nrow(unlag) == 1) unlag$p_value else NA_real_
     u_n <- if(nrow(unlag) == 1) unlag$n else NA_integer_
-    message(sprintf("Sheet %s / veg %s -> id=%s | unlagged (lag=0): r=%.3f p=%.3g n=%d; best lag=%d: r=%.3f p=%.3g n=%d",
-                    sheet, veg, fr$chosen_location, u_r, u_p, u_n,
-                    best$lag, best$pearson_r, best$p_value, best$n))
+    overall_p <- fr$veg_results[[veg]]$p_overall
+    b_lag <- if(nrow(best) == 1) best$lag       else NA_integer_
+    b_r   <- if(nrow(best) == 1) best$pearson_r else NA_real_
+    b_p   <- if(nrow(best) == 1) best$p_value   else NA_real_
+    b_n   <- if(nrow(best) == 1) best$n         else NA_integer_
+    message(sprintf("Sheet %s / veg %s -> id=%s | unlagged (lag=0): r=%.3f p=%.3g n=%d; overall p=%.3g; best lag=%d: r=%.3f p=%.3g n=%d",
+                    sheet, veg, fr$chosen_location, u_r, u_p, u_n, overall_p,
+                    b_lag, b_r, b_p, b_n))
   }
 }
 

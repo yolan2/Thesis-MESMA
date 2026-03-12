@@ -143,17 +143,9 @@ normalize_veg_name <- function(x) {
   tolower(trimws(x))
 }
 
-# --- Shared utility: compute pairwise Haversine distance matrix (km) ---
-# vectorised version avoids explicit loops for speed
-compute_haversine_distance_matrix <- function(coords) {
-  rad <- pi / 180
-  lat <- coords[,2] * rad
-  lon <- coords[,1] * rad
-  dlat <- outer(lat, lat, "-")
-  dlon <- outer(lon, lon, "-")
-  a <- sin(dlat/2)^2 + outer(cos(lat), cos(lat)) * sin(dlon/2)^2
-  2 * 6371 * asin(pmin(1, sqrt(a)))
-}
+# Compute_haversine_distance_matrix is defined in mesma_helpers.R; the
+# duplicate here has been removed to keep behaviour consistent across scripts.
+
 
 # --- Utility: interpret interpolation flag/option ---
 # Accepts logicals (TRUE/FALSE) or character strings.  Returns one of
@@ -201,25 +193,8 @@ whittaker_smooth <- function(y,
   as.numeric(z_hat)
 }
 
-# --- Shared utility: fit exponential variogram via NLS with fallback ---
-fit_exponential_variogram <- function(bin_mid, bin_gamma, total_var, dists) {
-  valid_bins <- !is.na(bin_gamma)
-  if (sum(valid_bins) < 2) return(NULL)
-  tryCatch({
-    nls_fit <- nls(g ~ s * (1 - exp(-d / r)),
-                   data = data.frame(d = bin_mid[valid_bins], g = bin_gamma[valid_bins]),
-                   start = list(s = total_var, r = median(dists)),
-                   lower = list(s = total_var * 0.1, r = max(dists) * 0.01),
-                   upper = list(s = total_var * 3, r = max(dists) * 2),
-                   algorithm = "port",
-                   control = list(maxiter = 50, warnOnly = TRUE))
-    as.numeric(coef(nls_fit)["r"])
-  }, error = function(e) {
-    thresh_idx <- which(bin_gamma[valid_bins] >= 0.5 * total_var)
-    if (length(thresh_idx) > 0) bin_mid[valid_bins][thresh_idx[1]]
-    else max(dists)
-  })
-}
+# Shared exponential variogram fitter now lives in mesma_helpers.R
+# to ensure consistent behaviour across scripts.
 
 # --- Shared utility: get dominant veg type per location ---
 get_dominant_veg_per_location <- function(df) {
@@ -259,35 +234,48 @@ bias_correct_timeseries <- function(full_data, bias_correction) {
     return(NULL)
   }
   norm_mat     <- bias_correction$norm_mat      # rows = true class, cols = predicted
-  class_counts <- bias_correction$class_counts  # named integer n_{i.}
-  cm_classes   <- rownames(norm_mat)
+  class_counts <- bias_correction$class_counts  # named integer n_{true,.}
+
+  # Stored matrix is P(predicted | true), but Olofsson correction needs
+  # P(true | map class). Reconstruct approximate counts and normalize by column.
+  count_mat <- sweep(norm_mat, 1, as.numeric(class_counts[rownames(norm_mat)]), `*`)
+  count_mat[!is.finite(count_mat)] <- 0
+  pred_counts <- colSums(count_mat, na.rm = TRUE)
+  post_mat <- count_mat
+  for (cj in seq_len(ncol(post_mat))) {
+    if (is.finite(pred_counts[cj]) && pred_counts[cj] > 0) {
+      post_mat[, cj] <- post_mat[, cj] / pred_counts[cj]
+    } else {
+      post_mat[, cj] <- 0
+    }
+  }
+  map_classes  <- colnames(post_mat)
+  true_classes <- rownames(post_mat)
 
   years <- sort(unique(full_data$year))
-  result_rows <- vector("list", length(years) * ncol(norm_mat))
+  result_rows <- vector("list", length(years) * nrow(post_mat))
   row_idx <- 0L
 
   for (yr in years) {
     yr_data <- full_data[full_data$year == yr, , drop = FALSE]
 
-    # W_i: raw map proportions keyed by lower-cased Veg name
+    # W_i: raw MAP proportions keyed by lower-cased Veg name.
+    # Keep the original absolute scale instead of renormalizing to vegetation-only.
     W_raw <- setNames(as.numeric(yr_data$global_coef),
                       tolower(as.character(yr_data$Veg)))
     W_raw[!is.finite(W_raw)] <- 0
 
-    shared  <- intersect(names(W_raw), cm_classes)
+    shared  <- intersect(names(W_raw), map_classes)
     if (length(shared) == 0) next
     W_sub   <- W_raw[shared]
-    W_total <- sum(W_sub, na.rm = TRUE)
-    if (!is.finite(W_total) || W_total <= 0) next
-    W_norm  <- W_sub / W_total          # proportions sum to 1
 
-    for (col_j in colnames(norm_mat)) {
+    for (true_j in true_classes) {
       adj_p <- 0
       se_sq <- 0
-      for (cls_i in shared) {
-        wi  <- W_norm[[cls_i]]
-        qij <- norm_mat[cls_i, col_j]
-        ni  <- class_counts[[cls_i]]
+      for (map_i in shared) {
+        wi  <- W_sub[[map_i]]
+        qij <- post_mat[true_j, map_i]
+        ni  <- pred_counts[[map_i]]
         if (!is.finite(wi) || !is.finite(qij)) next
         adj_p <- adj_p + wi * qij
         if (!is.na(ni) && ni > 1L) {
@@ -297,8 +285,8 @@ bias_correct_timeseries <- function(full_data, bias_correction) {
       se <- sqrt(max(0, se_sq))
 
       # Preserve original Veg capitalisation
-      orig_rows <- yr_data[tolower(as.character(yr_data$Veg)) == col_j, , drop = FALSE]
-      orig_veg  <- if (nrow(orig_rows) > 0) as.character(orig_rows$Veg[1]) else col_j
+      orig_rows <- yr_data[tolower(as.character(yr_data$Veg)) == true_j, , drop = FALSE]
+      orig_veg  <- if (nrow(orig_rows) > 0) as.character(orig_rows$Veg[1]) else true_j
 
       row_idx <- row_idx + 1L
       result_rows[[row_idx]] <- data.frame(
@@ -313,7 +301,7 @@ bias_correct_timeseries <- function(full_data, bias_correction) {
     }
 
     # Pass-through uncorrected values for classes absent from confusion matrix
-    missing_classes <- setdiff(tolower(names(W_raw)), cm_classes)
+    missing_classes <- setdiff(tolower(names(W_raw)), map_classes)
     for (cls in missing_classes) {
       # Find original row to preserve Veg capitalisation
       orig_rows <- yr_data[tolower(as.character(yr_data$Veg)) == cls, , drop = FALSE]
@@ -363,12 +351,12 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
       geom_line(linewidth = 1) +
       geom_point(show.legend = FALSE) +
       geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
-      labs(title = paste0(method, "-Normalized Vegetation Fractions"),
+       labs(title = paste0(method, ": Vegetation Fractions"),
            x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
       theme_minimal()
 
     # --- Olofsson-style bias correction overlay (dashed lines + SE band) ---
-    adj_veg <- bias_correct_timeseries(inf_veg, bias_correction)
+    adj_veg <- bias_correct_timeseries(full_data, bias_correction)
     if (!is.null(adj_veg) && nrow(adj_veg) > 0) {
       adj_veg <- adj_veg[adj_veg$Veg %in% unique(inf_veg$Veg), , drop = FALSE]
       if (nrow(adj_veg) > 0) {
@@ -404,7 +392,7 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
     geom_line(color = "saddlebrown", linewidth = 1) +
     geom_point(color = "saddlebrown") +
     geom_ribbon(aes(ymin = coef_025, ymax = coef_975), alpha = 0.15, fill = "saddlebrown", color = NA) +
-    labs(title = paste0(method, "-Based Barren Fraction"), x = "Year", y = "Barren Fraction") +
+    labs(title = paste0(method, ": Barren Fraction"), x = "Year", y = "Barren Fraction") +
     scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
     theme_minimal()
   ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_barren_cover.png")), p_barren, width = 8, height = 6)
@@ -429,7 +417,7 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
         geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.12, color = NA) +
         scale_color_manual(values = SPECIES_COLORS) +
         scale_fill_manual(values = SPECIES_COLORS) +
-        labs(title = paste0("Inference ", method, ": Species"),
+           labs(title = paste0(method, " Species"),
              x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
         theme_minimal()
       ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_separate.png")), p_sp_ts, width = 8, height = 6)
@@ -453,7 +441,7 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
           p_sp_stacked <- ggplot(df_prop_sp, aes(x = year, y = prop, fill = Veg)) +
             geom_area() +
             scale_fill_manual(values = SPECIES_COLORS) +
-            labs(title = paste0("Inference ", method, ": Species (Proportion, stacked)"),
+              labs(title = paste0(method, " Species Share"),
                  x = "Year", y = "Proportion", fill = "Veg") +
             theme_minimal()
           ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_stacked.png")), p_sp_stacked, width = 8, height = 6)
@@ -469,15 +457,8 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
 
 # RAW_BANDS defined in mesma_config.R
 # NOTE: Keep default args literal (not RAW_BANDS) so this remains worker-safe in parallel futures.
-# The default list will be pruned if EXCLUDE_BLUE_BAND is enabled, but we avoid
-# referencing the global variable directly in the default expression because the
-# default is evaluated when the function is created.  Instead we tweak inside.
+# Blue band is always retained.
 normalize_band_names <- function(df, bands = c("blue", "green", "red", "nir", "swir1", "swir2")) {
-  # drop blue from the working list if requested (handled here rather than in the
-  # default to keep the function definition worker-safe)
-  if (exists("EXCLUDE_BLUE_BAND", inherits = TRUE) && isTRUE(get("EXCLUDE_BLUE_BAND", inherits = TRUE))) {
-    bands <- setdiff(bands, "blue")
-  }
   if (is.null(df)) stop("normalize_band_names: df is NULL")
   if (nrow(df) == 0) return(df)
   current_names <- names(df)
@@ -494,42 +475,12 @@ normalize_band_names <- function(df, bands = c("blue", "green", "red", "nir", "s
   df
 }
 
-# Compute all supported indices from raw bands.
+# Compute all supported indices from the current raw-band columns.
+# This intentionally overwrites any pre-existing band-derived columns so they
+# stay aligned with the latest band values (e.g. after sensor bias correction).
 # IMPORTANT: This must be worker-safe (parallel futures).
 # NOTE: Indices that depend on a soil-line slope (e.g. WDVI) will be computed only
 # if a finite slope is available (either passed in or present as SOIL_LINE_SLOPE).
-compute_indices_from_bands <- function(df,
-                                      raw_bands = NULL) {
-  if (is.null(df)) stop("compute_indices_from_bands: df is NULL")
-  if (nrow(df) == 0) return(df)
-  eps <- 1e-9
-
-  # Determine raw bands to consider.  We purposely avoid referencing RAW_BANDS
-  # here to keep the function self-contained for parallel workers.
-  if (is.null(raw_bands)) {
-    raw_bands <- c("blue", "green", "red", "nir", "swir1", "swir2")
-  }
-
-  has_bands <- intersect(raw_bands, names(df))
-  if (length(has_bands) == 0) return(df)
-
-  # Convert bands to numeric once (avoids 50+ repeated as.numeric() calls)
-  b <- list()
-  for (bn in has_bands) b[[bn]] <- as.numeric(df[[bn]])
-
-  has <- function(...) all(c(...) %in% names(b))
-
-  # Only compute OPTIMAL_INDICES
-  if (has('nir','red','blue')) df$EVI <- 2.5 * (b$nir - b$red) / (b$nir + 6 * b$red - 7.5 * b$blue + 1)
-  if (has('red','blue','nir')) df$PSRI <- (b$red - b$blue) / (b$nir + eps)
-  if (has('nir','swir1')) df$NDMI <- (b$nir - b$swir1) / (b$nir + b$swir1 + eps)
-  if (has('swir1','swir2')) df$NDTI <- (b$swir1 - b$swir2) / (b$swir1 + b$swir2 + eps)
-  if (has('swir1','nir')) df$MSI <- b$swir1 / (b$nir + eps)
-  if (has('nir','red')) df$MSAVI <- (2 * b$nir + 1 - sqrt(pmax(0, (2 * b$nir + 1)^2 - 8 * (b$nir - b$red)))) / 2
-
-  df
-}
-
 # L2-normalize a feature vector per observation (whole-vector)
 #
 # Input: vec with n_indices * n_bins values.
@@ -582,6 +533,7 @@ mesma_zscore_vec_by_index <- function(vec, indices, means, sds, n_bins, eps_sigm
   out
 }
 
+# optional matrix version (unused here but kept for API parity)
 mesma_zscore_mat_by_index <- function(mat, indices, means, sds, n_bins, eps_sigma = NULL) {
   if (is.null(eps_sigma)) {
     eps_sigma <- if (exists("EPS_SIGMA", inherits = TRUE)) get("EPS_SIGMA", inherits = TRUE) else 1e-8
@@ -605,8 +557,7 @@ mesma_zscore_mat_by_index <- function(mat, indices, means, sds, n_bins, eps_sigm
   out
 }
 
-# Compute diagonal covariance for endmember bundle sampling
-# Uses per-band variance only (no cross-band covariance) which is more reliable
+# (rest of script continues...)
 # with small sample sizes typical in endmember bundles (n=3-7)
 compute_bundle_covariance <- function(Mv, verbose = FALSE) {
   # Mv: n x p matrix of endmember variant vectors (rows = variants, cols = features)
@@ -721,6 +672,29 @@ if ("location_id" %in% names(raw_df) && !is.character(raw_df$location_id)) {
 # === END GEE INPUT MAPPING BLOCK ===
 
 df <- raw_df
+
+# --- drop observations with phenology year before 1989 ----------------------
+# applying the cutoff here ensures downstream scripts (january_averages,
+# fit_mesma, etc.) never see the unwanted years.  We compute a temporary
+# pheno_year if it is not already present so that filtering works on raw
+# input CSVs as well.
+cutoff <- 1989
+if ("date" %in% names(df) || "pheno_year" %in% names(df)) {
+  ph <- NULL
+  if ("pheno_year" %in% names(df)) {
+    ph <- df$pheno_year
+  } else {
+    ph <- ifelse(lubridate::month(df$date) >= 3,
+                 lubridate::year(df$date),
+                 lubridate::year(df$date) - 1)
+  }
+  n_before <- nrow(df)
+  keep <- is.na(ph) | ph >= cutoff
+  df <- df[keep, , drop = FALSE]
+  if (n_before != nrow(df)) {
+    cat(sprintf("[FILTER] dropped %d rows with pheno_year < %d\n", n_before - nrow(df), cutoff))
+  }
+}
 
 # Preserve zenith.angle if present (e.g. from metadata), otherwise allow recalculation
 if ("zenith.angle" %in% names(df)) {
@@ -892,51 +866,19 @@ if ("date" %in% names(df)) {
 # =============================================================================
 # SENSOR BIAS CORRECTION — applied in-place before any index computation,
 # outlier removal, or PPI baseline derivation.
-# Shifts LANDSAT_89 (OLI) raw bands to the ETM+ radiometric scale using the
-# per-band mean biases produced by satellite_bias_check.R.
+# Harmonises LANDSAT_89 (OLI) raw bands to the ETM+ radiometric scale using
+# per-band affine coefficients (slope + intercept) from satellite_bias_check.R:
+#   ETM+ ≈ slope * OLI + intercept
 # =============================================================================
 {
-  .bias_csv <- file.path("satellite_bias_check", "bias_stats_features.csv")
-  if (file.exists(.bias_csv) && "satellite" %in% names(df)) {
-    .bias_tbl <- tryCatch(data.table::fread(.bias_csv), error = function(e) NULL)
-    if (!is.null(.bias_tbl) && "band" %in% names(.bias_tbl) && "mean_bias" %in% names(.bias_tbl)) {
-      .raw_bands   <- c("blue", "green", "red", "nir", "swir1", "swir2")
-      .bias_tbl[, band_lower := tolower(band)]
-      .bias_bands  <- .bias_tbl[band_lower %in% .raw_bands]
-      .oli_mask    <- tolower(trimws(as.character(df$satellite))) == "landsat_89"
-      cat(sprintf("[BIAS CORR] %d/%d training rows are LANDSAT_89; shifting to ETM+ scale\n",
-                  sum(.oli_mask, na.rm = TRUE), nrow(df)))
-      for (.i in seq_len(nrow(.bias_bands))) {
-        .b   <- .bias_bands$band_lower[.i]
-        .adj <- as.numeric(.bias_bands$mean_bias[.i])   # bias = 457-89 → add to OLI
-        if (!is.finite(.adj) || !(.b %in% names(df))) next
-        df[[.b]] <- as.numeric(df[[.b]])
-        df[[.b]][.oli_mask] <- df[[.b]][.oli_mask] + .adj
-        cat(sprintf("[BIAS CORR]   %-6s  %+.6f applied to %d OLI rows\n",
-                    .b, .adj, sum(.oli_mask & is.finite(df[[.b]]))))
-      }
-      cat("[BIAS CORR] Band correction complete; indices will be recomputed from corrected bands.\n")
-    } else {
-      cat("[BIAS CORR] Bias CSV found but could not parse; skipping.\n")
-    }
-  } else {
-    if (!file.exists(.bias_csv))
-      cat(sprintf("[BIAS CORR] %s not found — run satellite_bias_check.R to generate it.\n", .bias_csv))
-    if (!"satellite" %in% names(df))
-      cat("[BIAS CORR] No 'satellite' column in training data; bias correction skipped.\n")
-  }
-  rm(list = intersect(ls(), c(".bias_csv", ".bias_tbl", ".raw_bands", ".bias_bands",
-                               ".oli_mask", ".i", ".b", ".adj")))
+  df <- apply_oli_etm_bias_correction(df, dataset_label = "training", log_prefix = "[BIAS CORR]")
 }
 # =============================================================================
 
-# Compute NDDI and MSAVI from raw bands so early contamination filtering can proceed
+# Recompute all band-derived indices from the bias-corrected raw bands so early
+# contamination filtering and downstream normalization use the corrected values.
 before_cols <- names(df)
 df <- compute_indices_from_bands(df)
-
-if (exists("EXCLUDE_BLUE_BAND", inherits = TRUE) && isTRUE(get("EXCLUDE_BLUE_BAND", inherits = TRUE))) {
-  if ("blue" %in% names(df)) df$blue <- NULL
-}
 
 new_cols <- setdiff(names(df), before_cols)
 if (length(new_cols) > 0) {
@@ -979,7 +921,7 @@ if ("NDDI" %in% names(df)) {
         p_years <- ggplot2::ggplot(year_stats, ggplot2::aes(x = .year, y = avg_images_per_location)) +
           ggplot2::geom_line() + ggplot2::geom_point() +
           ggplot2::theme_minimal() +
-          ggplot2::labs(title = "Avg images per location per year",
+          ggplot2::labs(title = "Images per Location by Year",
                         x = "Year", y = "Avg images / location")
         print(p_years)
         if (exists("OUTPUT_DIR") && !is.null(OUTPUT_DIR)) {
@@ -1005,7 +947,7 @@ if ("NDDI" %in% names(df)) {
         p_years <- ggplot2::ggplot(year_stats, ggplot2::aes(x = year, y = avg_images_per_location)) +
           ggplot2::geom_line() + ggplot2::geom_point() +
           ggplot2::theme_minimal() +
-          ggplot2::labs(title = "Avg images per location per year",
+          ggplot2::labs(title = "Images per Location by Year",
                         x = "Year", y = "Avg images / location")
         print(p_years)
         if (exists("OUTPUT_DIR") && !is.null(OUTPUT_DIR)) {
@@ -1239,21 +1181,10 @@ if ("location_id" %in% names(df) && "location_id" %in% names(gpts_map)) {
 
   post_non_na <- sum(!is.na(joined$Veg) & joined$Veg != "")
 
-  if (post_non_na == pre_non_na && "location_row" %in% names(gpts_map)) {
-    df_ids <- unique(na.omit(as.character(df$location_id)))
-    match_count <- length(intersect(df_ids, unique(na.omit(as.character(gpts_map$location_row)))))
-    if (match_count > 0) {
-      cat(sprintf("[NOTICE] No matches by 'location_id' — attempting join by row-number mapping (matched ids=%d)\n", match_count))
-      joined2 <- join_and_fill_veg(df, gpts_map, join_by = c("location_id" = "location_row"))
-
-      if (sum(!is.na(joined2$Veg) & joined2$Veg != "") > post_non_na) {
-        joined <- joined2
-        post_non_na <- sum(!is.na(joined$Veg) & joined$Veg != "")
-        cat(sprintf("[NOTICE] Row-number join gained %d Veg rows\n", post_non_na - pre_non_na))
-      } else {
-        cat("[NOTICE] Row-number join did not increase Veg mapping; keeping original join state.\n")
-    }
-  }
+  # The old 'row-number mapping' fallback has been removed per user request.  We
+  # only ever join on the canonical "location_id" field and do not attempt any
+  # secondary join strategies.  This simplifies behaviour and avoids confusing
+  # implicit matches when IDs are missing or misaligned.
 
   if ("lat" %in% names(gpts_map)) {
     if ("lat.geo" %in% names(joined)) {
@@ -1261,7 +1192,6 @@ if ("location_id" %in% names(df) && "location_id" %in% names(gpts_map)) {
       joined$lat.geo <- NULL
       cat("[NOTICE] Replaced CSV latitude with GeoJSON latitude where available\n")
     }
-  }
   }
   df <- joined
 
@@ -1292,18 +1222,14 @@ if (!exists("compute_soil_line_slope", mode = "function")) {
 compute_soil_line_slope(df)
 df <- compute_indices_from_bands(df)
 
-if (exists("EXCLUDE_BLUE_BAND", inherits = TRUE) && isTRUE(get("EXCLUDE_BLUE_BAND", inherits = TRUE))) {
-  if ("blue" %in% names(df)) df$blue <- NULL
-}
-
-# STEP 2: Calculate PPI on raw data, now that Veg column is available
+# STEP 2: Recalculate PPI from the bias-corrected raw bands, now that Veg is available
 cat("[NOTICE] Retaining all years for PPI baseline calculation and trend analysis. Training subset will be filtered later.\n")
 if (exists("add_ppi_columns")) {
-  if (!"PPI" %in% names(df) || all(!is.finite(df$PPI))) {
-    dvi_soil_vec <- compute_dvi_soil_per_location(df)
-    df <- add_ppi_columns(df, dvi_soil = dvi_soil_vec)
-    cat("[PPI] Added PPI to dataset before normalization (per-location dvi_soil + per-location M).\n")
-  }
+  if ("PPI_raw" %in% names(df)) df$PPI_raw <- NULL
+  if ("ppi_norm" %in% names(df)) df$ppi_norm <- NULL
+  dvi_soil_vec <- compute_dvi_soil_per_location(df)
+  df <- add_ppi_columns(df, dvi_soil = dvi_soil_vec)
+  cat("[PPI] Recomputed PPI from bias-corrected raw bands before normalization (per-location dvi_soil + per-location M).\n")
 } else {
   stop("[PPI] add_ppi_columns not available; cannot compute PPI")
 }
@@ -1335,8 +1261,7 @@ norm_result <- normalize_mesma_data(df, cols = unique(c(OPTIMAL_INDICES, RAW_BAN
 df <- norm_result$df
 INDEX_SCALES <- norm_result$INDEX_SCALES
 
-ppi_max <- if (exists("PPI_FULL_VEG_COVER")) get("PPI_FULL_VEG_COVER") else 0.4
-df <- backup_and_normalize_ppi(df, ppi_max)
+df <- backup_and_normalize_ppi(df)
 
 # Filter to only include selected vegetation types
 selected_vegs <- c("herbs", "populus", "tamarix", "barren")

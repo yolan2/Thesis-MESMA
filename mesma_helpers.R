@@ -1,4 +1,90 @@
 
+apply_oli_etm_bias_correction <- function(df,
+                                          dataset_label = "training",
+                                          satellite_col = "satellite",
+                                          bias_csv = NULL,
+                                          raw_bands = c("blue", "green", "red", "nir", "swir1", "swir2"),
+                                          enable = NULL,
+                                          log_prefix = "[BIAS CORR]") {
+  if (is.null(bias_csv)) {
+    # Prefer the one in OUT_DIR (where satellite_bias_check.R actually writes if mesma_config.R is sourced)
+    if (exists("OUT_DIR", inherits = TRUE)) {
+      bias_csv <- file.path(get("OUT_DIR", inherits = TRUE), "bias_stats_features.csv")
+    }
+    # Fallback to local folder if OUT_DIR version doesn't exist
+    if (is.null(bias_csv) || !file.exists(bias_csv)) {
+      bias_csv <- "satellite_bias_check/bias_stats_features.csv"
+    }
+  }
+
+  if (is.null(enable)) {
+    enable <- if (exists("ENABLE_BAND_BIAS_CORRECTION", inherits = TRUE)) {
+      isTRUE(get("ENABLE_BAND_BIAS_CORRECTION", inherits = TRUE))
+    } else {
+      TRUE
+    }
+  }
+
+  if (!isTRUE(enable)) {
+    cat(sprintf("%s Band-level bias correction disabled (ENABLE_BAND_BIAS_CORRECTION=FALSE).\n", log_prefix))
+    return(df)
+  }
+
+  if (!(satellite_col %in% names(df))) {
+    cat(sprintf("%s No '%s' column in %s data; bias correction skipped.\n",
+                log_prefix, satellite_col, dataset_label))
+    return(df)
+  }
+
+  if (!file.exists(bias_csv)) {
+    stop(sprintf("%s %s not found — run satellite_bias_check.R to generate it.", log_prefix, bias_csv))
+  }
+
+  bias_tbl <- tryCatch(data.table::fread(bias_csv), error = function(e) NULL)
+  if (is.null(bias_tbl) || !all(c("band", "ols_slope", "ols_intercept") %in% names(bias_tbl))) {
+    stop(sprintf("%s Bias CSV is missing required columns (band / ols_slope / ols_intercept). Re-run satellite_bias_check.R to regenerate it.",
+                 log_prefix))
+  }
+  if (!("ols_significant" %in% names(bias_tbl))) {
+    bias_tbl[, ols_significant := TRUE]
+    cat(sprintf("%s 'ols_significant' not found in bias CSV; defaulting to TRUE for all bands.\n", log_prefix))
+  }
+
+  bias_tbl[, band_lower := tolower(trimws(as.character(band)))]
+  bias_bands <- bias_tbl[band_lower %in% raw_bands]
+  oli_mask <- tolower(trimws(as.character(df[[satellite_col]]))) == "landsat_89"
+
+  cat(sprintf("%s %d/%d %s rows are LANDSAT_89; applying affine (slope+intercept) correction\n",
+              log_prefix, sum(oli_mask, na.rm = TRUE), nrow(df), dataset_label))
+
+  for (i in seq_len(nrow(bias_bands))) {
+    b <- bias_bands$band_lower[i]
+    if (!(b %in% names(df))) next
+
+    if (!isTRUE(bias_bands$ols_significant[i])) {
+      p_val <- if ("ols_p_value" %in% names(bias_bands)) suppressWarnings(as.numeric(bias_bands$ols_p_value[i])) else NA_real_
+      p_msg <- if (is.finite(p_val)) sprintf("p=%.6f", p_val) else "p=NA"
+      cat(sprintf("%s   %-6s  skipped (no significant relation, %s)\n",
+                  log_prefix, b, p_msg))
+      next
+    }
+
+    slope <- suppressWarnings(as.numeric(bias_bands$ols_slope[i]))
+    intcp <- suppressWarnings(as.numeric(bias_bands$ols_intercept[i]))
+    if (!is.finite(slope) || !is.finite(intcp)) {
+      stop(sprintf("%s Non-finite affine terms for band '%s'; check satellite_bias_check.R output.", log_prefix, b))
+    }
+
+    df[[b]] <- as.numeric(df[[b]])
+    df[[b]][oli_mask] <- slope * df[[b]][oli_mask] + intcp
+    cat(sprintf("%s   %-6s  slope=%.6f  intercept=%+.6f  (%d OLI rows)\n",
+                log_prefix, b, slope, intcp, sum(oli_mask & is.finite(df[[b]]))))
+  }
+
+  cat(sprintf("%s Band correction complete; indices will be recomputed from corrected bands.\n", log_prefix))
+  df
+}
+
 compute_soil_line_slope <- function(input_df, min_samples = NULL, assign_global_dvi = TRUE) {
   if (is.null(min_samples)) {
     if (exists("MIN_ENDMEMBER_SAMPLES", inherits = TRUE)) {
@@ -47,6 +133,267 @@ compute_soil_line_slope <- function(input_df, min_samples = NULL, assign_global_
   }
 
   invisible(slope)
+}
+
+# --- Spatial autocorrelation / block-bootstrap utilities ---
+# Shared helper functions for estimating spatial dependence and performing
+# spatially-aware "moving block" resampling of locations.  Used by both the
+# MESMA fitting script and the january_averages workflow so that behaviour is
+# identical regardless of the entry point.
+
+# compute pairwise Haversine distance matrix (km) for an Nx2 lon/lat input.
+compute_haversine_distance_matrix <- function(coords) {
+  rad <- pi / 180
+  lat <- coords[,2] * rad
+  lon <- coords[,1] * rad
+  dlat <- outer(lat, lat, "-")
+  dlon <- outer(lon, lon, "-")
+  a <- sin(dlat/2)^2 + outer(cos(lat), cos(lat)) * sin(dlon/2)^2
+  2 * 6371 * asin(pmin(1, sqrt(a)))
+}
+
+# Shared utility: fit exponential variogram via NLS with fallback
+# (previously duplicated in multiple scripts).  Returns estimated range (r)
+# or NULL if fit failed; used by estimate_autocorrelation_range.
+fit_exponential_variogram <- function(bin_mid, bin_gamma, total_var, dists) {
+  valid_bins <- !is.na(bin_gamma)
+  if (sum(valid_bins) < 2) return(NULL)
+  tryCatch({
+    nls_fit <- nls(g ~ s * (1 - exp(-d / r)),
+                   data = data.frame(d = bin_mid[valid_bins], g = bin_gamma[valid_bins]),
+                   start = list(s = total_var, r = median(dists)),
+                   lower = list(s = total_var * 0.1, r = max(dists) * 0.01),
+                   upper = list(s = total_var * 3, r = max(dists) * 2),
+                   algorithm = "port",
+                   control = list(maxiter = 50, warnOnly = TRUE))
+    as.numeric(coef(nls_fit)["r"])
+  }, error = function(e) {
+    thresh_idx <- which(bin_gamma[valid_bins] >= 0.5 * total_var)
+    if (length(thresh_idx) > 0) bin_mid[valid_bins][thresh_idx[1]]
+    else max(dists)
+  })
+}
+
+# Collect unique coordinates for a list of locations.  Prefers the provided
+# df_tasks/all_coefs frame but will fall back to the global gpts_map if
+# necessary.  Coordinates are deduplicated (keeping finite values first).
+collect_location_coords <- function(locations, df_tasks = NULL, all_coefs = NULL) {
+  locations <- trimws(as.character(locations))
+  locations <- locations[!is.na(locations) & locations != ""]
+  if (length(locations) == 0) return(data.frame(location_id = character(0), lat = numeric(0), lon = numeric(0)))
+
+  cand <- NULL
+  if (!is.null(df_tasks) && all(c("location_id","lat","lon") %in% names(df_tasks))) {
+    cand <- df_tasks[, c("location_id","lat","lon"), drop = FALSE]
+  } else if (!is.null(all_coefs) && all(c("location_id","lat","lon") %in% names(all_coefs))) {
+    cand <- all_coefs[, c("location_id","lat","lon"), drop = FALSE]
+  }
+
+  if (!is.null(cand)) {
+    cand$location_id <- trimws(as.character(cand$location_id))
+    cand$lat <- suppressWarnings(as.numeric(cand$lat))
+    cand$lon <- suppressWarnings(as.numeric(cand$lon))
+    cand <- cand[!is.na(cand$location_id) & cand$location_id != "", , drop = FALSE]
+    cand <- deduplicate_coords(cand)
+  }
+
+  # fall back to global gpts_map if coords still inadequate
+  if ((is.null(cand) || nrow(cand) == 0 || all(is.na(cand$lat)) || all(is.na(cand$lon))) &&
+      exists("gpts_map", envir = globalenv())) {
+    gm <- get("gpts_map", envir = globalenv())
+    if (!is.null(gm) && all(c("location_id","lat","lon") %in% names(gm))) {
+      cand <- gm[, c("location_id","lat","lon"), drop = FALSE]
+      cand$location_id <- trimws(as.character(cand$location_id))
+      cand$lat <- suppressWarnings(as.numeric(cand$lat))
+      cand$lon <- suppressWarnings(as.numeric(cand$lon))
+      cand <- cand[!is.na(cand$location_id) & cand$location_id != "", , drop = FALSE]
+      cand <- deduplicate_coords(cand)
+    }
+  }
+
+  if (is.null(cand) || nrow(cand) == 0) {
+    return(data.frame(location_id = locations, lat = NA_real_, lon = NA_real_))
+  }
+  cand <- cand[match(locations, cand$location_id), , drop = FALSE]
+  if (nrow(cand) == 0) {
+    return(data.frame(location_id = locations, lat = NA_real_, lon = NA_real_))
+  }
+  cand
+}
+
+# Estimate spatial autocorrelation range using an exponential variogram.
+estimate_autocorrelation_range <- function(coords_df, values, fallback_km = 30.0) {
+  if (is.null(coords_df) || nrow(coords_df) == 0) return(fallback_km)
+  if (!all(c("lat", "lon") %in% names(coords_df))) return(fallback_km)
+
+  lat <- suppressWarnings(as.numeric(coords_df$lat))
+  lon <- suppressWarnings(as.numeric(coords_df$lon))
+  values <- suppressWarnings(as.numeric(values))
+
+  valid <- which(is.finite(lat) & is.finite(lon) & is.finite(values))
+  if (length(valid) < 5) return(fallback_km)  # need enough pairs
+
+  coords <- cbind(lon[valid], lat[valid])
+  vals <- values[valid]
+  if (var(vals, na.rm = TRUE) == 0) return(fallback_km)
+
+  dist_mat <- compute_haversine_distance_matrix(coords)
+  dists <- dist_mat[upper.tri(dist_mat)]
+  coef_diffs_sq <- outer(vals, vals, function(a, b) (a - b)^2)
+  gamma_vals <- coef_diffs_sq[upper.tri(coef_diffs_sq)] / 2
+  if (length(dists) == 0) return(fallback_km)
+
+  total_var <- var(vals, na.rm = TRUE)
+  n_bins <- min(10, max(3, length(dists) %/% 5))
+  bin_breaks <- unique(quantile(dists, probs = seq(0, 1, length.out = n_bins + 1)))
+  if (length(bin_breaks) < 3) return(fallback_km)
+
+  bin_mid <- (bin_breaks[-length(bin_breaks)] + bin_breaks[-1]) / 2
+  bin_gamma <- numeric(length(bin_mid))
+  for (bb in seq_along(bin_mid)) {
+    in_bin <- dists >= bin_breaks[bb] & dists < bin_breaks[bb + 1]
+    bin_gamma[bb] <- if (sum(in_bin) > 0) median(gamma_vals[in_bin]) else NA
+  }
+  valid_bins <- !is.na(bin_gamma)
+  if (sum(valid_bins) < 2) return(fallback_km)
+
+  range_est <- fit_exponential_variogram(bin_mid, bin_gamma, total_var, dists)
+  if (is.null(range_est)) return(fallback_km)
+  range_est <- as.numeric(range_est)
+  if (!is.finite(range_est) || range_est <= 0) return(fallback_km)
+
+  range_est <- max(1, min(range_est, 500))
+  cat(sprintf("[SPATIAL] Estimated autocorrelation range: %.1f km (used as block size)\n", range_est))
+  range_est
+}
+
+# Moran's I test for significant spatial autocorrelation; returns TRUE if
+# block bootstrap should be used.
+test_spatial_autocorrelation <- function(coords_df, values, alpha = 0.05, n_perm = 199) {
+  if (is.null(coords_df) || nrow(coords_df) == 0) return(FALSE)
+  if (!all(c("lat", "lon") %in% names(coords_df))) return(FALSE)
+  lat  <- suppressWarnings(as.numeric(coords_df$lat))
+  lon  <- suppressWarnings(as.numeric(coords_df$lon))
+  vals <- suppressWarnings(as.numeric(values))
+  ok   <- is.finite(lat) & is.finite(lon) & is.finite(vals)
+  if (sum(ok) < 5) return(FALSE)
+  lat  <- lat[ok]; lon <- lon[ok]; vals <- vals[ok]
+  if (var(vals) == 0) return(FALSE)
+
+  dist_mat <- as.matrix(compute_haversine_distance_matrix(cbind(lon, lat)))
+  if (!is.matrix(dist_mat) || nrow(dist_mat) < 2 || ncol(dist_mat) < 2) return(FALSE)
+  w <- 1 / dist_mat
+  diag(w) <- 0
+  w[!is.finite(w)] <- 0
+  rs <- rowSums(w, na.rm = TRUE); rs[rs == 0] <- 1
+  w  <- w / rs
+
+  moran_stat <- function(x) {
+    n  <- length(x); xc <- x - mean(x)
+    s0 <- sum(w, na.rm = TRUE); if (s0 == 0) return(0)
+    (n / s0) * sum(w * outer(xc, xc), na.rm = TRUE) / sum(xc^2)
+  }
+
+  obs_i  <- moran_stat(vals)
+  perm_i <- replicate(n_perm, moran_stat(sample(vals)))
+  p_val  <- (sum(perm_i >= obs_i) + 1L) / (n_perm + 1L)
+  cat(sprintf("[SPATIAL] Moran's I = %.4f, p = %.3f (%d perms) -> block bootstrap: %s\n",
+              obs_i, p_val, n_perm, if (p_val < alpha) "YES" else "NO"))
+  p_val < alpha
+}
+
+# Return estimated block size (km) if spatial autocorrelation is significant,
+# else zero so the bootstrap falls back to i.i.d. sampling.
+block_km_if_significant <- function(coords_df, values, alpha = 0.05, n_perm = 199,
+                                    fallback_km = BOOTSTRAP_BLOCK_KM) {
+  sig <- tryCatch(
+    test_spatial_autocorrelation(coords_df, values, alpha = alpha, n_perm = n_perm),
+    error = function(e) { warning("[SPATIAL] Moran test error: ", e$message); FALSE }
+  )
+  if (!isTRUE(sig)) {
+    cat("[SPATIAL] No significant spatial autocorrelation -> using regular (i.i.d.) bootstrap\n")
+    return(0)
+  }
+  estimate_autocorrelation_range(coords_df, values, fallback_km = fallback_km)
+}
+
+# Spatial block bootstrap for a vector of location IDs.  Returns a resampled
+# subset of the same length as n_draw, either i.i.d. or respecting spatial
+# blocks of size block_km.  Includes guard against too few blocks causing
+# artificially narrow confidence intervals.
+spatial_block_sample_locations <- function(locations, coords_df, n_draw,
+                                           block_km = NULL,
+                                           max_missing_frac = BOOTSTRAP_BLOCK_MAX_MISSING_FRAC) {
+  locations <- trimws(as.character(locations))
+  locations <- locations[!is.na(locations) & locations != ""]
+  n_draw <- as.integer(n_draw)
+  if (length(locations) == 0 || n_draw < 1) return(character(0))
+
+  if (!isTRUE(exists("ENABLE_SPATIAL_BLOCK_BOOTSTRAP")) || !isTRUE(ENABLE_SPATIAL_BLOCK_BOOTSTRAP)) {
+    return(sample(locations, n_draw, replace = TRUE))
+  }
+
+  if (is.null(coords_df) || nrow(coords_df) == 0 || !all(c("location_id","lat","lon") %in% names(coords_df))) {
+    return(sample(locations, n_draw, replace = TRUE))
+  }
+
+  coords_df$location_id <- trimws(as.character(coords_df$location_id))
+  coords_df$lat <- suppressWarnings(as.numeric(coords_df$lat))
+  coords_df$lon <- suppressWarnings(as.numeric(coords_df$lon))
+
+  coords_df <- coords_df[match(locations, coords_df$location_id), , drop = FALSE]
+  if (nrow(coords_df) == 0) return(sample(locations, n_draw, replace = TRUE))
+
+  ok <- is.finite(coords_df$lat) & is.finite(coords_df$lon)
+  missing_frac <- mean(!ok)
+  if (!is.finite(missing_frac) || missing_frac > max_missing_frac || sum(ok) < 3) {
+    return(sample(locations, n_draw, replace = TRUE))
+  }
+
+  if (is.null(block_km)) block_km <- BOOTSTRAP_BLOCK_KM
+  block_km <- as.numeric(block_km)
+  if (!is.finite(block_km) || block_km <= 0) return(sample(locations, n_draw, replace = TRUE))
+
+  mean_lat <- mean(coords_df$lat[ok])
+  km_per_deg_lat <- 111.32
+  km_per_deg_lon <- 111.32 * cos(mean_lat * pi / 180)
+  km_per_deg_lon <- max(1e-6, km_per_deg_lon)
+
+  cell_lat_deg <- block_km / km_per_deg_lat
+  cell_lon_deg <- block_km / km_per_deg_lon
+  cell_lat_deg <- max(1e-8, cell_lat_deg)
+  cell_lon_deg <- max(1e-8, cell_lon_deg)
+
+  cell_id <- rep(NA_character_, length(locations))
+  cell_id[ok] <- paste0(
+    floor(coords_df$lat[ok] / cell_lat_deg), "_", floor(coords_df$lon[ok] / cell_lon_deg)
+  )
+
+  blocks <- split(locations[ok], cell_id[ok], drop = TRUE)
+  block_ids <- names(blocks)
+
+  min_blocks_needed <- max(3L, as.integer(ceiling(n_draw / 3)))
+  if (length(block_ids) < 2) {
+    return(sample(locations, n_draw, replace = TRUE))
+  }
+  if (length(block_ids) < min_blocks_needed) {
+    cat(sprintf("[SPATIAL BOOTSTRAP] Only %d blocks for %d locations — too few for meaningful block diversity; using i.i.d. resampling\n",
+                length(block_ids), n_draw))
+    return(sample(locations, n_draw, replace = TRUE))
+  }
+
+  pool <- character(0)
+  avg_block_size <- mean(lengths(blocks))
+  n_blocks_draw <- max(1L, ceiling(n_draw / max(1, avg_block_size)))
+  sampled_blocks <- sample(block_ids, size = n_blocks_draw, replace = TRUE)
+  pool <- unlist(blocks[sampled_blocks], use.names = FALSE)
+
+  while (length(pool) < n_draw) {
+    sb <- sample(block_ids, size = 1L, replace = TRUE)
+    pool <- c(pool, blocks[[sb]])
+  }
+
+  sample(pool, n_draw, replace = FALSE)
 }
 
 analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor, grid_type = "full") {
@@ -244,7 +591,7 @@ analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor,
     scale_y_continuous(expand = c(0,0), breaks = y_centers, labels = rev(ordered_ids)) +
     coord_equal() +
     theme_minimal() + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 6), axis.text.y = element_text(size = 6)) +
-    labs(title = "Pairwise Cosine Similarity of All Variants", x = NULL, y = NULL)
+    labs(title = "Variant Cosine Similarity", x = NULL, y = NULL)
 
   tryCatch({
     ggsave(file.path(OUT_DIR, "variant_similarity_heatmap.png"), p_heat, width = 12, height = 10)
@@ -498,8 +845,7 @@ compile_bootstrap_results <- function(veg_boot_res, years, unique_loc_years, met
 
 # --- PPI norm/backup helper --------------------------------------------------
 # Backs up raw PPI to PPI_raw, then creates ppi_norm clamped to [0,1].
-# `ppi_max` is the normalizing constant (PPI_FULL_VEG_COVER).
-backup_and_normalize_ppi <- function(df, ppi_max, label = "") {
+backup_and_normalize_ppi <- function(df, label = "") {
   prefix <- if (nzchar(label)) paste0(label, ": ") else ""
 
   # Backup raw PPI
@@ -511,10 +857,10 @@ backup_and_normalize_ppi <- function(df, ppi_max, label = "") {
   # Compute ppi_norm
   if (!"ppi_norm" %in% names(df)) df$ppi_norm <- NA_real_
   if ("PPI_raw" %in% names(df) && any(is.finite(df$PPI_raw))) {
-    df$ppi_norm <- pmin(pmax(df$PPI_raw / ppi_max, 0), 1)
-    cat(sprintf("[PPI NORM] %sCreated 'ppi_norm' from 'PPI_raw' and clamped to [0,1] using PPI_FULL_VEG_COVER=%.3f\n", prefix, ppi_max))
+    df$ppi_norm <- pmin(pmax(df$PPI_raw, 0), 1)
+    cat(sprintf("[PPI NORM] %sCreated 'ppi_norm' from 'PPI_raw' and clamped to [0,1]\n", prefix))
   } else if ("PPI" %in% names(df) && any(is.finite(df$PPI))) {
-    df$ppi_norm <- pmin(pmax(df$PPI / ppi_max, 0), 1)
+    df$ppi_norm <- pmin(pmax(df$PPI, 0), 1)
     warning(sprintf("%s'PPI_raw' not found - computed 'ppi_norm' from 'PPI' (may be z-scored); values were clamped to [0,1].", prefix))
   } else {
     df$ppi_norm <- NA_real_
@@ -558,4 +904,55 @@ compute_dvi_soil_per_location <- function(df, quantile_p = 0.10, min_samples = 5
                  paste(head(bad_locs, 10), collapse = ", ")))
   }
   out
+}
+
+apply_stored_normalization <- function(df, norm_params, cols = unique(c(OPTIMAL_INDICES, RAW_BANDS)), lat_default = 40.2) {
+  cat("Applying stored normalization parameters to data...\n")
+
+  if (!"zenith.angle" %in% names(df)) df[["zenith.angle"]] <- NA_real_
+  if (is.null(norm_params[["INDEX_SCALES"]]) || length(norm_params[["INDEX_SCALES"]]) == 0) {
+    stop("[INDEX_SCALES] Missing stored normalization parameters (INDEX_SCALES)")
+  }
+
+  if (!"PPI" %in% names(df) || all(!is.finite(df[["PPI"]]))) {
+    if (all(c("nir", "red") %in% names(df)) && !"DVI" %in% names(df)) {
+      df[["DVI"]] <- as.numeric(df[["nir"]]) - as.numeric(df[["red"]])
+    }
+    if (exists("add_ppi_columns")) {
+      dvi_soil_vec <- compute_dvi_soil_per_location(df)
+      df <- add_ppi_columns(df, dvi_soil = dvi_soil_vec)
+      cat("[PPI] Added PPI to data before applying stored normalization (per-location dvi_soil + per-location M).\n")
+    }
+  }
+  if (!"PPI" %in% names(df) || all(!is.finite(df[["PPI"]]))) {
+    stop("[PPI] Missing or all PPI values non-finite after attempted auto-add; refusing to continue")
+  }
+  if (!"PPI_raw" %in% names(df)) df[["PPI_raw"]] <- df[["PPI"]]
+
+  cat(sprintf("[apply_stored_normalization] Applying INDEX_SCALES to %d indices\n", length(norm_params[["INDEX_SCALES"]])))
+  n_scaled <- 0L
+  for (col in names(norm_params[["INDEX_SCALES"]])) {
+    if (col %in% names(df)) {
+      params <- norm_params[["INDEX_SCALES"]][[col]]
+      if (!is.list(params) || !all(c("mean", "sd") %in% names(params))) {
+        stop(sprintf("[INDEX_SCALES] Invalid params for index '%s' (expected list(mean, sd))", col))
+      }
+      mu <- params[["mean"]]
+      sigma <- params[["sd"]]
+      if (!is.finite(mu) || !is.finite(sigma) || sigma <= 0) {
+        stop(sprintf("[INDEX_SCALES] Non-finite or non-positive mean/sd for index '%s'", col))
+      }
+      df[[col]] <- (df[[col]] - mu) / sigma
+      n_scaled <- n_scaled + 1L
+    }
+  }
+  cat(sprintf("[apply_stored_normalization] Z-scored %d feature columns\n", n_scaled))
+
+  df
+}
+
+normalize_veg_name <- function(x) {
+  x <- as.character(x)
+  x[!nzchar(trimws(x))] <- NA_character_
+  tolower(trimws(x))
 }

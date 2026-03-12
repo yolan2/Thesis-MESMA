@@ -12,9 +12,26 @@ suppressPackageStartupMessages({
 })
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# Primary training CSV path.  Additional files (e.g. inference sets) may be
+# combined via INFERENCE_CSV defined in mesma_config.R below.
 INPUT_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_low (3).csv"
 OUT_DIR   <- "satellite_bias_check"
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Optionally source mesma_config to pick up any extra CSVs the user has set
+if (file.exists("mesma_config.R")) {
+  source("mesma_config.R")
+}
+
+# Compose list of CSVs to load for bias calculation; include training plus
+# any inference or additional files specified in config variables.
+BIAS_INPUTS <- unique(c(INPUT_CSV,
+                        if (exists("INFERENCE_CSV") && nzchar(INFERENCE_CSV)) INFERENCE_CSV,
+                        if (exists("ADDITIONAL_BIAS_CSVS")) ADDITIONAL_BIAS_CSVS))
+# ensure non-null
+BIAS_INPUTS <- BIAS_INPUTS[!is.na(BIAS_INPUTS) & nzchar(BIAS_INPUTS)]
+cat(sprintf("[BIAS CHECK] Loading %d CSV(s) for bias computation:\n  %s\n",
+            length(BIAS_INPUTS), paste(BIAS_INPUTS, collapse = "\n  ")))
 
 BANDS <- c("Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2")
 
@@ -42,6 +59,31 @@ compute_indices <- function(dt) {
   dt[, PPI := tmp$PPI]
 }
 
+# robust outlier filter used only for affine OLS coefficient estimation
+# returns a logical mask for finite paired observations that remain after
+# removing extreme values in x, y, and their difference using MAD thresholds.
+robust_pair_mask <- function(x, y, mad_thresh = 4) {
+  ok <- is.finite(x) & is.finite(y)
+  if (sum(ok) < 10) return(ok)
+
+  x_ok <- x[ok]
+  y_ok <- y[ok]
+  d_ok <- y_ok - x_ok
+
+  keep_local <- rep(TRUE, length(x_ok))
+  for (vals in list(x_ok, y_ok, d_ok)) {
+    medv <- stats::median(vals, na.rm = TRUE)
+    madv <- stats::mad(vals, center = medv, constant = 1, na.rm = TRUE)
+    if (is.finite(madv) && madv > 0) {
+      keep_local <- keep_local & (abs(vals - medv) <= mad_thresh * madv)
+    }
+  }
+
+  keep <- rep(FALSE, length(x))
+  keep[which(ok)] <- keep_local
+  keep
+}
+
 # all features we'll compute biases for
 FEATURES <- c(BANDS, INDICES)
 
@@ -58,9 +100,17 @@ PPI_FULL_VEG_COVER <- 0.584568
 # note: DEFAULT_DVI_SOIL is defined in ppi_helpers.R; fallback if missing
 if (!exists("DEFAULT_DVI_SOIL")) DEFAULT_DVI_SOIL <- 0.0308
 
-cat("Loading CSV …\n")
-df <- fread(INPUT_CSV)
-setnames(df, names(df), trimws(names(df)))   # strip any accidental whitespace
+cat("Loading CSV(s) …\n")
+if (length(BIAS_INPUTS) == 0) stop("No input CSVs specified for bias check")
+# read and rbind; fill=TRUE to allow differing column sets
+list_df <- lapply(BIAS_INPUTS, function(f) {
+  if (!file.exists(f)) stop(sprintf("Input CSV not found: %s", f))
+  dt <- fread(f)
+  setnames(dt, names(dt), trimws(names(dt)))
+  dt
+})
+df <- data.table::rbindlist(list_df, fill = TRUE)
+cat(sprintf("  combined dataset contains %d rows\n", nrow(df)))
 
 cat(sprintf("  %d rows | satellites: %s\n",
     nrow(df), paste(sort(unique(df$satellite)), collapse = ", ")))
@@ -102,33 +152,69 @@ cat("\n=== Per-feature bias (LANDSAT_457 minus LANDSAT_89) ===\n")
 bias_stats <- rbindlist(lapply(FEATURES, function(b) {
   col457 <- paste0(b, "_457")
   col89  <- paste0(b, "_89")
-  diff   <- pairs[[col457]] - pairs[[col89]]
+  x   <- pairs[[col89]]
+  y   <- pairs[[col457]]
+  diff <- y - x
+
+  # OLS affine fit: ETM+ = slope * OLI + intercept  (Roy et al. 2016 approach)
+  # Fit only after robust outlier removal on the matched pairs.
+  ok <- robust_pair_mask(x, y)
+  ols_slope     <- NA_real_
+  ols_intercept <- NA_real_
+  ols_p_value   <- NA_real_
+  ols_significant <- FALSE
+  if (sum(ok) >= 10) {
+    fit <- lm(y[ok] ~ x[ok])
+    ols_slope     <- unname(coef(fit)[2])
+    ols_intercept <- unname(coef(fit)[1])
+    ols_p_value   <- summary(fit)$coefficients[2, 4]
+    ols_significant <- !is.na(ols_p_value) && ols_p_value < 0.05
+  }
+
   data.table(
-    band   = b,
-    n      = sum(!is.na(diff)),
-    mean_bias = mean(diff, na.rm = TRUE),
-    median_bias = median(diff, na.rm = TRUE),
-    sd_bias = sd(diff, na.rm = TRUE),
-    rmse   = sqrt(mean(diff^2, na.rm = TRUE)),
-    mae    = mean(abs(diff), na.rm = TRUE),
-    r2     = cor(pairs[[col457]], pairs[[col89]], use = "complete.obs")^2
+    band          = b,
+    n             = sum(!is.na(diff)),
+    n_ols         = sum(ok, na.rm = TRUE),
+    ols_slope     = ols_slope,
+    ols_intercept = ols_intercept,
+    ols_p_value   = ols_p_value,
+    ols_significant = ols_significant,
+    median_bias   = median(diff, na.rm = TRUE),
+    sd_bias       = sd(diff, na.rm = TRUE),
+    rmse          = sqrt(mean(diff^2, na.rm = TRUE)),
+    mae           = mean(abs(diff), na.rm = TRUE),
+    r2            = cor(x, y, use = "complete.obs")^2
   )
 }))
 
 bias_stats[, `:=`(
-  mean_bias   = round(mean_bias,   5),
-  median_bias = round(median_bias, 5),
-  sd_bias     = round(sd_bias,     5),
-  rmse        = round(rmse,        5),
-  mae         = round(mae,         5),
-  r2          = round(r2,          4)
+  ols_slope     = round(ols_slope,     6),
+  ols_intercept = round(ols_intercept, 6),
+  ols_p_value   = round(ols_p_value,   6),
+  median_bias   = round(median_bias,   5),
+  sd_bias       = round(sd_bias,       5),
+  rmse          = round(rmse,          5),
+  mae           = round(mae,           5),
+  r2            = round(r2,            4)
 )]
 print(bias_stats)
 
 fwrite(bias_stats, file.path(OUT_DIR, "bias_stats_features.csv"))
 cat(sprintf("\nSaved: %s/bias_stats_features.csv\n", OUT_DIR))
+cat("  Columns: ols_slope + ols_intercept + ols_p_value + ols_significant added (affine ETM+ = slope*OLI + intercept)\n")
 
 # ── Melt to long format for plotting ─────────────────────────────────────────
+# The long table is reused for several figures below.  ggplot's geom_violin
+# silently drops any factor level that has fewer than two non-NA y-values
+# (it prints a warning "Groups with fewer than two datapoints have been
+# dropped").  that's exactly what the user reported: SWIR1/SWIR2 only
+# produced a white box from the boxplot while the violin in the same slot
+# vanished.  those bands had extremely low variance after whatever filtering
+# was applied, so the density estimator collapsed and the polygon was omitted.
+# We therefore create a separate column for plotting where we jitter groups
+# with <2 unique values.  the jitter is infinitesimal and only affects the
+# plot – the original `diff` is left untouched for statistics.
+
 pairs_long <- melt(
   pairs,
   id.vars = c("location_id", "date", "year", "lat", "lon", "vegetation"),
@@ -136,8 +222,23 @@ pairs_long <- melt(
   variable.name = "band_idx",
   value.name    = c("val_457", "val_89")
 )
-pairs_long[, band := FEATURES[band_idx]]
+# convert to factor so ggplot respects the order defined in FEATURES; this
+# guarantees that raw bands (first entries of FEATURES) appear left of all
+# computed indices.
+pairs_long[, band := factor(FEATURES[band_idx], levels = FEATURES)]
 pairs_long[, diff := val_457 - val_89]
+
+# create a plotting column that will be jittered if needed
+pairs_long[, diff_plot := diff]
+# identify bands with fewer than two unique non-NA diff values
+short_bands <- pairs_long[!is.na(diff), .(uniq = uniqueN(diff)), by = band][uniq < 2, band]
+if (length(short_bands) > 0) {
+  warning("Band(s) with <2 unique differences (no violin shape will be drawn): ",
+          paste(short_bands, collapse = ", "))
+  # add tiny noise so geom_violin will at least draw a flat shape
+  pairs_long[band %in% short_bands, diff_plot := diff +
+               runif(.N, min = -1e-6, max = 1e-6)]
+}
 
 # ── Plot 1: Scatter plots (1:1 line) per band ─────────────────────────────────
 cat("Plotting scatter plots …\n")
@@ -150,7 +251,7 @@ pairs_samp <- pairs_long[, .SD[sample(.N, min(.N, MAX_PTS))], by = band]
 scatter_plots <- lapply(FEATURES, function(b) {
   d <- pairs_samp[band == b]
   lim <- range(c(d$val_457, d$val_89), na.rm = TRUE)
-  bias_val <- bias_stats[band == b, mean_bias]
+  bias_val <- bias_stats[band == b, median_bias]
   r2_val   <- bias_stats[band == b, r2]
   ggplot(d, aes(x = val_457, y = val_89)) +
     geom_point(alpha = 0.15, size = 0.4, colour = "#2166ac") +
@@ -168,7 +269,7 @@ scatter_plots <- lapply(FEATURES, function(b) {
 })
 
 scatter_panel <- wrap_plots(scatter_plots, ncol = 3) +
-  plot_annotation(title = "Feature values: LANDSAT 4/5/7 vs LANDSAT 8/9 (same location & date)",
+  plot_annotation(title = "Feature Values: L457 vs L89",
                   subtitle = sprintf("n = %d matched pairs  |  red = 1:1, orange = OLS fit", nrow(pairs)))
 
 ggsave(file.path(OUT_DIR, "scatter_by_feature.png"),
@@ -178,15 +279,34 @@ cat(sprintf("Saved: %s/scatter_by_feature.png\n", OUT_DIR))
 # ── Plot 2: Bias distribution (violin + boxplot) ──────────────────────────────
 cat("Plotting bias distributions …\n")
 
-p_bias_dist <- ggplot(pairs_long, aes(x = band, y = diff, fill = band)) +
-  geom_violin(trim = TRUE, alpha = 0.6, colour = NA) +
-  geom_boxplot(width = 0.15, outlier.shape = NA, colour = "grey10", fill = "white") +
+# create a colour vector large enough for all features; the default
+# Set2 palette only holds eight colours, so interpolate if we need more.
+if (!requireNamespace("RColorBrewer", quietly = TRUE)) {
+  stop("Package 'RColorBrewer' is required for coloured plots")
+}
+fill_cols <- RColorBrewer::brewer.pal(min(length(FEATURES), 8), "Set2")
+if (length(FEATURES) > length(fill_cols)) {
+  fill_cols <- colorRampPalette(fill_cols)(length(FEATURES))
+}
+names(fill_cols) <- FEATURES
+
+p_bias_dist <- ggplot(pairs_long, aes(x = band, y = diff_plot, fill = band)) +
+  # vertical separator between raw bands and indices (after BANDS entries)
+  geom_vline(xintercept = length(BANDS) + 0.5, colour = "grey40", linetype = "dotted",
+             inherit.aes = FALSE) +
+  # draw the box on a transparent background so it doesn't obscure a
+  # violin that happens to lie entirely inside the IQR.  the box outline
+  # is retained for reference.
+  geom_boxplot(width = 0.15, outlier.shape = NA, colour = "grey10", fill = NA) +
+  geom_violin(trim = TRUE, alpha = 0.6, colour = NA,
+              width = 0.8, scale = "width", na.rm = TRUE) +
   geom_hline(yintercept = 0, colour = "red", linewidth = 0.7) +
-  scale_fill_brewer(palette = "Set2", guide = "none") +
+  scale_fill_manual(values = fill_cols, guide = "none") +
   labs(
-    title = "Bias distribution per feature  (LANDSAT_457 − LANDSAT_89)",
+    title = "Bias by Feature (L457 - L89)",
     x = "Feature", y = "Difference"
   ) +
+  ylim(-0.2, 0.2) +
   theme_bw(base_size = 11)
 
 ggsave(file.path(OUT_DIR, "bias_distribution_by_feature.png"),
@@ -212,7 +332,7 @@ p_time <- ggplot(time_bias, aes(x = year, y = mean_bias, colour = band,
   scale_colour_brewer(palette = "Dark2", guide = "none") +
   scale_fill_brewer(palette = "Dark2", guide = "none") +
   labs(
-    title = "Mean bias per year  (LANDSAT_457 − LANDSAT_89)",
+    title = "Mean Bias by Year (L457 - L89)",
     x = "Year", y = "Mean difference ± SE"
   ) +
   theme_bw(base_size = 9)
@@ -221,38 +341,7 @@ ggsave(file.path(OUT_DIR, "bias_trend_by_year.png"),
        p_time, width = 14, height = 8, dpi = 150)
 cat(sprintf("Saved: %s/bias_trend_by_year.png\n", OUT_DIR))
 
-# ── Plot 4: Spatial bias maps ─────────────────────────────────────────────────
-cat("Plotting spatial bias maps for all features …\n")
-
-# compute mean bias per location for every band/feature
-spatial_bias <- pairs_long[, .(mean_bias = mean(diff, na.rm = TRUE)),
-                            by = .(location_id, lat, lon, band)]
-
-# loop over each feature to create a separate map file
-for (b in FEATURES) {
-  sb <- spatial_bias[band == b]
-  if (nrow(sb) == 0) next
-
-  p_map <- ggplot(sb, aes(x = lon, y = lat, colour = mean_bias)) +
-    geom_point(size = 1.2, alpha = 0.7) +
-    scale_colour_gradient2(
-      low = "#d6604d", mid = "white", high = "#4393c3",
-      midpoint = 0, name = sprintf("%s bias\n(457−89)", b)
-    ) +
-    coord_quickmap() +
-    labs(
-      title = sprintf("Spatial distribution of %s bias  (LANDSAT_457 − LANDSAT_89)", b),
-      x = "Longitude", y = "Latitude"
-    ) +
-    theme_bw(base_size = 11)
-
-  fname <- sprintf("spatial_bias_%s.png", b)
-  ggsave(file.path(OUT_DIR, fname),
-         p_map, width = 10, height = 7, dpi = 150)
-  cat(sprintf("Saved: %s/%s\n", OUT_DIR, fname))
-}
-
-# ── Plot 5: Bias by vegetation class (if available) ───────────────────────────
+# ── Plot 4: Bias by vegetation class (if available) ───────────────────────────
 if ("vegetation" %in% names(pairs_long) && any(!is.na(pairs_long$vegetation) & pairs_long$vegetation != "")) {
   cat("Plotting bias by vegetation class …\n")
 
@@ -264,7 +353,7 @@ if ("vegetation" %in% names(pairs_long) && any(!is.na(pairs_long$vegetation) & p
     scale_fill_brewer(palette = "Paired", guide = "none") +
     coord_cartesian(ylim = quantile(pairs_long$diff, c(0.01, 0.99), na.rm = TRUE)) +
     labs(
-      title = "Bias by vegetation class  (LANDSAT_457 − LANDSAT_89)",
+      title = "Bias by Vegetation (L457 - L89)",
       x = "Vegetation class", y = "Difference"
     ) +
     theme_bw(base_size = 9) +
@@ -275,7 +364,7 @@ if ("vegetation" %in% names(pairs_long) && any(!is.na(pairs_long$vegetation) & p
   cat(sprintf("Saved: %s/bias_by_vegetation.png\n", OUT_DIR))
 }
 
-# ── Plot 6: DOY (seasonal) bias ───────────────────────────────────────────────
+# ── Plot 5: DOY (seasonal) bias ───────────────────────────────────────────────
 cat("Plotting seasonal bias …\n")
 
 if ("doy" %in% names(pairs)) {
@@ -299,7 +388,7 @@ if ("doy" %in% names(pairs)) {
     scale_x_continuous(breaks = 1:12,
                        labels = month.abb) +
     labs(
-      title = "Seasonal (monthly) bias  (LANDSAT_457 − LANDSAT_89)",
+      title = "Monthly Bias (L457 - L89)",
       x = "Month", y = "Mean difference"
     ) +
     theme_bw(base_size = 9)

@@ -30,31 +30,10 @@ print_veg_summary_once <- function(msg) {
   }
 }
 
-# Prevent accidental use of a pre-existing global variable named 'years'.
-# In past runs an object called `years` (sometimes an environment) leaked in
-# via user .RData or other scripts and caused subsequent loops such as those
-# in compute_global_index_snr to blow up with "invalid for() loop sequence".
-# Clearing it early ensures any iteration over `years` inside functions uses a
-# locally computed value instead of an unrelated object.
-if (exists("years", envir = globalenv())) {
-  try(rm(years, envir = globalenv()), silent = TRUE)
-}
-# Likewise clear any stray `mat` object that might pollute loops or
-# apply callbacks later.  In earlier runs a mysterious `mat` lookup was
-# causing a crash; removing it up front avoids the problem entirely.
-if (exists("mat", envir = globalenv())) {
-  rm(mat, envir = globalenv())
-}
-
 
 # ---------------------------------------------------------------------------
 # configuration flags that users can override before sourcing this script
 # ---------------------------------------------------------------------------
-# When TRUE we exclude the historically problematic interval 1992-1999 from
-# analysis and add shading to plots.  **The default is now FALSE so that all
-# years are kept**; set EXCLUDE_PRE2000 <- TRUE before sourcing if you want to
-# reproduce earlier behaviour.
-if (!exists("EXCLUDE_PRE2000", inherits = TRUE)) EXCLUDE_PRE2000 <- FALSE
 
 
 
@@ -101,11 +80,32 @@ if (!exists("output_dir")) {
 }
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
+plot_location_filter_survival <- function(before_n, after_n, title_text, out_name = NULL) {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) return(invisible(NULL))
+
+  df_plot <- data.frame(
+    stage = factor(c("Before filter", "After filter"), levels = c("Before filter", "After filter")),
+    n_locations = c(as.integer(before_n), as.integer(after_n))
+  )
+
+  p <- ggplot2::ggplot(df_plot, ggplot2::aes(x = stage, y = n_locations, fill = stage)) +
+    ggplot2::geom_col(width = 0.7, show.legend = FALSE) +
+    ggplot2::geom_text(ggplot2::aes(label = n_locations), vjust = -0.3) +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(title = title_text, x = NULL, y = "Number of locations")
+
+  print(p)
+  if (!is.null(out_name) && nzchar(as.character(out_name))) {
+    try(ggplot2::ggsave(file.path(output_dir, out_name), p, width = 6, height = 4), silent = TRUE)
+  }
+  invisible(p)
+}
+
 # Raw spectral bands (optional - included if present)
 # blue included for index calculation then dropped
 RAW_BANDS <- c("blue", "green", "red", "nir", "swir1", "swir2")
 # Indices we consider for FVC calibration & diagnostics
-INDICES_OF_INTEREST <- c("EVI", "PSRI", "MSAVI", "NDVI", "PPI", "OSAVI", "NIRv", "NBR", "TCW", "NDMI")
+INDICES_OF_INTEREST <- c("EVI", "MSAVI", "NDVI", "PPI", "OSAVI", "NIRv", "NBR", "TCW", "NDMI")
 
 # Detrending configuration: which months constitute "summer" for seasonal model fitting
 # and the minimum number of finite samples required per index to build a seasonal model.
@@ -179,42 +179,6 @@ normalize_band_names <- function(df, bands = RAW_BANDS) {
 }
 
 # Compute a set of spectral indices from raw bands (compatible with R_extract_hls.R's formulae)
-compute_indices_from_bands <- function(df) {
-  if (is.null(df) || nrow(df) == 0) return(df)
-  eps <- 1e-9
-  has_bands <- intersect(RAW_BANDS, names(df))
-  if (length(has_bands) == 0) return(df)
-
-  # Safely compute each index only if its required bands are present
-  if (all(c('nir','red') %in% names(df))) df$DVI <- as.numeric(df$nir) - as.numeric(df$red)
-  if (all(c('nir','red') %in% names(df))) df$OSAVI <- (as.numeric(df$nir) - as.numeric(df$red)) / (as.numeric(df$nir) + as.numeric(df$red) + 0.16)
-  if (all(c('green','red') %in% names(df))) df$PRI <- (as.numeric(df$green) - as.numeric(df$red)) / (as.numeric(df$green) + as.numeric(df$red) + eps)
-  if (all(c('nir','red') %in% names(df))) df$NIRv <- as.numeric(df$nir) * ((as.numeric(df$nir) - as.numeric(df$red)) / (as.numeric(df$nir) + as.numeric(df$red) + eps))
-  if (all(c('nir','swir2') %in% names(df))) df$NBR <- (as.numeric(df$nir) - as.numeric(df$swir2)) / (as.numeric(df$nir) + as.numeric(df$swir2) + eps)
-  if (all(c('swir1','swir2') %in% names(df))) df$TCW <- (as.numeric(df$swir1) - as.numeric(df$swir2)) / (as.numeric(df$swir1) + as.numeric(df$swir2) + eps)
-  if (all(c('nir','red') %in% names(df))) df$NDVI <- (as.numeric(df$nir) - as.numeric(df$red)) / (as.numeric(df$nir) + as.numeric(df$red) + eps)
-  if (all(c('nir','red') %in% names(df))) df$MSAVI2 <- (2 * as.numeric(df$nir) + 1 - sqrt(pmax(0, (2 * as.numeric(df$nir) + 1)^2 - 8 * (as.numeric(df$nir) - as.numeric(df$red))))) / 2
-  if (all(c('nir','red') %in% names(df))) df$MSAVI <- (2 * as.numeric(df$nir) + 1 - sqrt(pmax(0, (2 * as.numeric(df$nir) + 1)^2 - 8 * (as.numeric(df$nir) - as.numeric(df$red))))) / 2
-  if (all(c('nir','swir1') %in% names(df))) df$NDMI <- (as.numeric(df$nir) - as.numeric(df$swir1)) / (as.numeric(df$nir) + as.numeric(df$swir1) + eps)
-
-  # Add blue-dependent indices
-  if (all(c('nir','red','blue') %in% names(df))) {
-    df$EVI <- 2.5 * (as.numeric(df$nir) - as.numeric(df$red)) / (as.numeric(df$nir) + 6*as.numeric(df$red) - 7.5*as.numeric(df$blue) + 1)
-    df$PSRI <- (as.numeric(df$red) - as.numeric(df$blue)) / (as.numeric(df$nir) + eps)
-  }
-  if (all(c('red','green','blue') %in% names(df))) {
-    df$MCARI <- ((as.numeric(df$red) - as.numeric(df$green)) - 0.2*(as.numeric(df$red) - as.numeric(df$blue))) * (as.numeric(df$red) / (as.numeric(df$green) + eps))
-  }
-  if (all(c('blue','green','red','nir','swir1','swir2') %in% names(df))) {
-    df$TCB <- 0.3029 * as.numeric(df$blue) + 0.2786 * as.numeric(df$green) + 0.4733 * as.numeric(df$red) + 0.5599 * as.numeric(df$nir) + 0.508 * as.numeric(df$swir1) + 0.1872 * as.numeric(df$swir2)
-    df$GVI <- -0.2941 * as.numeric(df$blue) - 0.243 * as.numeric(df$green) - 0.5424 * as.numeric(df$red) + 0.7276 * as.numeric(df$nir) + 0.0713 * as.numeric(df$swir1) - 0.1608 * as.numeric(df$swir2)
-  }
-
-  # Apply kNDVI-like tweak used in extractor (NIRv * 1.3)
-  if ('NIRv' %in% names(df)) df$NIRv <- df$NIRv * 1.3
-
-  df
-}
 
 # Outlier configuration defined early so helper can be used during initial filtering
 if (!exists("ENABLE_OUTLIER_REMOVAL", inherits = TRUE)) ENABLE_OUTLIER_REMOVAL <- TRUE
@@ -392,61 +356,43 @@ remove_large_outliers <- function(df, candidates = NULL, mad_thresh = OUTLIER_MA
 }
 
 # ==============================================================================
-# 0. Load Real Data
+# 0. Load Preprocessed Data
 # ==============================================================================
 
-cat("Loading real phenology data...\n")
+cat("Loading preprocessed phenology data...\n")
 
-# Load phenology data from the specified file only; no fallbacks allowed
-# (the script will crash if the file is missing or invalid).
-data_file <- "C:\\Users\\yolan\\Downloads\\Landsat_Harmonized_Bands_1985_2025_train (3).csv"
-if (!file.exists(data_file)) {
-  stop(sprintf("Phenology data file not found: %s", data_file))
+if (!file.exists("preprocessed_data.rds")) {
+  stop("Preprocessed data file not found: preprocessed_data.rds. Please run preprocess_data.R first.")
 }
 
-cat(sprintf("Loading data from: %s\n", data_file))
+df_raw <- readRDS("preprocessed_data.rds")
+cat("Loaded preprocessed data from preprocessed_data.rds\n")
 
-# Derive a short tag from the input filename so that each CSV run writes
-# into its own subdirectory and doesn’t overwrite previous outputs.
-input_tag <- tools::file_path_sans_ext(basename(data_file))
-# sanitize (remove spaces, punctuation) to avoid filesystem issues
-input_tag <- gsub("[^A-Za-z0-9_-]", "_", input_tag)
+# Use a fixed input tag for preprocessed data
+input_tag <- "preprocessed"
 
-cat(sprintf("Input tag: %s\n", input_tag))
-
-df_raw <- fread(data_file)
-# restrict raw input to testing years if requested
-if (exists("TEST_YEARS") && !is.null(TEST_YEARS) && length(TEST_YEARS) > 0) {
-  if ("date" %in% names(df_raw)) {
-    df_raw <- df_raw[lubridate::year(as.Date(df_raw$date)) %in% TEST_YEARS, , drop=FALSE]
-  } else if ("year" %in% names(df_raw)) {
-    df_raw <- df_raw[as.integer(df_raw$year) %in% TEST_YEARS, , drop=FALSE]
+# Helper: ensure the requested indices exist and have finite values
+validate_indices_computed <- function(df, require_ppi = FALSE) {
+  needed <- INDICES_OF_INTEREST
+  if (!require_ppi) needed <- setdiff(needed, "PPI")
+  missing_cols <- setdiff(needed, names(df))
+  if (length(missing_cols) > 0) {
+    stop(sprintf("[INDEX VALIDATION] missing required index columns: %s",
+                 paste(missing_cols, collapse = ", ")))
   }
-  cat(sprintf("[TEST MODE] df_raw rows after year filtering: %d\n", nrow(df_raw)))
+  # also verify that at least one finite value exists for each index
+  for (idx in needed) {
+    vals <- df[[idx]]
+    if (is.null(vals) || all(!is.finite(vals))) {
+      stop(sprintf("[INDEX VALIDATION] index '%s' exists but contains no finite values", idx))
+    }
+  }
+  invisible(TRUE)
 }
 
-# Normalize band names to canonical lower-case
-df_raw <- normalize_band_names(df_raw)
-
-# Reconstruct location_id from coordinates (same policy as fit_veg_mixture_mesma.R):
-# do not trust existing location_id values from CSV.
-if ("location_id" %in% names(df_raw)) {
-  df_raw$location_id_orig <- df_raw$location_id
-  df_raw$location_id <- NULL
-  cat("[NOTICE] Removed existing 'location_id' from input; reconstructing from coordinates\n")
-}
-if (all(c("lon", "lat") %in% names(df_raw))) {
-  df_raw$location_id <- make_location_id(df_raw$lon, df_raw$lat)
-} else if (all(c("target_lon", "target_lat") %in% names(df_raw))) {
-  df_raw$location_id <- make_location_id(df_raw$target_lon, df_raw$target_lat)
-} else {
-  stop("[INDEX SETUP] Cannot reconstruct location_id: missing lon/lat (or target_lon/target_lat)")
-}
-
-if ("vegetation" %in% names(df_raw) && !"Veg" %in% names(df_raw)) {
-  df_raw$Veg <- df_raw$vegetation
-  cat("[NOTICE] Renamed 'vegetation' -> 'Veg' in phenology data\n")
-}
+# Preprocessing (index computation, filtering, PPI, detrending) already done in preprocess_data.R
+# Validate that required indices are present
+validate_indices_computed(df_raw, require_ppi = TRUE)
 # require presence of a usable Veg column; abort otherwise
 if (!"Veg" %in% names(df_raw)) {
   stop("Input CSV must contain a 'Veg' column with vegetation labels")
@@ -465,23 +411,6 @@ cat(sprintf("[VEG DIAG] Top Veg labels: %s\n", paste(sprintf("%s=%d", names(veg_
 cat("[NOTICE] Found Veg values in input CSV; skipping GeoJSON join and using CSV-provided Veg values.\n")
 
 # -----------------------------------------------------------------------------
-# PREPARE INDICES & DETERREND (ensure this runs before extracting endmembers)
-# -----------------------------------------------------------------------------
-# Ensure indices are computed on df_raw before detrending
-missing_indices <- setdiff(setdiff(INDICES_OF_INTEREST, "PPI"), names(df_raw))
-if (length(missing_indices) > 0 && all(c('nir','red') %in% names(df_raw))) {
-  cat("[INDEX SETUP] Computing missing indices from raw bands on df_raw\n")
-  df_raw <- compute_indices_from_bands(df_raw)
-  # ensure EVI exists for this preliminary index set
-  df_raw <- ensure_evi(df_raw)
-
-  # Drop blue band after indices are computed if exclusion is requested
-  if (exists("EXCLUDE_BLUE_BAND", inherits = TRUE) && isTRUE(get("EXCLUDE_BLUE_BAND", inherits = TRUE))) {
-    if ("blue" %in% names(df_raw)) df_raw$blue <- NULL
-  }
-  
-  cat("[INDEX SETUP] ensured EVI in df_raw after initial compute_indices_from_bands\n")
-}
 
 # Helper: assign phenology year from a date (used by outlier grouping)
 assign_pheno_year <- function(d) {
@@ -503,6 +432,42 @@ if ("NDDI" %in% names(df_raw)) {
 # Remove large outliers (if enabled) after any early dust filtering,
 # and BEFORE computing per-location Jan-Mar mean dvi_soil / PPI / separability.
 df_raw <- remove_large_outliers(df_raw)
+
+# Require at least two summer observations per location-year for January averages workflow.
+if (!"pheno_year" %in% names(df_raw) && "date" %in% names(df_raw)) {
+  df_raw$pheno_year <- assign_pheno_year(df_raw$date)
+}
+if (all(c("location_id", "pheno_year", "date") %in% names(df_raw))) {
+  summer_counts <- df_raw |>
+    dplyr::mutate(.month = lubridate::month(as.Date(date))) |>
+    dplyr::group_by(location_id, pheno_year) |>
+    dplyr::summarise(
+      n_summer_obs = sum(.month %in% SUMMER_DETREND_MONTHS, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  keep_loc_year <- summer_counts |>
+    dplyr::filter(n_summer_obs >= 2L) |>
+    dplyr::select(location_id, pheno_year)
+
+  n_locations_before <- dplyr::n_distinct(summer_counts$location_id)
+  n_locations_after <- if (nrow(keep_loc_year) > 0) dplyr::n_distinct(keep_loc_year$location_id) else 0L
+
+  df_raw <- df_raw |>
+    dplyr::inner_join(keep_loc_year, by = c("location_id", "pheno_year"))
+
+  cat(sprintf("[FILTER] January averages requires >= 2 summer observations (months %s) per location-year\n",
+              paste(SUMMER_DETREND_MONTHS, collapse = ",")))
+  cat(sprintf("[FILTER] Locations surviving January summer-observation filter: %d / %d\n",
+              n_locations_after, n_locations_before))
+
+  plot_location_filter_survival(
+    before_n = n_locations_before,
+    after_n = n_locations_after,
+    title_text = "January Filter Survival",
+    out_name = "january_filter_survival_locations.png"
+  )
+}
 
 # Compute a per-location DVI soil baseline for PPI using January–March mean.
 # The soil value for each location is now the average of all DVI observations
@@ -559,47 +524,7 @@ if (any(insufficient_idx)) {
 if (!any(is.finite(dvi_soil_vec))) {
   stop("[PPI] No locations with sufficient Jan-Mar rows remained after skipping")
 }
-cat(sprintf("[PPI] per-location dvi_soil(Jan-Mar mean) summary: finite=%d/%d, min=%.6f, median=%.6f, max=%.6f\n",
-            sum(is.finite(dvi_soil_vec)), length(dvi_soil_vec),
-            min(dvi_soil_vec, na.rm = TRUE), stats::median(dvi_soil_vec, na.rm = TRUE), max(dvi_soil_vec, na.rm = TRUE)))
-
-# --- M diagnostics: understand exactly what rows feed into M calculation ---
-{
-  .dv  <- tolower(trimws(as.character(df_raw$Veg)))
-  .ns_raw <- df_raw$no_soil
-  .ns  <- suppressWarnings(as.integer(as.character(.ns_raw)))
-  .dvi <- if ("DVI" %in% names(df_raw)) as.numeric(df_raw$DVI) else rep(NA_real_, nrow(df_raw))
-  .dd  <- suppressWarnings(as.Date(df_raw$date))
-  .mon <- lubridate::month(.dd)
-
-  cat("[PPI M DIAG] no_soil column class  :", class(df_raw$no_soil), "\n")
-  cat("[PPI M DIAG] no_soil unique values  :", paste(sort(unique(.ns_raw)), collapse = ", "), "\n")
-  cat("[PPI M DIAG] no_soil as int uniq    :", paste(sort(unique(.ns)), collapse = ", "), "\n")
-  cat("[PPI M DIAG] Veg unique vals        :", paste(sort(unique(.dv[!is.na(.dv)])), collapse = ", "), "\n")
-
-  .n_rows    <- nrow(df)
-  .n_no_soil <- sum(.ns == 1L, na.rm = TRUE)
-  .n_no_soil_sum <- sum(.ns == 1L & .mon %in% SUMMER_DETREND_MONTHS, na.rm = TRUE)
-  .n_no_soil_fin <- sum(.ns == 1L & .mon %in% SUMMER_DETREND_MONTHS & is.finite(.dvi), na.rm = TRUE)
-
-  cat(sprintf("[PPI M DIAG] total rows              : %d\n", .n_rows))
-  cat(sprintf("[PPI M DIAG] rows with no_soil==1     : %d\n", .n_no_soil))
-  cat(sprintf("[PPI M DIAG] no_soil==1 + months %s : %d\n", paste(SUMMER_DETREND_MONTHS, collapse=","), .n_no_soil_sum))
-  cat(sprintf("[PPI M DIAG] ... + finite DVI        : %d\n", .n_no_soil_fin))
-
-  if (.n_no_soil_fin > 0) {
-    .vals <- .dvi[.ns == 1L & .mon %in% SUMMER_DETREND_MONTHS & is.finite(.dvi)]
-    # use na.rm=TRUE to avoid crashing when unexpected NA/NaN slip through
-    cat(sprintf("[PPI M DIAG] DVI of qualifying rows: min=%.4f  Q10=%.4f  Q50=%.4f  Q90=%.4f  Q95=%.4f  max=%.4f  -> M=max=%.4f\n",
-                min(.vals, na.rm = TRUE), quantile(.vals, .10, na.rm = TRUE), quantile(.vals, .50, na.rm = TRUE),
-                quantile(.vals, .90, na.rm = TRUE), quantile(.vals, .95, na.rm = TRUE),
-                max(.vals, na.rm = TRUE), max(.vals, na.rm = TRUE)))
-  }
-  rm(.dv, .ns_raw, .ns, .dvi, .dd, .mon,
-     .n_pop, .n_pop_ns1, .n_pop_ns0, .n_pop_nsNA, .n_pop_sum, .n_pop_fin)
-}
-# ---- end M diagnostics ----
-
+# PPI is already computed in preprocessed data
 ppi_m <- compute_ppi_m_from_populus_q90(df_raw, months = SUMMER_DETREND_MONTHS)
 if (!is.finite(ppi_m)) {
   # Emit detailed diagnostics before aborting so the user knows exactly what is missing.
@@ -720,8 +645,6 @@ calculate_indices <- function(df) {
     # Original Set
     DVI   = nir - red,
     OSAVI = (nir - red) / (nir + red + 0.16),
-    #CRI   = (1/(green + eps)) - (1/(red + eps)),
-    #PRI   = (green - red) / (green + red + eps),
     NIRv  = (nir * ((nir - red) / (nir + red + eps))) * 1.3, # Including the 1.3 scaling
     NBR   = (nir - swir2) / (nir + swir2 + eps),
     TCW   = (swir1 - swir2) / (swir1 + swir2 + eps),
@@ -757,41 +680,9 @@ calculate_indices <- function(df) {
 
 
 # Raw spectral bands (optional - included if present)
-RAW_BANDS <- c("green", "red", "nir", "swir1", "swir2")
+RAW_BANDS <- c("blue", "green", "red", "nir", "swir1", "swir2")
 
-# Compute a set of spectral indices from raw bands (blue band omitted)
-compute_indices_from_bands <- function(df) {
-  if (is.null(df) || nrow(df) == 0) return(df)
-  eps <- 1e-9
-  has_bands <- intersect(RAW_BANDS, names(df))
-  if (length(has_bands) == 0) return(df)
-
-  # Safely compute each index only if its required bands are present
-  if (all(c('nir','red') %in% names(df))) {
-    df$DVI   <- as.numeric(df$nir) - as.numeric(df$red)
-    df$OSAVI <- (as.numeric(df$nir) - as.numeric(df$red)) / (as.numeric(df$nir) + as.numeric(df$red) + 0.16)
-    df$NDVI  <- (as.numeric(df$nir) - as.numeric(df$red)) / (as.numeric(df$nir) + as.numeric(df$red) + eps)
-    df$MSAVI2 <- (2 * as.numeric(df$nir) + 1 - sqrt(pmax(0, (2 * as.numeric(df$nir) + 1)^2 - 8 * (as.numeric(df$nir) - as.numeric(df$red))))) / 2
-    df$MSAVI  <- df$MSAVI2
-  }
-  if (all(c('green','red') %in% names(df))) {
-    df$PRI <- (as.numeric(df$green) - as.numeric(df$red)) / (as.numeric(df$green) + as.numeric(df$red) + eps)
-  }
-  if (all(c('nir','red') %in% names(df))) {
-    df$NIRv <- as.numeric(df$nir) * ((as.numeric(df$nir) - as.numeric(df$red)) / (as.numeric(df$nir) + as.numeric(df$red) + eps)) * 1.3
-  }
-  if (all(c('nir','swir2') %in% names(df))) {
-    df$NBR <- (as.numeric(df$nir) - as.numeric(df$swir2)) / (as.numeric(df$nir) + as.numeric(df$swir2) + eps)
-  }
-  if (all(c('swir1','swir2') %in% names(df))) {
-    df$TCW <- (as.numeric(df$swir1) - as.numeric(df$swir2)) / (as.numeric(df$swir1) + as.numeric(df$swir2) + eps)
-  }
-  if (all(c('nir','swir1') %in% names(df))) {
-    df$NDMI <- (as.numeric(df$nir) - as.numeric(df$swir1)) / (as.numeric(df$nir) + as.numeric(df$swir1) + eps)
-  }
-
-  df
-}
+# Compute a set of spectral indices from raw bands
 
 # Function to calculate robust variance using STL decomposition + MAD
 # Helper: compute MAD^2 with minimal sample requirement (top-level helper, no nested defs)
@@ -857,22 +748,11 @@ safe_col_weighted_avg <- function(mat, wts) {
 # -----------------------------------------------------------------------------
 # Compute PPI first (summer medians used as representative values) so we have one stable index value per loc-year
 # -----------------------------------------------------------------------------
-# Compute indices (DVI etc.) on raw data if not present
-if (!"DVI" %in% names(df_raw) || !all(c("nir","red") %in% names(df_raw))) {
-  df_raw <- compute_indices_from_bands(df_raw)
-  df_raw <- ensure_evi(df_raw)
-  
-  if (exists("EXCLUDE_BLUE_BAND", inherits = TRUE) && isTRUE(get("EXCLUDE_BLUE_BAND", inherits = TRUE))) {
-    if ("blue" %in% names(df_raw)) df_raw$blue <- NULL
-  }
-  
-  cat("[INDEX SETUP] ensured EVI in df_raw after second compute_indices_from_bands call\n")
+# PPI must already exist from preprocessing.
+if (!"PPI" %in% names(df_raw) || all(!is.finite(df_raw$PPI))) {
+  stop("[INDEX SETUP] PPI missing from preprocessed data")
 }
 
-# PPI must already exist from the strict per-location Jan-Mar mean pipeline above.
-if (!"PPI" %in% names(df_raw) || all(!is.finite(df_raw$PPI))) {
-  stop("[INDEX SETUP] PPI missing after per-location Jan-Mar mean dvi_soil computation")
-}
 
 # Detrend summer indices (June-Sep) using polynomial fit of DOY for each index
 if (!"date" %in% names(df_raw)) stop("Phenology data must include a 'date' column for detrending")
@@ -1104,40 +984,31 @@ safe_as_numeric <- function(x) {
 # Indices and RAW_BANDS are defined earlier in the file; outlier configuration was moved earlier to make the helper available at load time.
 
 calculate_indices <- function(df) {
-  # Ensure bands are present
-  req_bands <- c("blue", "green", "red", "nir", "swir1", "swir2")
-  missing_bands <- setdiff(req_bands, names(df))
-  if (length(missing_bands) > 0) {
-    cat("Warning: Missing bands for index calculation:", paste(missing_bands, collapse=", "), ". Skipping index calculation.\n")
-    return(df)
-  }
-  
+  if (is.null(df) || nrow(df) == 0) return(df)
   eps <- 1e-9
   
   # Calculate DVI if missing
-  if (!"DVI" %in% names(df)) df$DVI <- df$nir - df$red
+  if (!"DVI" %in% names(df) && all(c("nir", "red") %in% names(df))) df$DVI <- df$nir - df$red
   
-  # Calculate additional indices
-  df$OSAVI <- (df$nir - df$red) / (df$nir + df$red + 0.16)
-  df$MCARI <- ((df$red - df$green) - 0.2*(df$red - df$blue)) * (df$red / (df$green + eps))
-  df$NIRv  <- (df$nir * ((df$nir - df$red) / (df$nir + df$red + eps))) * 1.3
-  df$PSRI  <- (df$red - df$blue) / (df$nir + eps)
-  df$NBR   <- (df$nir - df$swir2) / (df$nir + df$swir2 + eps)
-  # Project-specific TCW (Normalized Difference) definition
-  df$TCW   <- (df$swir1 - df$swir2) / (df$swir1 + df$swir2 + eps) 
-  df$NDMI  <- (df$nir - df$swir1) / (df$nir + df$swir1 + eps)
+  # Calculate additional indices only if their required bands are present
+  if (all(c("nir", "red") %in% names(df))) df$OSAVI <- (df$nir - df$red) / (df$nir + df$red + 0.16)
+  if (all(c("red", "green", "blue") %in% names(df))) df$MCARI <- ((df$red - df$green) - 0.2*(df$red - df$blue)) * (df$red / (df$green + eps))
+  if (all(c("nir", "red") %in% names(df))) df$NIRv  <- (df$nir * ((df$nir - df$red) / (df$nir + df$red + eps))) * 1.3
+  if (all(c("red", "blue", "nir") %in% names(df))) df$PSRI  <- (df$red - df$blue) / (df$nir + eps)
+  if (all(c("nir", "swir2") %in% names(df))) df$NBR   <- (df$nir - df$swir2) / (df$nir + df$swir2 + eps)
+  if (all(c("swir1", "swir2") %in% names(df))) df$TCW   <- (df$swir1 - df$swir2) / (df$swir1 + df$swir2 + eps) 
+  if (all(c("nir", "swir1") %in% names(df))) df$NDMI  <- (df$nir - df$swir1) / (df$nir + df$swir1 + eps)
   
-  # Tasseled Cap (using project-specific coefficients)
-  df$TCB   <- 0.3029 * df$blue + 0.2786 * df$green + 0.4733 * df$red + 0.5599 * df$nir + 0.508 * df$swir1 + 0.1872 * df$swir2
-  df$GVI   <- -0.2941 * df$blue - 0.243 * df$green - 0.5424 * df$red + 0.7276 * df$nir + 0.0713 * df$swir1 - 0.1608 * df$swir2
+  # Tasseled Cap (using project-specific coefficients) - requires all bands
+  if (all(c("blue", "green", "red", "nir", "swir1", "swir2") %in% names(df))) {
+    df$TCB   <- 0.3029 * df$blue + 0.2786 * df$green + 0.4733 * df$red + 0.5599 * df$nir + 0.508 * df$swir1 + 0.1872 * df$swir2
+    df$GVI   <- -0.2941 * df$blue - 0.243 * df$green - 0.5424 * df$red + 0.7276 * df$nir + 0.0713 * df$swir1 - 0.1608 * df$swir2
+  }
   
   # Ensure NDVI/MSAVI are present and consistent
-  df$NDVI <- (df$nir - df$red) / (df$nir + df$red + eps)
-  df$MSAVI <- (2 * df$nir + 1 - sqrt(pmax(0, (2 * df$nir + 1)^2 - 8 * (df$nir - df$red)))) / 2
-  
-  # Drop blue band after indices are computed if exclusion is requested
-  if (exists("EXCLUDE_BLUE_BAND", inherits = TRUE) && isTRUE(get("EXCLUDE_BLUE_BAND", inherits = TRUE))) {
-    if ("blue" %in% names(df)) df$blue <- NULL
+  if (all(c("nir", "red") %in% names(df))) {
+    df$NDVI <- (df$nir - df$red) / (df$nir + df$red + eps)
+    df$MSAVI <- (2 * df$nir + 1 - sqrt(pmax(0, (2 * df$nir + 1)^2 - 8 * (df$nir - df$red)))) / 2
   }
   
   return(df)
@@ -1227,6 +1098,21 @@ df_list <- lapply(input_csvs, function(csv_path) {
 })
 
 df <- dplyr::bind_rows(df_list)
+# filter out any pheno years earlier than 1989 in the combined inference data
+cutoff <- 1989
+if ("date" %in% names(df) || "pheno_year" %in% names(df)) {
+  if (!"pheno_year" %in% names(df) && "date" %in% names(df)) {
+    df$pheno_year <- ifelse(lubridate::month(as.Date(df$date)) >= 3,
+                             lubridate::year(as.Date(df$date)),
+                             lubridate::year(as.Date(df$date)) - 1)
+  }
+  n_before <- nrow(df)
+  df <- df[is.na(df$pheno_year) | df$pheno_year >= cutoff, , drop = FALSE]
+  if (n_before != nrow(df)) {
+    cat(sprintf("[FILTER] january_averages dropped %d rows with pheno_year < %d\n", n_before - nrow(df), cutoff))
+  }
+}
+
 if (!".inference_scope" %in% names(df)) df$.inference_scope <- infer_inference_scope(basename(INPUT_CSV))
 
 # Apply optional test-years filtering to raw combined inference data early
@@ -1262,32 +1148,6 @@ cat(sprintf("[INPUT] Trend units (one per inference file): %s\n",
 SKIP_TRENDS <- FALSE
 input_norm <- unique(tryCatch(normalizePath(input_csvs, winslash="/", mustWork=FALSE), error=function(e) input_csvs))
 
-# optionally drop observations from years 1992-1999 (these are often
-# problematic Landsat TM/ETM+ years that we historically excluded).  Users
-# can disable this behaviour by setting EXCLUDE_PRE2000 <- FALSE before
-# sourcing this script.
-if (!exists("EXCLUDE_PRE2000", inherits = TRUE)) EXCLUDE_PRE2000 <- TRUE
-
-if (isTRUE(EXCLUDE_PRE2000)) {
-  if ("date" %in% names(df)) {
-    # Ensure date column is Date
-    if (!lubridate::is.Date(df$date)) df$date <- as.Date(df$date)
-    n_before <- nrow(df)
-    years_to_drop <- 1992:1999
-    df <- df[!(lubridate::year(df$date) %in% years_to_drop), , drop = FALSE]
-    cat(sprintf("[DATA FILTER] Dropped %d observations from years %d-%d\n", n_before - nrow(df), min(years_to_drop), max(years_to_drop)))
-  } else if ("year" %in% names(df)) {
-    n_before <- nrow(df)
-    years_to_drop <- 1992:1999
-    df <- df[!(as.integer(df$year) %in% years_to_drop), , drop = FALSE]
-    cat(sprintf("[DATA FILTER] Dropped %d observations from years %d-%d (using 'year' column)\n", n_before - nrow(df), min(years_to_drop), max(years_to_drop)))
-  } else {
-    cat("[DATA FILTER] No 'date' or 'year' column found; cannot drop 1992-1999 observations automatically\n")
-  }
-} else {
-  cat("[DATA FILTER] EXCLUDE_PRE2000 is FALSE; retaining all pre‑2000 years\n")
-}
-
 # Normalize and prefer CSV-provided Veg / no soil values when present
 if ("vegetation" %in% names(df) && !"Veg" %in% names(df)) {
   df$Veg <- df$vegetation
@@ -1303,7 +1163,7 @@ if ("Veg" %in% names(df)) {
 
 # Normalize column names for bands to lowercase to match script expectations
 # The script expects 'nir' and 'red' for calculations if indices are missing
-band_mapping <- c("NIR" = "nir", "Red" = "red", "Green" = "green", "SWIR1" = "swir1", "SWIR2" = "swir2")
+band_mapping <- c("Blue" = "blue", "NIR" = "nir", "Red" = "red", "Green" = "green", "SWIR1" = "swir1", "SWIR2" = "swir2")
 for (orig in names(band_mapping)) {
   if (orig %in% names(df) && !band_mapping[orig] %in% names(df)) {
     names(df)[names(df) == orig] <- band_mapping[orig]
@@ -1358,6 +1218,9 @@ if (all(c("lon", "lat") %in% names(df))) {
 # ensure gpts_map is defined so later code doesn’t error out
 gpts_map <- NULL
 
+ENABLE_TRAINING_STATS <- FALSE
+
+if (isTRUE(ENABLE_TRAINING_STATS)) {
 # --- TRAINING DATA (used for statistics) ---
 # Always use explicit training CSV; no fallback allowed.
 TRAINING_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_train (3).csv"
@@ -1419,7 +1282,8 @@ cat(sprintf("[TRAINING] EVI finite values after calculate_indices: %d/%d\n",
     stop("[TRAINING] Cannot compute per-location Jan-Mar mean PPI: DVI missing or invalid")
   }
   # IMPORTANT: compute Jan-Mar mean baseline on full non-detrended training data.
-  dvi_soil_vec <- compute_dvi_soil_per_location(training_df, min_samples = 1L, months = PPI_SOIL_BASELINE_MONTHS)
+  # compute baseline without explicit months arg to avoid signature mismatch
+  dvi_soil_vec <- compute_dvi_soil_per_location(training_df, min_samples = 1L)
   insufficient_idx <- is.finite(training_df$DVI) & !is.finite(dvi_soil_vec)
   if (any(insufficient_idx)) {
     insufficient_locs <- unique(as.character(training_df$location_id[insufficient_idx]))
@@ -1463,16 +1327,24 @@ cat(sprintf("[TRAINING] EVI finite values after calculate_indices: %d/%d\n",
   cat("Filtering training data for years 1985-2025...\n")
   training_df <- training_df |> dplyr::filter(year >= 1985 & year <= 2025)
   cat("Training rows after year filtering:", nrow(training_df), "\n")
+} else {
+  cat("[TRAINING] skipped (ENABLE_TRAINING_STATS=FALSE)\n")
+}
 
 
 
 # Finalize trend plotting skip decision after training fallback choice is known.
-TRAINING_CSV_PATH <- tryCatch(normalizePath(TRAINING_CSV, winslash = "/", mustWork = FALSE), error = function(e) NA_character_)
-SKIP_TRENDS <- any(!is.na(TRAINING_CSV_PATH) & input_norm == TRAINING_CSV_PATH)
-if (isTRUE(SKIP_TRENDS)) {
-  cat("[CONFIG] Detected training data as input; trend plotting will be skipped\n")
+if (exists("TRAINING_CSV")) {
+  TRAINING_CSV_PATH <- tryCatch(normalizePath(TRAINING_CSV, winslash = "/", mustWork = FALSE), error = function(e) NA_character_)
+  SKIP_TRENDS <- any(!is.na(TRAINING_CSV_PATH) & input_norm == TRAINING_CSV_PATH)
+  if (isTRUE(SKIP_TRENDS)) {
+    cat("[CONFIG] Detected training data as input; trend plotting will be skipped\n")
+  } else {
+    cat("[CONFIG] Input treated as inference data; trend plotting enabled\n")
+  }
 } else {
-  cat("[CONFIG] Input treated as inference data; trend plotting enabled\n")
+  SKIP_TRENDS <- FALSE
+  cat("[CONFIG] Training statistics disabled; input treated as inference data; trend plotting enabled\n")
 }
 
 # Reconstruct location_id from coordinates; do not use existing IDs.
@@ -1505,47 +1377,63 @@ cat("Filtering data for years 1985-2025...\n")
 df <- df |> dplyr::filter(year >= 1985 & year <= 2025)
 cat("Data rows after year filtering:", nrow(df), "\n")
 
+# Normalize band column names (e.g. "Blue" → "blue", "NIR" → "nir")
+df <- normalize_band_names(df)
+
 # =============================================================================
-# SENSOR BIAS CORRECTION (additive; applied to LANDSAT_89 / OLI bands)
+# SENSOR BIAS CORRECTION (affine per-band; applied to LANDSAT_89 / OLI bands)
+# Roy et al. (2016): ρ_ETM+ = slope × ρ_OLI + intercept
 # Run satellite_bias_check.R once to produce the bias CSV before this script.
 # The corrected copy (df_corr) is kept alongside the original df so that BOTH
 # corrected and uncorrected trend plots are produced for comparison.
+# mesma_config.R is not sourced here; default ENABLE_BAND_BIAS_CORRECTION=TRUE.
 # =============================================================================
 BIAS_CSV <- file.path("satellite_bias_check", "bias_stats_features.csv")
 df_corr               <- NULL
 SENSOR_BIAS_AVAILABLE <- FALSE
+.jan_bias_enabled <- !exists("ENABLE_BAND_BIAS_CORRECTION") || isTRUE(ENABLE_BAND_BIAS_CORRECTION)
 
-if (file.exists(BIAS_CSV) && "satellite" %in% names(df)) {
-  bias_tbl <- tryCatch(data.table::fread(BIAS_CSV), error = function(e) NULL)
-  if (!is.null(bias_tbl) && "band" %in% names(bias_tbl) && "mean_bias" %in% names(bias_tbl)) {
-    # only raw spectral bands — indices will be recomputed from corrected bands
-    raw_band_names <- c("green", "red", "nir", "swir1", "swir2")
-    bias_tbl[, band_lower := tolower(band)]
-    bias_bands <- bias_tbl[band_lower %in% raw_band_names]
-    oli_mask   <- tolower(trimws(as.character(df$satellite))) == "landsat_89"
-    cat(sprintf("[BIAS CORR] %d/%d rows are LANDSAT_89 (OLI); shifting to ETM+ scale\n",
-                sum(oli_mask, na.rm = TRUE), nrow(df)))
-    df_corr <- df  # full copy before any index computation
-    for (i in seq_len(nrow(bias_bands))) {
-      b   <- bias_bands$band_lower[i]
-      adj <- as.numeric(bias_bands$mean_bias[i])  # bias = 457-89 → add to OLI
-      if (!is.finite(adj) || !(b %in% names(df_corr))) next
-      df_corr[[b]] <- as.numeric(df_corr[[b]])
-      df_corr[[b]][oli_mask] <- df_corr[[b]][oli_mask] + adj
-      cat(sprintf("[BIAS CORR]   %-6s  +%.6f to %d OLI rows\n", b, adj,
-                  sum(oli_mask & is.finite(df_corr[[b]]))))
-    }
-    SENSOR_BIAS_AVAILABLE <- TRUE
-    cat("[BIAS CORR] df_corr created; indices will be recomputed on corrected bands.\n")
-  } else {
-    cat("[BIAS CORR] Bias CSV found but could not parse; skipping.\n")
-  }
-} else {
+if (.jan_bias_enabled && "satellite" %in% names(df)) {
   if (!file.exists(BIAS_CSV))
-    cat(sprintf("[BIAS CORR] %s not found — run satellite_bias_check.R first.\n", BIAS_CSV))
-  if (!"satellite" %in% names(df))
+    stop(sprintf("[BIAS CORR] %s not found — run satellite_bias_check.R first.", BIAS_CSV))
+
+  bias_tbl <- tryCatch(data.table::fread(BIAS_CSV), error = function(e) NULL)
+  if (is.null(bias_tbl) || !all(c("band", "ols_slope", "ols_intercept") %in% names(bias_tbl)))
+    stop("[BIAS CORR] Bias CSV is missing required columns (ols_slope / ols_intercept). ",
+         "Re-run satellite_bias_check.R to regenerate it.")
+
+  # Only correct raw spectral bands; indices are recomputed afterwards.
+  raw_band_names <- c("blue", "green", "red", "nir", "swir1", "swir2")
+  bias_tbl[, band_lower := tolower(band)]
+  bias_bands <- bias_tbl[band_lower %in% raw_band_names]
+
+  oli_mask <- tolower(trimws(as.character(df$satellite))) == "landsat_89"
+  cat(sprintf("[BIAS CORR] %d/%d rows are LANDSAT_89 (OLI); affine (slope+intercept)\n",
+              sum(oli_mask, na.rm = TRUE), nrow(df)))
+
+  df_corr <- df  # full copy before any index computation
+  for (i in seq_len(nrow(bias_bands))) {
+    b   <- bias_bands$band_lower[i]
+    if (!(b %in% names(df_corr))) next
+    sl  <- as.numeric(bias_bands$ols_slope[i])
+    icp <- as.numeric(bias_bands$ols_intercept[i])
+    if (!is.finite(sl) || !is.finite(icp))
+      stop(sprintf("[BIAS CORR] Non-finite affine terms for band '%s'; check satellite_bias_check.R output.", b))
+    df_corr[[b]] <- as.numeric(df_corr[[b]])
+    df_corr[[b]][oli_mask] <- sl * df_corr[[b]][oli_mask] + icp
+    cat(sprintf("[BIAS CORR]   %-6s  slope=%.5f intercept=%.6f  to %d OLI rows\n",
+                b, sl, icp, sum(oli_mask & is.finite(df_corr[[b]]))))
+  }
+  SENSOR_BIAS_AVAILABLE <- TRUE
+  cat("[BIAS CORR] df_corr created; indices will be recomputed on corrected bands.\n")
+} else {
+  if (!.jan_bias_enabled) {
+    cat("[BIAS CORR] ENABLE_BAND_BIAS_CORRECTION=FALSE; skipping.\n")
+  } else {
     cat("[BIAS CORR] No 'satellite' column in df; bias correction skipped.\n")
+  }
 }
+rm(.jan_bias_enabled)
 
 # Compute indices and strict per-location Jan-Mar mean PPI
 df <- calculate_indices(df)
@@ -1559,7 +1447,7 @@ if (!"DVI" %in% names(df) || !any(is.finite(df$DVI))) {
   stop("[INDEX SETUP] Cannot compute per-location PPI for df because DVI is missing or invalid")
 }
 # IMPORTANT: compute Jan-Mar mean baseline on full non-detrended df.
-dvi_soil_vec_df <- compute_dvi_soil_per_location(df, months = PPI_SOIL_BASELINE_MONTHS)
+dvi_soil_vec_df <- compute_dvi_soil_per_location(df)
 insufficient_idx_df <- is.finite(df$DVI) & !is.finite(dvi_soil_vec_df)
 if (any(insufficient_idx_df)) {
   insufficient_locs_df <- unique(as.character(df$location_id[insufficient_idx_df]))
@@ -1655,15 +1543,16 @@ if (isTRUE(SENSOR_BIAS_AVAILABLE) && !is.null(df_corr)) {
   if (!"DVI" %in% names(df_corr) && all(c("nir", "red") %in% names(df_corr)))
     df_corr$DVI <- as.numeric(df_corr$nir) - as.numeric(df_corr$red)
   if ("DVI" %in% names(df_corr) && any(is.finite(df_corr$DVI))) {
-    dvi_soil_corr <- tryCatch(
-      compute_dvi_soil_per_location(df_corr, months = PPI_SOIL_BASELINE_MONTHS),
-      error = function(e) { warning("[BIAS CORR] dvi_soil failed: ", e$message); dvi_soil_vec_df }
-    )
+    # No fallback allowed: compute soil baseline strictly from bias-corrected data.
+    dvi_soil_corr <- compute_dvi_soil_per_location(df_corr)
+    if (!any(is.finite(dvi_soil_corr))) {
+      stop("[BIAS CORR] compute_dvi_soil_per_location produced no finite values")
+    }
     df_corr <- add_ppi_columns(df_corr, dvi_soil = dvi_soil_corr)
     cat(sprintf("[BIAS CORR] df_corr indices recomputed; PPI M=%.6f soil median=%.6f\n",
                 ppi_m_df, stats::median(dvi_soil_corr, na.rm = TRUE)))
   } else {
-    cat("[BIAS CORR] DVI not available in df_corr; PPI skipped.\n")
+    stop("[BIAS CORR] DVI not available in df_corr; cannot compute PPI")
   }
   # propagate temporal metadata
   df_corr$month      <- lubridate::month(df_corr$date)
@@ -1671,32 +1560,33 @@ if (isTRUE(SENSOR_BIAS_AVAILABLE) && !is.null(df_corr)) {
   df_corr$pheno_year <- assign_pheno_year(df_corr$date)
 }
 
-# Filter for winter (Jan-Mar) and summer (Jun-Sep) data in the training set.
+# Filter for winter (Jan-Mar) and summer (Jun-Sep) data in the analysis set.
 # First make sure month column is integer.
-if ("month" %in% names(training_df)) {
-  if (is.list(training_df$month)) training_df$month <- unlist(training_df$month)
-  training_df$month <- as.integer(training_df$month)
-} else if ("date" %in% names(training_df)) {
-  training_df$month <- lubridate::month(training_df$date)
+analysis_df <- df
+if ("month" %in% names(analysis_df)) {
+  if (is.list(analysis_df$month)) analysis_df$month <- unlist(analysis_df$month)
+  analysis_df$month <- as.integer(analysis_df$month)
+} else if ("date" %in% names(analysis_df)) {
+  analysis_df$month <- lubridate::month(analysis_df$date)
 }
 
 # attach day-of-year for detrending computation
-if (!"doy" %in% names(training_df) && "date" %in% names(training_df)) {
-  training_df$doy <- lubridate::yday(training_df$date)
+if (!"doy" %in% names(analysis_df) && "date" %in% names(analysis_df)) {
+  analysis_df$doy <- lubridate::yday(analysis_df$date)
 }
 
 # compute seasonal polynomial baseline using summer months only.  Previous
 # behaviour fitted a smooth spline to the full year; the current requirement is
 # that trend metrics are derived solely from detrended summer values.
-for (idx in intersect(INDICES_OF_INTEREST, names(training_df))) {
+for (idx in intersect(INDICES_OF_INTEREST, names(analysis_df))) {
   trend_col <- paste0(idx, "_trend")
-  training_df[[trend_col]] <- NA_real_
+  analysis_df[[trend_col]] <- NA_real_
 
   # restrict fitting to summer months
-  summer_fit <- training_df |> dplyr::filter(month %in% SUMMER_DETREND_MONTHS)
+  summer_fit <- analysis_df |> dplyr::filter(month %in% SUMMER_DETREND_MONTHS)
   finite_fit <- is.finite(summer_fit$doy) & is.finite(summer_fit[[idx]])
   if (sum(finite_fit) < MIN_SEASONAL_SAMPLES) {
-    cat(sprintf("[TREND] Skipping polynomial for %s: insufficient summer training samples (%d)\n", idx, sum(finite_fit)))
+    cat(sprintf("[TREND] Skipping polynomial for %s: insufficient summer analysis samples (%d)\n", idx, sum(finite_fit)))
     next
   }
 
@@ -1717,43 +1607,24 @@ for (idx in intersect(INDICES_OF_INTEREST, names(training_df))) {
   }
 
   # predict only for summer rows; other months remain NA (unused later)
-  pred_indices <- which(training_df$month %in% SUMMER_DETREND_MONTHS & is.finite(training_df$doy))
+  pred_indices <- which(analysis_df$month %in% SUMMER_DETREND_MONTHS & is.finite(analysis_df$doy))
   if (length(pred_indices) > 0) {
-    training_df[[trend_col]][pred_indices] <- predict(seasonal_model,
-                                                      newdata = training_df[pred_indices, , drop = FALSE])
-  }
-}
-
-# After computing per-index polynomial trends we can optionally evaluate
-# a dataset-level signal-to-noise ratio using the helper defined below.  The
-# helper is somewhat expensive on very large training sets, so we wrap the call
-# in tryCatch and simply log a warning on failure.  Unexpected input types are
-# now handled gracefully inside the helper itself.
-if (exists("compute_global_index_snr")) {
-  snr_vals <- tryCatch(
-    compute_global_index_snr(training_df, INDICES_OF_INTEREST),
-    error = function(e) {
-      warning("[SNR] compute_global_index_snr failed: ", e$message)
-      NULL
-    }
-  )
-  if (!is.null(snr_vals)) {
-    cat("[SNR] Dataset-level index SNR (median across loc-years):\n")
-    print(snr_vals)
+    analysis_df[[trend_col]][pred_indices] <- predict(seasonal_model,
+                                                      newdata = analysis_df[pred_indices, , drop = FALSE])
   }
 }
 
 # subsets
-winter_data <- training_df |> dplyr::filter(month %in% c(1L,2L,3L))
+winter_data <- analysis_df |> dplyr::filter(month %in% c(1L,2L,3L))
 # alias winter subset to january_data for downstream convenience
 january_data <- winter_data
 
-summer_data <- training_df |> dplyr::filter(month %in% c(6L,7L,8L,9L))
+summer_data <- analysis_df |> dplyr::filter(month %in% c(6L,7L,8L,9L))
 # apply detrending to summer subset using precomputed trend
 for (idx in intersect(INDICES_OF_INTEREST, names(summer_data))) {
   trop <- paste0(idx, "_trend")
   if (trop %in% names(summer_data)) {
-    global_mean <- mean(training_df[[trop]], na.rm = TRUE)
+    global_mean <- mean(analysis_df[[trop]], na.rm = TRUE)
     summer_data[[paste0(idx, "_norm")]] <-
       summer_data[[idx]] - (summer_data[[trop]] - global_mean)
   }
@@ -1885,16 +1756,17 @@ compute_fvc_snr <- function(df_signal, df_noise, indices, group_col = "location_
   out
 }
 
-training_nonbarren <- training_df
-if ("Veg" %in% names(training_df)) training_nonbarren <- training_df[!(tolower(training_df$Veg) == "barren"), , drop = FALSE]
+if (exists("training_df")) {
+  training_nonbarren <- training_df
+  if ("Veg" %in% names(training_df)) training_nonbarren <- training_df[!(tolower(training_df$Veg) == "barren"), , drop = FALSE]
 
-# Use training_df (all classes) for Signal (Dynamic Range)
-# Use training_nonbarren for Noise
-index_snr <- compute_fvc_snr(training_df, training_nonbarren, indices_to_snr, group_col = "location_id")
+  # Use training_df (all classes) for Signal (Dynamic Range)
+  # Use training_nonbarren for Noise
+  index_snr <- compute_fvc_snr(training_df, training_nonbarren, indices_to_snr, group_col = "location_id")
 
-cat("Index SNR (Signal variance / noise variance, dynamic‑range squared over residual variance):\n")
-print(index_snr)
-
+  cat("Index SNR (Signal variance / noise variance, dynamic‑range squared over residual variance):\n")
+  print(index_snr)
+}
 # ensure 'mat' exists in case some downstream code accidentally references it
 mat <- NA_real_
 
@@ -1902,227 +1774,29 @@ mat <- NA_real_
 # )
 # ")
 
-# ---- Location bootstrap helpers copied from fit_veg_mixture_mesma ----
-# These helpers mirror the spatial-block resampling logic employed by the
-# primary MESMA fitting script.  January averages previously used a
-# simple i.i.d. location bootstrap; the new functions allow the same
-# autocorrelation-aware sampling behaviour.
+# Spatial autocorrelation and block-bootstrap helpers are now maintained in mesma_helpers.R and
+# sourced at the top of this script.  Duplicated definitions have been removed.
 
-# compute pairwise Haversine distances (km) for an Nx2 matrix of lon/lat
-compute_haversine_distance_matrix <- function(coords) {
-  rad <- pi / 180
-  lat <- coords[,2] * rad
-  lon <- coords[,1] * rad
-  dlat <- outer(lat, lat, "-")
-  dlon <- outer(lon, lon, "-")
-  a <- sin(dlat/2)^2 + outer(cos(lat), cos(lat)) * sin(dlon/2)^2
-  2 * 6371 * asin(pmin(1, sqrt(a)))
-}
 
-# collect unique coordinates for a set of locations from an optional data.frame
-collect_location_coords <- function(locations, df = NULL) {
-  locations <- trimws(as.character(locations))
-  locations <- locations[!is.na(locations) & locations != ""]
-  if (length(locations) == 0) {
-    return(data.frame(location_id = character(0), lat = numeric(0), lon = numeric(0)))
-  }
+# see mesma_helpers.R for compute_haversine_distance_matrix (shared)
 
-  cand <- NULL
-  if (!is.null(df) && all(c("location_id","lat","lon") %in% names(df))) {
-    cand <- df[, c("location_id","lat","lon"), drop = FALSE]
-    cand$location_id <- trimws(as.character(cand$location_id))
-    cand$lat <- suppressWarnings(as.numeric(cand$lat))
-    cand$lon <- suppressWarnings(as.numeric(cand$lon))
-    cand <- cand[!is.na(cand$location_id) & cand$location_id != "", , drop = FALSE]
-    cand <- cand[!duplicated(cand$location_id), , drop = FALSE]
-  }
 
-  if (is.null(cand) || nrow(cand) == 0) {
-    return(data.frame(location_id = locations, lat = NA_real_, lon = NA_real_))
-  }
-  cand <- cand[match(locations, cand$location_id), , drop = FALSE]
-  if (nrow(cand) == 0) {
-    return(data.frame(location_id = locations, lat = NA_real_, lon = NA_real_))
-  }
-  cand
-}
+# see mesma_helpers.R for collect_location_coords (shared)
 
-# estimate spatial autocorrelation range (km) via an exponential variogram
-estimate_autocorrelation_range <- function(coords_df, values, fallback_km = 30.0) {
-  if (is.null(coords_df) || nrow(coords_df) == 0) return(fallback_km)
-  if (!all(c("lat","lon") %in% names(coords_df))) return(fallback_km)
 
-  lat <- suppressWarnings(as.numeric(coords_df$lat))
-  lon <- suppressWarnings(as.numeric(coords_df$lon))
-  values <- suppressWarnings(as.numeric(values))
+# see mesma_helpers.R for estimate_autocorrelation_range (shared)
 
-  valid <- which(is.finite(lat) & is.finite(lon) & is.finite(values))
-  if (length(valid) < 5) return(fallback_km)
 
-  coords <- cbind(lon[valid], lat[valid])
-  vals <- values[valid]
-  if (var(vals, na.rm = TRUE) == 0) return(fallback_km)
+# see mesma_helpers.R for test_spatial_autocorrelation (shared)
 
-  dist_mat <- compute_haversine_distance_matrix(coords)
-  dists <- dist_mat[upper.tri(dist_mat)]
-  coef_diffs_sq <- outer(vals, vals, function(a, b) (a - b)^2)
-  gamma_vals <- coef_diffs_sq[upper.tri(coef_diffs_sq)] / 2
-  if (length(dists) == 0) return(fallback_km)
 
-  total_var <- var(vals, na.rm = TRUE)
-  n_bins <- min(10, max(3, length(dists) %/% 5))
-  bin_breaks <- unique(quantile(dists, probs = seq(0,1,length.out = n_bins+1)))
-  if (length(bin_breaks) < 3) return(fallback_km)
+# see mesma_helpers.R for block_km_if_significant (shared)
 
-  bin_mid <- (bin_breaks[-length(bin_breaks)] + bin_breaks[-1]) / 2
-  bin_gamma <- numeric(length(bin_mid))
-  for (bb in seq_along(bin_mid)) {
-    in_bin <- dists >= bin_breaks[bb] & dists < bin_breaks[bb+1]
-    bin_gamma[bb] <- if (sum(in_bin) > 0) median(gamma_vals[in_bin]) else NA
-  }
-  valid_bins <- !is.na(bin_gamma)
-  if (sum(valid_bins) < 2) return(fallback_km)
 
-  fit_exponential_variogram <- function(x, y, total_var, dists) {
-    tryCatch({
-      m <- nls(y ~ total_var * (1 - exp(-x / r)), start = list(r = median(dists, na.rm=TRUE)),
-               control = nls.control(warnOnly = TRUE), algorithm = "port",
-               lower = c(r = 0.1), upper = c(r = 1e4))
-      coef(m)[["r"]]
-    }, error = function(e) NULL)
-  }
-  range_est <- fit_exponential_variogram(bin_mid, bin_gamma, total_var, dists)
-  if (is.null(range_est)) return(fallback_km)
-  range_est <- as.numeric(range_est)
-  if (!is.finite(range_est) || range_est <= 0) return(fallback_km)
-  max(1, min(range_est, 500))
-}
+# see mesma_helpers.R for spatial_block_sample_locations (shared)
 
-# --- Moran's I permutation test for spatial autocorrelation ---
-test_spatial_autocorrelation <- function(coords_df, values, alpha = 0.05, n_perm = 199) {
-  if (is.null(coords_df) || nrow(coords_df) == 0) return(FALSE)
-  if (!all(c("lat", "lon") %in% names(coords_df))) return(FALSE)
-  lat  <- suppressWarnings(as.numeric(coords_df$lat))
-  lon  <- suppressWarnings(as.numeric(coords_df$lon))
-  vals <- suppressWarnings(as.numeric(values))
-  ok   <- is.finite(lat) & is.finite(lon) & is.finite(vals)
-  if (sum(ok) < 5) return(FALSE)
-  lat  <- lat[ok]; lon <- lon[ok]; vals <- vals[ok]
-  if (var(vals) == 0) return(FALSE)
 
-  dist_mat <- as.matrix(compute_haversine_distance_matrix(cbind(lon, lat)))
-  if (!is.matrix(dist_mat) || nrow(dist_mat) < 2 || ncol(dist_mat) < 2) return(FALSE)
-  w <- 1 / dist_mat
-  diag(w) <- 0
-  w[!is.finite(w)] <- 0
-  rs <- rowSums(w, na.rm = TRUE); rs[rs == 0] <- 1
-  w  <- w / rs  # row-standardise
 
-  moran_stat <- function(x) {
-    n  <- length(x); xc <- x - mean(x)
-    s0 <- sum(w, na.rm = TRUE); if (s0 == 0) return(0)
-    (n / s0) * sum(w * outer(xc, xc), na.rm = TRUE) / sum(xc^2)
-  }
-
-  obs_i  <- moran_stat(vals)
-  perm_i <- replicate(n_perm, moran_stat(sample(vals)))
-  p_val  <- (sum(perm_i >= obs_i) + 1L) / (n_perm + 1L)
-  cat(sprintf("[SPATIAL] Moran's I = %.4f, p = %.3f (%d perms) -> block bootstrap: %s\n",
-              obs_i, p_val, n_perm, if (p_val < alpha) "YES" else "NO"))
-  p_val < alpha
-}
-
-# Returns estimated autocorrelation range (km) if significant, else 0 (i.i.d. signal).
-block_km_if_significant <- function(coords_df, values, alpha = 0.05, n_perm = 199,
-                                    fallback_km = BOOTSTRAP_BLOCK_KM) {
-  sig <- tryCatch(
-    test_spatial_autocorrelation(coords_df, values, alpha = alpha, n_perm = n_perm),
-    error = function(e) { warning("[SPATIAL] Moran test error: ", e$message); FALSE }
-  )
-  if (!isTRUE(sig)) return(0)
-  estimate_autocorrelation_range(coords_df, values, fallback_km = fallback_km)
-}
-
-# sample location IDs with optional spatial block structure
-spatial_block_sample_locations <- function(locations, coords_df, n_draw,
-                                           block_km = NULL,
-                                           max_missing_frac = BOOTSTRAP_BLOCK_MAX_MISSING_FRAC) {
-  locations <- trimws(as.character(locations))
-  locations <- locations[!is.na(locations) & locations != ""]
-  n_draw <- as.integer(n_draw)
-  if (length(locations) == 0 || n_draw < 1) return(character(0))
-
-  if (!isTRUE(exists("ENABLE_SPATIAL_BLOCK_BOOTSTRAP")) || !isTRUE(ENABLE_SPATIAL_BLOCK_BOOTSTRAP)) {
-    return(sample(locations, n_draw, replace = TRUE))
-  }
-
-  if (is.null(coords_df) || nrow(coords_df) == 0 ||
-      !all(c("location_id","lat","lon") %in% names(coords_df))) {
-    return(sample(locations, n_draw, replace = TRUE))
-  }
-
-  coords_df$location_id <- trimws(as.character(coords_df$location_id))
-  coords_df$lat <- suppressWarnings(as.numeric(coords_df$lat))
-  coords_df$lon <- suppressWarnings(as.numeric(coords_df$lon))
-  coords_df <- coords_df[match(locations, coords_df$location_id), , drop = FALSE]
-  if (nrow(coords_df) == 0) return(sample(locations, n_draw, replace = TRUE))
-
-  ok <- is.finite(coords_df$lat) & is.finite(coords_df$lon)
-  missing_frac <- mean(!ok)
-  if (!is.finite(missing_frac) || missing_frac > max_missing_frac || sum(ok) < 3) {
-    return(sample(locations, n_draw, replace = TRUE))
-  }
-
-  if (is.null(block_km)) block_km <- BOOTSTRAP_BLOCK_KM
-  block_km <- as.numeric(block_km)
-  if (!is.finite(block_km) || block_km <= 0) return(sample(locations, n_draw, replace = TRUE))
-
-  mean_lat <- mean(coords_df$lat[ok])
-  km_per_deg_lat <- 111.32
-  km_per_deg_lon <- 111.32 * cos(mean_lat * pi / 180)
-  km_per_deg_lon <- max(1e-6, km_per_deg_lon)
-
-  cell_lat_deg <- block_km / km_per_deg_lat
-  cell_lon_deg <- block_km / km_per_deg_lon
-  cell_lat_deg <- max(1e-8, cell_lat_deg)
-  cell_lon_deg <- max(1e-8, cell_lon_deg)
-
-  cell_id <- rep(NA_character_, length(locations))
-  cell_id[ok] <- paste0(
-    floor(coords_df$lat[ok] / cell_lat_deg), "_", floor(coords_df$lon[ok] / cell_lon_deg)
-  )
-
-  blocks <- split(locations[ok], cell_id[ok], drop = TRUE)
-  block_ids <- names(blocks)
-
-  # Require enough blocks for meaningful diversity: at least n_draw/3 unique
-  # blocks (i.e. average ≤3 locations per block).  With very few blocks the
-  # pool ends up nearly identical across iterations, collapsing CI width to
-  # near zero.  Fall back to i.i.d. resampling in that case.
-  min_blocks_needed <- max(3L, as.integer(ceiling(n_draw / 3)))
-  if (length(block_ids) < min(2L, min_blocks_needed)) {
-    return(sample(locations, n_draw, replace = TRUE))
-  }
-  if (length(block_ids) < min_blocks_needed) {
-    cat(sprintf("[SPATIAL BOOTSTRAP] Only %d blocks for %d locations — too few for meaningful block diversity; using i.i.d. resampling\n",
-                length(block_ids), n_draw))
-    return(sample(locations, n_draw, replace = TRUE))
-  }
-
-  pool <- character(0)
-  avg_block_size <- mean(lengths(blocks))
-  n_blocks_draw <- max(1L, ceiling(n_draw / max(1, avg_block_size)))
-  sampled_blocks <- sample(block_ids, size = n_blocks_draw, replace = TRUE)
-  pool <- unlist(blocks[sampled_blocks], use.names = FALSE)
-
-  while (length(pool) < n_draw) {
-    sb <- sample(block_ids, size = 1L, replace = TRUE)
-    pool <- c(pool, blocks[[sb]])
-  }
-  sample(pool, n_draw, replace = FALSE)
-}
-
-# end location bootstrap helpers
 
 
 # Helper function to convert day-of-year to pentad (5-day intervals)
@@ -2206,52 +1880,6 @@ bootstrap_hierarchical_means <- function(df, metrics = c("MSAVI", "NDVI", "PPI")
   return(output)
 }
 
-# Function to bootstrap medians using location resampling
-# (disabled) median-related functionality has been removed per request.
-# bootstrap_hierarchical_medians <- function(df, metrics = c("PPI"), group_col = "location_id", B = 1000) {
-#   if (!group_col %in% names(df)) return(rep(NA, length(metrics) * 2))
-#
-#   df <- df |> dplyr::select(all_of(c(group_col, metrics)))
-#   df[[group_col]] <- as.character(df[[group_col]])
-#   ids <- unique(df[[group_col]])
-#   n_ids <- length(ids)
-#   if (n_ids < 2) return(rep(NA, length(metrics) * 2))
-#
-#   data_map <- lapply(ids, function(id) {
-#     mat <- as.matrix(df[df[[group_col]] == id, metrics, drop = FALSE])
-#     if (is.null(dim(mat))) mat <- matrix(mat, ncol = length(metrics))
-#     colnames(mat) <- metrics
-#     mat
-#   })
-#   names(data_map) <- ids
-#
-#   boot_replicates <- replicate(B, {
-#     sel_ids <- sample(ids, n_ids, replace = TRUE)
-#     selected_mats <- data_map[sel_ids]
-#
-#     cluster_stats <- vapply(selected_mats, function(mat) {
-#       n_obs <- nrow(mat)
-#       if (is.na(n_obs) || n_obs <= 0) return(rep(NA_real_, length(metrics)))
-#       rows <- sample.int(n_obs, n_obs, replace = TRUE)
-      # apply(mat[rows, , drop = FALSE], 2, median, na.rm = TRUE)  # stray line removed; 'rows' undefined
-    # }, numeric(length(metrics)))
-    # # Ensure cluster_stats is a matrix (metrics x n_clusters)
-    # if (is.null(dim(cluster_stats))) cluster_stats <- matrix(cluster_stats, nrow = length(metrics))
-    #
-    # # Aggregate across clusters by median
-    # apply(cluster_stats, 1, median, na.rm = TRUE)
-    # })
-    #
-    # if (is.null(dim(boot_replicates))) boot_replicates <- matrix(boot_replicates, nrow = length(metrics))
-    #
-    # cis <- apply(boot_replicates, 1, function(x) stats::quantile(x, probs = c(0.025, 0.975), na.rm = TRUE))
-    # output <- as.vector(cis)
-    # metric_names <- rep(metrics, each = 2)
-    # ci_types <- rep(c("lower", "upper"), times = length(metrics))
-    # names(output) <- paste(metric_names, ci_types, sep = "_")
-    # return(output)
-#}
-
 # Helper to calculate mean of location means
 mean_of_means <- function(vals, ids) {
   if (length(vals) == 0) return(NA_real_)
@@ -2269,24 +1897,25 @@ B <- 1000  # Number of bootstrap replicates
 process_global_averages <- function(data, month_name) {
   cat(sprintf("Calculating Global %s Averages with Hierarchical Bootstrapping...\n", month_name))
   
-  # only use indices actually present in the data (avoids selection errors)
-  metrics <- intersect(INDICES_OF_INTEREST, names(data))
-  if (length(metrics) == 0) {
-    warning(sprintf("No INDICES_OF_INTEREST columns available for %s, returning empty summary", month_name))
-    return(data.frame())
+  # Use only the indices that are present in the data
+  available_indices <- intersect(INDICES_OF_INTEREST, names(data))
+  if (length(available_indices) == 0) {
+    warning(sprintf("No indices from INDICES_OF_INTEREST found in data for %s. Skipping global averages.", month_name))
+    return(NULL)
   }
-  missing <- setdiff(INDICES_OF_INTEREST, metrics)
-  if (length(missing) > 0) {
-    cat(sprintf("[NOTICE] Dropping missing indices for global %s averages: %s\n", month_name, paste(missing, collapse=", ")))
+  if (length(available_indices) < length(INDICES_OF_INTEREST)) {
+    missing <- setdiff(INDICES_OF_INTEREST, names(data))
+    cat(sprintf("Warning: Missing indices for %s: %s. Using available indices: %s\n",
+                month_name, paste(missing, collapse = ", "), paste(available_indices, collapse = ", ")))
   }
-
-  global_boot <- bootstrap_hierarchical_means(data, metrics = metrics, B = B)
+  
+  global_boot <- bootstrap_hierarchical_means(data, metrics = available_indices, B = B)
   
   avg_stats <- data |> 
     dplyr::summarize(
       n_observations = dplyr::n(),
       n_locations = dplyr::n_distinct(location_id),
-      across(all_of(metrics), ~ mean_of_means(.x, location_id), .names = "avg_{.col}")
+      across(all_of(available_indices), ~ mean_of_means(.x, location_id), .names = "avg_{.col}")
     )
   
   # Bind CIs
@@ -2316,7 +1945,7 @@ plot_global_averages <- function(summary_df, title_prefix, output_dir) {
     geom_point() +
     geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
     theme_minimal() +
-    labs(title = paste0(title_prefix, " global averages with 95% CI"),
+    labs(title = paste0(title_prefix, " Global Averages (95% CI)"),
          x = "Index", y = "Mean value")
 
   fn <- file.path(output_dir, paste0(gsub("\\s+", "_", title_prefix), "_global_CI.png"))
@@ -2344,7 +1973,7 @@ plot_vegtype_averages <- function(df, title_prefix, output_dir) {
     geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
     facet_wrap(~ index, scales = "free_y") +
     theme_minimal() +
-    labs(title = paste0(title_prefix, " veg-type averages with 95% CI"),
+    labs(title = paste0(title_prefix, " Veg-Type Averages (95% CI)"),
          x = "Veg type", y = "Mean value")
 
   fn <- file.path(output_dir, paste0(gsub("\\s+", "_", title_prefix), "_vegtype_CI.png"))
@@ -2728,12 +2357,14 @@ indices_to_plot <- intersect(INDICES_OF_INTEREST,
 # Only per-inference CSV trend plots with CI are generated below.
 
 # -----------------------------------------------------------------------------
-# Generate the same trend plots per inference scope (low/mid/kon), each in its
-# own child output folder, mirroring MESMA's per-source folder structure.
+# Generate per-scope trend plots.  Accepts an optional bias-corrected data
+# frame (df_scope_corr).  When provided, both pipelines are overlaid on every
+# figure: uncorrected = dashed line, bias-corrected = solid line.
 # -----------------------------------------------------------------------------
 run_scope_trend_plots <- function(df_scope, scope_name, scope_output_dir,
                                   indices_to_plot, B,
-                                  summer_months = SUMMER_DETREND_MONTHS) {
+                                  summer_months = SUMMER_DETREND_MONTHS,
+                                  df_scope_corr = NULL) {
   if (is.null(df_scope) || nrow(df_scope) == 0) {
     cat(sprintf("[SCOPE %s] No rows; skipping scope trend plots\n", scope_name))
     return(invisible(NULL))
@@ -2750,83 +2381,155 @@ run_scope_trend_plots <- function(df_scope, scope_name, scope_output_dir,
   }
   if (!dir.exists(scope_output_dir)) dir.create(scope_output_dir, recursive = TRUE)
 
-  plot_data_mean_scope <- list()  # only mean values are kept (median removed)
-
-  for (idx in indices_to_plot) {
-    if (!(idx %in% names(df_scope))) next
-    # restrict to summer months for seasonal baseline
-    full_data <- df_scope |> dplyr::filter(month %in% SUMMER_DETREND_MONTHS & is.finite(.data[[idx]]))
-    if (nrow(full_data) == 0) next
-    if (!"doy" %in% names(full_data)) full_data$doy <- lubridate::yday(full_data$date)
-
-    # polynomial seasonal baseline on summer records
-    finite_fit <- is.finite(full_data$doy) & is.finite(full_data[[idx]])
-    if (sum(finite_fit) < MIN_SEASONAL_SAMPLES) next
-    n_unique <- length(unique(full_data$doy[finite_fit]))
-    if (n_unique < 3) next
-    f <- as.formula(paste(idx, "~ poly(doy,", DETREND_POLY_DEGREE, ")"))
-    seasonal_model <- tryCatch(lm(f, data = full_data[finite_fit, ]), error = function(e) NULL)
-    if (is.null(seasonal_model)) next
-
-    full_data$seasonal_trend <- predict(seasonal_model, newdata = full_data)
-    global_seasonal_mean <- mean(full_data$seasonal_trend, na.rm = TRUE)
-    norm_metric <- paste0(idx, "_norm")
-    full_data[[norm_metric]] <- full_data[[idx]] - (full_data$seasonal_trend - global_seasonal_mean)
-    
-    summer_data <- full_data
-
-    summer_yearly_boot <- summer_data |>
-      dplyr::group_by(pheno_year) |>
-      dplyr::do({
-        tmp <- .
-        # Do not override location_id with .trend_location_id (which is 1 per inference file)
-        # tmp$location_id <- as.character(tmp$.trend_location_id)
-        res <- bootstrap_hierarchical_means(tmp, metrics = c(norm_metric), B = B)
-        loc_means <- sapply(unique(tmp$location_id), function(id) {
-          sub <- tmp[tmp$location_id == id, ]
-          mean(sub[[norm_metric]], na.rm = TRUE)
-        })
-        data.frame(mean_val = mean(loc_means, na.rm = TRUE), ci_lower = res[1], ci_upper = res[2])
-      }) |>
-      dplyr::ungroup()
-    summer_yearly_boot$index <- idx
-    plot_data_mean_scope[[idx]] <- summer_yearly_boot
-    # median bootstrap removed per user request
+  # ── inner helper: compute per-year bootstrapped trend for one data frame ──
+  compute_trend_data <- function(d, label) {
+    if (!"month" %in% names(d) && "date" %in% names(d))
+      d$month <- lubridate::month(as.Date(d$date))
+    if (!"pheno_year" %in% names(d) && "date" %in% names(d))
+      d$pheno_year <- assign_pheno_year(as.Date(d$date))
+    result_list <- list()
+    for (idx in indices_to_plot) {
+      if (!(idx %in% names(d))) next
+      full_data <- d |> dplyr::filter(month %in% SUMMER_DETREND_MONTHS & is.finite(.data[[idx]]))
+      if (nrow(full_data) == 0) next
+      if (!"doy" %in% names(full_data)) full_data$doy <- lubridate::yday(full_data$date)
+      finite_fit <- is.finite(full_data$doy) & is.finite(full_data[[idx]])
+      if (sum(finite_fit) < MIN_SEASONAL_SAMPLES) next
+      if (length(unique(full_data$doy[finite_fit])) < 3) next
+      f <- as.formula(paste(idx, "~ poly(doy,", DETREND_POLY_DEGREE, ")"))
+      seasonal_model <- tryCatch(lm(f, data = full_data[finite_fit, ]), error = function(e) NULL)
+      if (is.null(seasonal_model)) next
+      full_data$seasonal_trend <- predict(seasonal_model, newdata = full_data)
+      global_seasonal_mean <- mean(full_data$seasonal_trend, na.rm = TRUE)
+      norm_metric <- paste0(idx, "_norm")
+      full_data[[norm_metric]] <- full_data[[idx]] - (full_data$seasonal_trend - global_seasonal_mean)
+      yearly_boot <- full_data |>
+        dplyr::group_by(pheno_year) |>
+        dplyr::do({
+          tmp <- .
+          res <- bootstrap_hierarchical_means(tmp, metrics = c(norm_metric), B = B)
+          loc_means <- sapply(unique(tmp$location_id), function(id) {
+            sub <- tmp[tmp$location_id == id, ]
+            mean(sub[[norm_metric]], na.rm = TRUE)
+          })
+          data.frame(mean_val  = mean(loc_means, na.rm = TRUE),
+                     ci_lower  = res[1],
+                     ci_upper  = res[2])
+        }) |>
+        dplyr::ungroup()
+      yearly_boot$index    <- idx
+      yearly_boot$pipeline <- label
+      result_list[[idx]] <- yearly_boot
+    }
+    if (length(result_list) == 0) return(NULL)
+    do.call(rbind, result_list)
   }
 
-  if (length(plot_data_mean_scope) == 0) {
-    cat(sprintf("[SCOPE %s] No valid trend series after filtering; skipping plot export\n", scope_name))
+  # Compute trend for uncorrected pipeline
+  trend_unc <- compute_trend_data(df_scope, "Uncorrected")
+  if (is.null(trend_unc) || nrow(trend_unc) == 0) {
+    cat(sprintf("[SCOPE %s] No valid trend series; skipping plot export\n", scope_name))
     return(invisible(NULL))
   }
+  try(readr::write_csv(trend_unc |> dplyr::select(-pipeline),
+                       file.path(scope_output_dir, "trend_mean.csv")), silent = TRUE)
+  cat(sprintf("[SCOPE %s] Saved uncorrected trend CSV to: %s\n", scope_name,
+              file.path(scope_output_dir, "trend_mean.csv")))
 
-  plot_data_mean_scope <- do.call(rbind, plot_data_mean_scope)
+  # Compute trend for bias-corrected pipeline (optional)
+  trend_cor <- NULL
+  if (!is.null(df_scope_corr) && nrow(df_scope_corr) > 0) {
+    trend_cor <- tryCatch(
+      compute_trend_data(df_scope_corr, "Bias-corrected"),
+      error = function(e) {
+        cat(sprintf("[SCOPE %s] Corrected trend failed: %s\n", scope_name, e$message))
+        NULL
+      }
+    )
+    if (!is.null(trend_cor) && nrow(trend_cor) > 0) {
+      try(readr::write_csv(trend_cor |> dplyr::select(-pipeline),
+                           file.path(scope_output_dir, "trend_mean_corrected.csv")), silent = TRUE)
+      cat(sprintf("[SCOPE %s] Saved bias-corrected trend CSV to: %s\n", scope_name,
+                  file.path(scope_output_dir, "trend_mean_corrected.csv")))
+    }
+  }
 
-  # write scope-specific CSV (after rbind so it is a data frame, not a list)
-  try({
-    readr::write_csv(plot_data_mean_scope, file.path(scope_output_dir, "trend_mean.csv"))
-    cat(sprintf("[SCOPE %s] Saved mean trend data CSV to: %s\n", scope_name, file.path(scope_output_dir, "trend_mean.csv")))
-  }, silent = TRUE)
+  has_corr <- !is.null(trend_cor) && nrow(trend_cor) > 0
 
-  # ── faceted plot: one panel per index, ribbon drawn BEFORE line/points ──
-  p_mean_scope <- ggplot(plot_data_mean_scope, aes(x = pheno_year, y = mean_val)) +
+  # ── combined long-format data frame for plotting ──────────────────────────
+  comb_df <- if (has_corr) dplyr::bind_rows(trend_unc, trend_cor) else trend_unc
+
+  # Visual encoding: dashed = uncorrected, solid = bias-corrected
+  lt_vals  <- c("Uncorrected" = "dashed", "Bias-corrected" = "solid")
+  col_vals <- c("Uncorrected" = "#e41a1c", "Bias-corrected" = "#377eb8")
+  fill_vals <- col_vals
+  # When only one pipeline, use neutral steelblue
+  if (!has_corr) {
+    lt_vals   <- c("Uncorrected" = "solid")
+    col_vals  <- c("Uncorrected" = "steelblue")
+    fill_vals <- c("Uncorrected" = "steelblue")
+  }
+
+  subtitle_txt <- if (has_corr)
+    "Dashed = uncorrected  |  Solid = OLI bias-corrected  |  Seasonal normalisation applied"
+  else
+    "Seasonal normalisation applied per index"
+
+  # ── faceted plot: one panel per index ────────────────────────────────────
+  p_facet <- ggplot(comb_df,
+                    aes(x = pheno_year, y = mean_val,
+                        colour = pipeline, fill = pipeline, linetype = pipeline)) +
     add_excluded_years_shade(is_date = FALSE) +
     add_year_lines(is_date = FALSE) +
-    geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.3, fill = "steelblue") +
-    geom_line(color = "steelblue", linewidth = 0.8) +
-    geom_point(color = "steelblue4", size = 1.5) +
+    geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.15, colour = NA) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 1.5) +
+    scale_colour_manual(values = col_vals, name = NULL) +
+    scale_fill_manual(values = fill_vals, name = NULL) +
+    scale_linetype_manual(values = lt_vals, name = NULL) +
     facet_wrap(~ index, scales = "free_y") +
-    labs(title = sprintf("%s: Mean June-Sept Vegetation Indices (95%% CI)", toupper(scope_name)),
-         subtitle = "Seasonal normalization applied per index",
-         x = "Year", y = "Mean Value") +
-    theme_minimal()
-  ggsave(file.path(scope_output_dir, "all_indices_summer_trend_mean.png"), plot = p_mean_scope, width = 16, height = 12)
+    labs(
+      title    = sprintf("%s: Summer Indices (95%% CI)", toupper(scope_name)),
+      subtitle = subtitle_txt,
+      x = "Year", y = "Mean Value"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  ggsave(file.path(scope_output_dir, "all_indices_summer_trend_mean.png"),
+         plot = p_facet, width = 16, height = 12)
 
-  # ── overlay plot: all indices in one panel, raw values ───────────────
-  index_names <- unique(plot_data_mean_scope$index)
+  # additionally export one PNG per individual index so users can view trends
+  # without facet wrapping.  Useful when only a single index is of interest.
+  for (idx in unique(comb_df$index)) {
+    df_idx <- comb_df[comb_df$index == idx, , drop = FALSE]
+    if (nrow(df_idx) == 0) next
+    p_idx <- ggplot(df_idx,
+                    aes(x = pheno_year, y = mean_val,
+                        colour = pipeline, fill = pipeline, linetype = pipeline)) +
+      add_excluded_years_shade(is_date = FALSE) +
+      add_year_lines(is_date = FALSE) +
+      geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.15, colour = NA) +
+      geom_line(linewidth = 0.8) +
+      geom_point(size = 1.5) +
+      scale_colour_manual(values = col_vals, name = NULL) +
+      scale_fill_manual(values = fill_vals, name = NULL) +
+      scale_linetype_manual(values = lt_vals, name = NULL) +
+      labs(
+        title    = sprintf("%s: %s (95%% CI)", toupper(scope_name), idx),
+        subtitle = subtitle_txt,
+        x = "Year", y = "Mean Value"
+      ) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+    fn_idx <- file.path(scope_output_dir, paste0("trend_", idx, "_mean.png"))
+    ggsave(fn_idx, plot = p_idx, width = 10, height = 6)
+    cat(sprintf("[SCOPE %s] Saved individual index plot to: %s\n", scope_name, fn_idx))
+  }
+
+  # ── overlay plot: all indices in one panel ───────────────────────────────
+  index_names <- unique(comb_df$index)
   if (length(index_names) >= 2) {
-    overlay_df <- plot_data_mean_scope  # already long-format with mean_val and CI
-
-    n_idx   <- length(index_names)
+    n_idx <- length(index_names)
     pal <- tryCatch(
       RColorBrewer::brewer.pal(max(3, min(n_idx, 12)), "Paired")[seq_len(n_idx)],
       error = function(e) scales::hue_pal()(n_idx)
@@ -2834,7 +2537,9 @@ run_scope_trend_plots <- function(df_scope, scope_name, scope_output_dir,
     if (n_idx > length(pal)) pal <- rep_len(pal, n_idx)
     names(pal) <- index_names
 
-    p_overlay <- ggplot(overlay_df, aes(x = pheno_year, y = mean_val, colour = index, fill = index)) +
+    p_overlay <- ggplot(comb_df,
+                        aes(x = pheno_year, y = mean_val,
+                            colour = index, fill = index, linetype = pipeline)) +
       add_excluded_years_shade(is_date = FALSE) +
       add_year_lines(is_date = FALSE) +
       geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.12, colour = NA) +
@@ -2842,23 +2547,23 @@ run_scope_trend_plots <- function(df_scope, scope_name, scope_output_dir,
       geom_point(size = 1.2) +
       scale_colour_manual(values = pal) +
       scale_fill_manual(values = pal) +
+      scale_linetype_manual(values = lt_vals, name = "Pipeline") +
       labs(
-        title    = sprintf("%s: All indices overlaid (raw values)", toupper(scope_name)),
-        subtitle = "Values are not normalised across indices",
-        x        = "Year",
-        y        = "Mean value",
-        colour   = "Index",
-        fill     = "Index"
+        title    = sprintf("%s: All Indices", toupper(scope_name)),
+        subtitle = subtitle_txt,
+        x = "Year", y = "Mean value",
+        colour = "Index", fill = "Index"
       ) +
       theme_minimal() +
       theme(legend.position = "right")
-
-    ggsave(file.path(scope_output_dir, "all_indices_overlay.png"), plot = p_overlay, width = 14, height = 7)
-    cat(sprintf("[SCOPE %s] Saved overlay plot to: %s\n", scope_name, file.path(scope_output_dir, "all_indices_overlay.png")))
+    ggsave(file.path(scope_output_dir, "all_indices_overlay.png"),
+           plot = p_overlay, width = 14, height = 7)
+    cat(sprintf("[SCOPE %s] Saved overlay plot to: %s\n", scope_name,
+                file.path(scope_output_dir, "all_indices_overlay.png")))
   }
 
   cat(sprintf("[SCOPE %s] Saved trend plots to: %s\n", scope_name, scope_output_dir))
-  invisible(list(mean = plot_data_mean_scope))
+  invisible(list(mean = trend_unc, corrected = trend_cor))
 }
 
 source_csvs <- unique(as.character(df$.inference_source_csv))
@@ -2867,15 +2572,23 @@ if (length(source_csvs) > 0) {
   cat(sprintf("[INFERENCE] Generating per-inference CSV trend plots for %d source file(s)\n", length(source_csvs)))
   for (src in source_csvs) {
     source_tag <- tools::file_path_sans_ext(basename(src))
-    scope_df <- df |> dplyr::filter(.inference_source_csv == src)
+    scope_df   <- df |> dplyr::filter(.inference_source_csv == src)
+    # Grab corrected subset when bias correction is available; NULL otherwise.
+    scope_df_c <- if (isTRUE(SENSOR_BIAS_AVAILABLE) &&
+                      !is.null(df_corr) &&
+                      ".inference_source_csv" %in% names(df_corr)) {
+      df_corr[as.character(df_corr$.inference_source_csv) == src, , drop = FALSE]
+    } else NULL
+    if (!is.null(scope_df_c) && nrow(scope_df_c) == 0) scope_df_c <- NULL
     scope_outdir <- file.path(output_dir, source_tag)
     run_scope_trend_plots(
-      df_scope = scope_df,
-      scope_name = source_tag,
+      df_scope      = scope_df,
+      scope_name    = source_tag,
       scope_output_dir = scope_outdir,
-      indices_to_plot = indices_to_plot,
-      B = B,
-      summer_months = 6:9
+      indices_to_plot  = indices_to_plot,
+      B             = B,
+      summer_months = 6:9,
+      df_scope_corr = scope_df_c
     )
     # also compute and save simple pre-inference summary tables for this scope
     try({
@@ -2918,130 +2631,10 @@ if (length(source_csvs) > 0) {
 
 # =============================================================================
 # SENSOR BIAS COMPARISON PLOTS
-# Repeat the per-scope trend analysis on df_corr (OLI-corrected) and produce
-# side-by-side / overlaid comparison plots vs the uncorrected results.
-# Only runs when a valid df_corr exists (requires satellite_bias_check.R output).
+# Both pipelines (uncorrected = dashed / bias-corrected = solid) are now
+# overlaid directly inside run_scope_trend_plots via the df_scope_corr
+# argument.  No separate comparison block is needed.
 # =============================================================================
-if (isTRUE(SENSOR_BIAS_AVAILABLE) && !is.null(df_corr) &&
-    ".inference_source_csv" %in% names(df_corr)) {
-
-  cat("\n[BIAS COMPARISON] Generating corrected-vs-uncorrected trend comparison plots\n")
-
-  # helper: load a previously-saved trend CSV produced by run_scope_trend_plots
-  load_trend_csv <- function(path) {
-    if (!file.exists(path)) return(NULL)
-    tryCatch(readr::read_csv(path, show_col_types = FALSE), error = function(e) NULL)
-  }
-
-  source_csvs_corr <- unique(as.character(df_corr$.inference_source_csv))
-  source_csvs_corr <- source_csvs_corr[!is.na(source_csvs_corr) & nzchar(source_csvs_corr)]
-
-  for (src in source_csvs_corr) {
-    source_tag   <- tools::file_path_sans_ext(basename(src))
-    scope_df_c   <- df_corr[df_corr$.inference_source_csv == src, , drop = FALSE]
-    # output folder for corrected results sits next to the uncorrected folder
-    corr_outdir  <- file.path(output_dir, paste0(source_tag, "_bias_corrected"))
-    if (!dir.exists(corr_outdir)) dir.create(corr_outdir, recursive = TRUE)
-
-    cat(sprintf("[BIAS COMPARISON] %s: running corrected trend plots\n", source_tag))
-
-    # Run the same pipeline on the corrected subset
-    corr_trend_result <- tryCatch(
-      run_scope_trend_plots(
-        df_scope         = scope_df_c,
-        scope_name       = paste0(source_tag, " (bias-corrected)"),
-        scope_output_dir = corr_outdir,
-        indices_to_plot  = indices_to_plot,
-        B                = B,
-        summer_months    = 6:9
-      ),
-      error = function(e) {
-        cat(sprintf("[BIAS COMPARISON] %s: error in corrected trend run: %s\n", source_tag, e$message))
-        NULL
-      }
-    )
-
-    # Build overlay comparison plot: uncorrected vs corrected on the same axes
-    uncorr_csv <- file.path(output_dir, source_tag, "trend_mean.csv")
-    corr_csv   <- file.path(corr_outdir, "trend_mean.csv")
-
-    unc_df <- load_trend_csv(uncorr_csv)
-    cor_df <- load_trend_csv(corr_csv)
-
-    if (!is.null(unc_df) && !is.null(cor_df) &&
-        all(c("pheno_year", "mean_val", "ci_lower", "ci_upper", "index") %in% names(unc_df)) &&
-        all(c("pheno_year", "mean_val", "ci_lower", "ci_upper", "index") %in% names(cor_df))) {
-
-      unc_df$correction <- "Uncorrected"
-      cor_df$correction <- "Bias-corrected (OLI \u2192 ETM+)"
-      cmp_df <- dplyr::bind_rows(unc_df, cor_df)
-
-      p_cmp <- ggplot(cmp_df,
-                      aes(x = pheno_year, y = mean_val,
-                          colour = correction, fill = correction)) +
-        geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper),
-                    alpha = 0.15, colour = NA) +
-        geom_line(linewidth = 0.8) +
-        geom_point(size = 1.2) +
-        facet_wrap(~ index, scales = "free_y") +
-        scale_colour_manual(values = c(
-          "Uncorrected"               = "#e41a1c",
-          "Bias-corrected (OLI \u2192 ETM+)" = "#377eb8"
-        )) +
-        scale_fill_manual(values = c(
-          "Uncorrected"               = "#e41a1c",
-          "Bias-corrected (OLI \u2192 ETM+)" = "#377eb8"
-        )) +
-        labs(
-          title    = sprintf("%s: sensor bias correction comparison", toupper(source_tag)),
-          subtitle = "Red = uncorrected  |  Blue = OLI bands shifted to ETM+ scale (mean inter-sensor bias)",
-          x        = "Year", y = "Mean index value (seasonally normalised)",
-          colour   = NULL, fill = NULL
-        ) +
-        theme_minimal() +
-        theme(legend.position = "bottom")
-
-      cmp_png <- file.path(output_dir, paste0(source_tag, "_bias_correction_comparison.png"))
-      ggsave(cmp_png, plot = p_cmp, width = 16, height = 12)
-      cat(sprintf("[BIAS COMPARISON] %s: saved overlay comparison plot -> %s\n",
-                  source_tag, cmp_png))
-
-      # Also save a per-index difference plot (corrected minus uncorrected)
-      diff_df <- dplyr::inner_join(
-        unc_df |> dplyr::select(pheno_year, index, mean_unc = mean_val),
-        cor_df |> dplyr::select(pheno_year, index, mean_cor = mean_val),
-        by = c("pheno_year", "index")
-      )
-      diff_df$delta <- diff_df$mean_cor - diff_df$mean_unc   # correction effect
-
-      p_diff <- ggplot(diff_df, aes(x = pheno_year, y = delta)) +
-        geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
-        geom_line(colour = "#4daf4a", linewidth = 0.8) +
-        geom_point(colour = "#4daf4a", size = 1.2) +
-        facet_wrap(~ index, scales = "free_y") +
-        labs(
-          title    = sprintf("%s: effect of sensor bias correction", toupper(source_tag)),
-          subtitle = "corrected \u2212 uncorrected (positive = correction raised the value)",
-          x        = "Year", y = "\u0394 mean index value"
-        ) +
-        theme_minimal()
-
-      diff_png <- file.path(output_dir, paste0(source_tag, "_bias_correction_delta.png"))
-      ggsave(diff_png, plot = p_diff, width = 16, height = 8)
-      cat(sprintf("[BIAS COMPARISON] %s: saved delta plot -> %s\n", source_tag, diff_png))
-
-      # Save merged CSV for further analysis
-      readr::write_csv(cmp_df, file.path(output_dir, paste0(source_tag, "_bias_comparison.csv")))
-
-    } else {
-      cat(sprintf("[BIAS COMPARISON] %s: one or both trend CSVs missing/malformed; skipping overlay plot\n",
-                  source_tag))
-    }
-  }
-  cat("[BIAS COMPARISON] Done.\n")
-} else if (!isTRUE(SENSOR_BIAS_AVAILABLE)) {
-  cat("[BIAS COMPARISON] Skipped (no sensor bias CSV available).\n")
-}
 
 # end of SKIP_TRENDS block
 }

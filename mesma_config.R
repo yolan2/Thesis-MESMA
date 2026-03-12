@@ -52,8 +52,11 @@ setup_parallel_backend <- function(workers = NULL) {
 
 INPUT_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_train (3).csv"
                                  # Path to the input CSV used for training. Replace with your own file path.
-INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_low (3).csv"
-                                 # Path for spatial inference input (set to NA to disable inference steps).
+INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_kon (1).csv"
+#choose "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_kon (1).csv"
+#or "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_low (3).csv"
+#or "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_mid (2).csv"
+ADDITIONAL_BIAS_CSVS <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_low (3).csv"
 
 
 # Training year selection
@@ -122,7 +125,7 @@ COMBO_ABORT_LIMIT <- 5e7          # Hard abort threshold: if combos exceed this,
                                   # Only raise with extreme caution on large-memory hosts.
 
 # Bootstrap / inference sizing
-BOOTSTRAP_B <- 200L              # Number of bootstrap iterations (location-level). Higher -> more stable CIs but slower. 100-500 typical.
+BOOTSTRAP_B <- 100L              # Number of bootstrap iterations (location-level). Higher -> more stable CIs but slower. 100-500 typical.
 MAX_INFERENCE_LOCATIONS <- 2000L # Max locations processed per inference CSV file (single-file run cap)
 
 # Spatial dependence handling in bootstrap
@@ -165,7 +168,7 @@ ENABLE_OOB_FRACTION_UNCERTAINTY <- TRUE  # If TRUE, add OOB-derived fraction err
 #
 # When projecting into the LDA subspace and some input features are missing, the pipeline automatically computes a per-sample reliability weight for each discriminant axis. This downweights axes that depend heavily on unavailable features so that missing data cannot spuriously drive unmixing. This behaviour is always active whenever LDA-space solving is used.
 #
-USE_LDA_SPACE_SOLVER <- FALSE   # Toggle LDA-space unmixing on/off (default FALSE)
+USE_LDA_SPACE_SOLVER <- TRUE   # Toggle LDA-space unmixing on/off (default FALSE)
 # Note: LDA reliability is enabled automatically when using LDA-space solver.
 # --- IWLMM (Iteratively Weighted Linear Mixing Model) ---
 # Experimental alternate unmixing solver that perturbs endmembers within
@@ -174,7 +177,7 @@ USE_LDA_SPACE_SOLVER <- FALSE   # Toggle LDA-space unmixing on/off (default FALS
 # computational cost.  This mode can now be used together with sparse
 # unmixing; when both flags are TRUE the pipeline will run a combined solver
 # that alternates perturbation updates with a sparse coefficient solver.
-USE_IWLMM <- FALSE        # Set TRUE to enable IWLMM unmixing during MESMA
+USE_IWLMM <- TRUE        # Set TRUE to enable IWLMM unmixing during MESMA
 IWLMM_MAX_ITER <- 5            # Maximum alternating optimization iterations
 IWLMM_TOL <- 1e-4               # Convergence tolerance on coefficients
 IWLMM_BOUND_SIGMA <- 2.0        # Multiplier on per-feature sigma to bound perturbations
@@ -195,9 +198,12 @@ DEFAULT_UNMIX_SOLVER <- "fcls"   # default fallback when MESMA_PARAMS$solver uns
 # behaviour; sparse library search/selection used to be governed by
 # ENABLE_SPARSE_MIXING, which has been removed because it had no effect.
 # Sparse subset behaviour is now driven entirely by the parameters below.
-USE_SPARSE_UNMIXING <- TRUE    # Set TRUE to apply L1-penalized solver to every unmixing call.
+USE_SPARSE_UNMIXING <- TRUE  # Set TRUE to apply L1-penalized solver to every unmixing call.
 # (removed) ENABLE_SPARSE_MIXING <- FALSE
 SPARSE_MIXING_LAMBDA <- 0.01     # Sparsity penalty added to score as: rmse + lambda * n_active_components.
+# Notes: n_active_components counts coefficients exceeding SPARSE_COEF_THRESHOLD.
+# Barren endmember is excluded from this count so that sparsity penalties only
+# affect vegetation classes.
 SPARSE_MIN_COMPONENTS <- 1L      # Minimum number of active classes allowed in sparse subset search.
 SPARSE_MAX_COMPONENTS <- 4L      # Maximum number of active classes allowed in sparse subset search.
 SPARSE_COEF_THRESHOLD <- 0.02    # Coefficients > threshold are counted as active components for sparsity penalty.
@@ -213,7 +219,7 @@ FEATURE_PRUNING_THRESHOLD <- 0.95 # Correlation threshold above which a feature 
 MIN_OBS_PER_LOC_YEAR <- 8L      # Minimum rows required per location-year for processing (raised from 3). Increase to be stricter on noisy cases.
 MIN_UNIQUE_DOY_DEFAULT <- 5L    # Minimum unique DOYs per loc-year during training to consider time-series adequate.
 MIN_UNIQUE_DOY_INFERENCE <- 3L  # Less strict for inference to allow sparse inputs.
-MIN_PENTADS_PER_TRAIN_SAMPLE <- 10L  # Minimum observations required per location-year trace to construct a training sample.
+MIN_PENTADS_PER_TRAIN_SAMPLE <- 8L  # Minimum observations required per location-year trace to construct a training sample.
 
 # Modeling/algorithmic caps and defaults
 ENABLE_LDA_L2_NORMALIZATION <- TRUE # L2-normalize training samples to focus on temporal shape rather than amplitude.
@@ -282,12 +288,28 @@ VALIDATION_FRACTION <- 0.20         # Fraction held out for validation (stratifi
 PERMUTATION_N_ITER <- 500            # Number of permutations per feature for significance testing
 PERMUTATION_MIN_SAMPLES <- 20       # Minimum OOB samples required for testing
 PERMUTATION_ALPHA <- 0.4          # Significance level for permutation p-values (features with p >= alpha are pruned)
+INDEX_PERM_ALPHA <- 0.1           # Significance level for dropping entirely index groups
 
 # Endmember selection tuning
-MAX_K_EAR <- 7L                  # Maximum number of endmembers to consider per vegetation class in EAR selection (conservative increase to explore one more k).
+MAX_K_EAR <- 2L                  # Maximum number of endmembers to consider per vegetation class in EAR selection (conservative increase to explore one more k).
 CLUSTER_COMPLEXITY_LAMBDA <- 0.005  # Complexity penalty per total endmember: S = min(R_oob, R_train) - λ * sum(k)
-BARREN_SIM_THRESHOLD <- 0.75     # Pre-filter: drop vegetation training observations whose cosine similarity to barren mean exceeds this threshold
+BARREN_SIM_THRESHOLD <- 1     # Pre-filter: drop vegetation training observations whose cosine similarity to barren mean exceeds this threshold
 
+# === COLLINEARITY GUARD (endmember separability) ===
+# When a class centroid lies near the convex hull of the other class centroids
+# in the z-scored feature space, MESMA can describe that class as a mixture
+# of the others (e.g., tamarix ≈ α·populus + β·herbs).  The collinearity guard
+# detects this condition and upweights features that maximise the perpendicular
+# separation of the trapped class, effectively pulling it out of the simplex.
+# The boost is baked into the z-score standard deviations, so inference code
+# requires no changes — the effect propagates automatically through the
+# normalisation parameters stored in MESMA_PARAMS.
+ENABLE_COLLINEARITY_GUARD <- TRUE     # Enable convex-hull membership detection and feature boosting
+COLLINEARITY_THRESHOLD    <- 1.5      # Classes with relative separation below this threshold are considered "trapped".
+                                      # Relative separation = dist(centroid, convex_hull) / within-class spread.
+                                      # Lower values -> only boost severely trapped classes; higher -> more aggressive.
+COLLINEARITY_BOOST_FACTOR <- 3.0      # Maximum multiplier applied to the z-score SDs of the most separating features.
+                                      # Higher -> stronger push out of the simplex.  Typical range: 1.5–5.0.
 
 # === END GLOBAL CONFIG ===
 PROGRESS_LOG_TO_FILE <- FALSE
@@ -296,14 +318,31 @@ LOG_FILE <- "mesma_progress.log"
 # -----------------------------------------------------------------------------
 # Spectral band configuration
 # 
-# NEW LOGIC: We include "blue" in RAW_BANDS for index calculation (EVI, PSRI, etc.).
-# Historically the band was removed after preprocessing to avoid sensor
-# inconsistencies (OLI vs ETM+ cross‑calibration), but bias correction is now
-# applied to all raw bands before any indices are computed.  Set
-# EXCLUDE_BLUE_BAND <- FALSE when you want to retain blue for fitting and
-# downstream MESMA features.
+# NEW LOGIC: "blue" is always included in RAW_BANDS for index calculation
+# (EVI, PSRI, etc.) and will never be dropped.
 RAW_BANDS <- c("blue", "green", "red", "nir", "swir1", "swir2")
-EXCLUDE_BLUE_BAND <- FALSE  # If TRUE, 'blue' is dropped AFTER index computation.
+# EXCLUDE_BLUE_BAND is deprecated and ignored.
+
+# Sensor-bias correction behavior in preprocessing
+# When TRUE, shift LANDSAT_89 (OLI) raw bands to ETM+ scale using affine
+# coefficients from satellite_bias_check/bias_stats_features.csv before index
+# computation.  No additive 'mean bias' corrections are applied.
+# Recommended TRUE even for Collection 2: C2 corrects radiometric calibration
+# but residual surface-reflectance biases persist due to differing spectral
+# response functions (OLI vs ETM+) and atmospheric correction algorithms
+# (LaSRC vs LEDAPS).  These matter for temporal MESMA where both sensor
+# families contribute observations to the same phenological time series.
+ENABLE_BAND_BIAS_CORRECTION <- TRUE
+
+# Sensor-bias correction behavior in preprocessing
+# (deprecated) direct index-level shift for LANDSAT_89 using stats from
+# satellite_bias_check/bias_stats_features.csv.  This mechanism is no longer
+# supported and the value remains FALSE for compatibility.
+ENABLE_DIRECT_INDEX_BIAS_CORRECTION <- FALSE
+
+# Features excluded from direct index correction (kept case-insensitive).
+# Keep raw bands excluded to avoid double-correcting them.
+DIRECT_INDEX_BIAS_EXCLUDE <- c("blue", "green", "red", "nir", "swir1", "swir2")
 
 
 OUTPUT_DIR <- "C:/MAP/phenology_results"

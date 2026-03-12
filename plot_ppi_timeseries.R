@@ -260,7 +260,7 @@ p <- ggplot(ppi_summary, aes(x = date, y = mean_PPI, color = Veg, fill = Veg)) +
   add_excluded_years_shade(is_date = TRUE) + add_year_lines(is_date = TRUE) +
   geom_line(linewidth = 1) +
   geom_ribbon(aes(ymin = mean_PPI - se_PPI, ymax = mean_PPI + se_PPI), alpha = 0.2, color = NA) +
-  labs(title = "Average Plant Phenology Index (PPI) over Time by Vegetation Type",
+  labs(title = "PPI Over Time by Veg Type",
        subtitle = "Shaded area represents Standard Error",
        x = "Date",
        y = "PPI") +
@@ -276,7 +276,7 @@ cat("Plot saved to:", output_file, "\n")
 # Also plot by DOY (Day of Year) to see seasonality
 p_doy <- ggplot(plot_data, aes(x = doy, y = PPI, color = Veg)) +
   geom_smooth(se = FALSE) + 
-  labs(title = "Seasonal PPI Profile by Vegetation Type (Smoothed)",
+    labs(title = "Seasonal PPI by Veg Type",
        x = "Day of Year",
        y = "PPI") +
   theme_minimal() +

@@ -19,7 +19,7 @@ plot_global_averages <- function(summary_df, title_prefix, output_dir) {
     geom_point() +
     geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
     theme_minimal() +
-    labs(title = paste0(title_prefix, " global averages with 95% CI"),
+    labs(title = paste0(title_prefix, " Global Averages (95% CI)"),
          x = "Index", y = "Mean value")
 
   fn <- file.path(output_dir, paste0(gsub("\\s+", "_", title_prefix), "_global_CI.png"))

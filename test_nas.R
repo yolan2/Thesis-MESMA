@@ -1,0 +1,5 @@
+df <- read.csv("C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_low (3).csv")
+cat("Total rows pre 2015:", sum(df$year < 2015, na.rm=TRUE), "\n")
+cat("NAs in Blue pre 2015:", sum(is.na(df$Blue[df$year < 2015])), "\n")
+cat("NAs in Red pre 2015:", sum(is.na(df$Red[df$year < 2015])), "\n")
+cat("NAs in Swir1 pre 2015:", sum(is.na(df$SWIR1[df$year < 2015])), "\n")

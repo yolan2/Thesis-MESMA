@@ -219,3 +219,48 @@ auto_add_ppi_columns <- function(df, dvi_soil = NULL, env_var = "MESMA_DVI_SOIL"
   }
   return(list(df = df, added = FALSE, reason = "dvi_soil_required"))
 }
+
+compute_indices_from_bands <- function(df,
+                                      raw_bands = NULL) {
+  if (is.null(df)) stop("compute_indices_from_bands: df is NULL")
+  if (nrow(df) == 0) return(df)
+  eps <- 1e-9
+
+  # Determine raw bands to consider.  We purposely avoid referencing RAW_BANDS
+  # here to keep the function self-contained for parallel workers.
+  if (is.null(raw_bands)) {
+    raw_bands <- c("blue", "green", "red", "nir", "swir1", "swir2")
+  }
+
+  has_bands <- intersect(raw_bands, names(df))
+  if (length(has_bands) == 0) return(df)
+
+  # Convert bands to numeric once (avoids 50+ repeated as.numeric() calls)
+  b <- list()
+  for (bn in has_bands) b[[bn]] <- as.numeric(df[[bn]])
+
+  has <- function(...) all(c(...) %in% names(b))
+
+  # Compute all required indices
+  if (has('nir','red')) df$DVI <- b$nir - b$red
+  if (has('red','nir')) df$NDDI <- (b$red - b$nir) / (b$red + b$nir + eps)
+  if (has('nir','red','blue')) df$EVI <- 2.5 * (b$nir - b$red) / (b$nir + 6 * b$red - 7.5 * b$blue + 1)
+  if (has('red','blue','nir')) df$PSRI <- (b$red - b$blue) / (b$nir + eps)
+  if (has('nir','swir1')) df$NDMI <- (b$nir - b$swir1) / (b$nir + b$swir1 + eps)
+  if (has('swir1','swir2')) df$NDTI <- (b$swir1 - b$swir2) / (b$swir1 + b$swir2 + eps)
+  if (has('swir1','nir')) df$MSI <- b$swir1 / (b$nir + eps)
+  if (has('nir','red')) df$MSAVI <- (2 * b$nir + 1 - sqrt(pmax(0, (2 * b$nir + 1)^2 - 8 * (b$nir - b$red)))) / 2
+  if (has('nir','red')) df$NDVI <- (b$nir - b$red) / (b$nir + b$red + eps)
+  if (has('nir','red')) df$OSAVI <- (b$nir - b$red) / (b$nir + b$red + 0.16)
+  if (has('nir','red')) df$NIRv <- b$nir * ((b$nir - b$red) / (b$nir + b$red + eps)) * 1.3
+  if (has('nir','swir2')) df$NBR <- (b$nir - b$swir2) / (b$nir + b$swir2 + eps)
+  if (has('swir1','swir2')) df$TCW <- (b$swir1 - b$swir2) / (b$swir1 + b$swir2 + eps)
+  if (has('green','red')) df$PRI <- (b$green - b$red) / (b$green + b$red + eps)
+  if (has('red','green','blue')) df$MCARI <- ((b$red - b$green) - 0.2*(b$red - b$blue)) * (b$red / (b$green + eps))
+  if (has('blue','green','red','nir','swir1','swir2')) {
+    df$TCB <- 0.3029 * b$blue + 0.2786 * b$green + 0.4733 * b$red + 0.5599 * b$nir + 0.508 * b$swir1 + 0.1872 * b$swir2
+    df$GVI <- -0.2941 * b$blue - 0.243 * b$green - 0.5424 * b$red + 0.7276 * b$nir + 0.0713 * b$swir1 - 0.1608 * b$swir2
+  }
+
+  df
+}
