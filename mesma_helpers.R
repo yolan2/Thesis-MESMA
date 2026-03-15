@@ -334,7 +334,7 @@ spatial_block_sample_locations <- function(locations, coords_df, n_draw,
   }
 
   if (is.null(coords_df) || nrow(coords_df) == 0 || !all(c("location_id","lat","lon") %in% names(coords_df))) {
-    return(sample(locations, n_draw, replace = TRUE))
+    stop("[SPATIAL BOOTSTRAP] Coordinate data (location_id, lat, lon) is required but missing or malformed.")
   }
 
   coords_df$location_id <- trimws(as.character(coords_df$location_id))
@@ -342,12 +342,17 @@ spatial_block_sample_locations <- function(locations, coords_df, n_draw,
   coords_df$lon <- suppressWarnings(as.numeric(coords_df$lon))
 
   coords_df <- coords_df[match(locations, coords_df$location_id), , drop = FALSE]
-  if (nrow(coords_df) == 0) return(sample(locations, n_draw, replace = TRUE))
+  if (nrow(coords_df) == 0) {
+    stop("[SPATIAL BOOTSTRAP] No coordinate records matched the supplied location IDs.")
+  }
 
   ok <- is.finite(coords_df$lat) & is.finite(coords_df$lon)
   missing_frac <- mean(!ok)
   if (!is.finite(missing_frac) || missing_frac > max_missing_frac || sum(ok) < 3) {
-    return(sample(locations, n_draw, replace = TRUE))
+    stop(sprintf(
+      "[SPATIAL BOOTSTRAP] Too many locations lack valid coordinates (%.0f%% missing, need at least 3 valid). Check your coordinate data.",
+      missing_frac * 100
+    ))
   }
 
   if (is.null(block_km)) block_km <- BOOTSTRAP_BLOCK_KM
@@ -374,12 +379,16 @@ spatial_block_sample_locations <- function(locations, coords_df, n_draw,
 
   min_blocks_needed <- max(3L, as.integer(ceiling(n_draw / 3)))
   if (length(block_ids) < 2) {
-    return(sample(locations, n_draw, replace = TRUE))
+    stop(sprintf(
+      "[SPATIAL BOOTSTRAP] All %d locations fall into a single spatial block (block_km = %.1f km). Increase block size or check coordinate spread.",
+      n_draw, block_km
+    ))
   }
   if (length(block_ids) < min_blocks_needed) {
-    cat(sprintf("[SPATIAL BOOTSTRAP] Only %d blocks for %d locations — too few for meaningful block diversity; using i.i.d. resampling\n",
-                length(block_ids), n_draw))
-    return(sample(locations, n_draw, replace = TRUE))
+    stop(sprintf(
+      "[SPATIAL BOOTSTRAP] Only %d spatial blocks for %d locations (need at least %d). Block size %.1f km is too large relative to the spatial extent — reduce BOOTSTRAP_BLOCK_KM or check coordinates.",
+      length(block_ids), n_draw, min_blocks_needed, block_km
+    ))
   }
 
   pool <- character(0)

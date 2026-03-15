@@ -135,12 +135,6 @@ if (n_samples < 4L) stop("Too few samples for PCA-LDA.")
 X_mat <- do.call(rbind, X_list)
 
 # ── Z-score per feature×pentad column group (ENABLE_ZSCORE_AFTER_L2 = TRUE) ──
-# Store per-index means and SDs so the collinearity guard can modify them
-z_means <- numeric(length(avail))
-z_sds   <- numeric(length(avail))
-names(z_means) <- avail
-names(z_sds)   <- avail
-
 X_z <- X_mat
 for (k in seq_along(avail)) {
   idx <- (k - 1L) * N_PENT + seq_len(N_PENT)
@@ -148,94 +142,9 @@ for (k in seq_along(avail)) {
   mu  <- mean(v, na.rm = TRUE)
   sg  <- sd(v,   na.rm = TRUE)
   if (is.na(sg) || sg < 1e-9) sg <- 1
-  z_means[k] <- mu
-  z_sds[k]   <- sg
   X_z[, idx] <- (v - mu) / sg
 }
 X_z[!is.finite(X_z)] <- 0
-
-# ── Collinearity guard (mirrors train_feature_pipeline) ──────────────────────
-# Detect classes trapped inside the convex hull of others and boost separating
-# features by shrinking their z-score SDs.  This keeps the scatter plot
-# consistent with the trained MESMA_PARAMS feature space.
-coll_guard_enable <- exists("ENABLE_COLLINEARITY_GUARD") && isTRUE(ENABLE_COLLINEARITY_GUARD)
-
-if (coll_guard_enable && length(unique(y_class)) >= 3) {
-  coll_threshold <- if (exists("COLLINEARITY_THRESHOLD")) COLLINEARITY_THRESHOLD else 1.5
-  coll_boost_max <- if (exists("COLLINEARITY_BOOST_FACTOR")) COLLINEARITY_BOOST_FACTOR else 3.0
-
-  classes_coll <- unique(y_class)
-  centroids_coll <- do.call(rbind, lapply(classes_coll, function(cls) {
-    colMeans(X_z[y_class == cls, , drop = FALSE], na.rm = TRUE)
-  }))
-  rownames(centroids_coll) <- classes_coll
-
-  coll_boost <- rep(1.0, length(avail))
-  names(coll_boost) <- avail
-
-  for (ci in seq_along(classes_coll)) {
-    cls_name <- classes_coll[ci]
-    target_centroid <- centroids_coll[ci, ]
-    other_centroids <- centroids_coll[-ci, , drop = FALSE]
-
-    E_coll <- t(other_centroids)
-    delta_coll <- sqrt(mean(E_coll^2, na.rm = TRUE)) * 100
-    if (!is.finite(delta_coll) || delta_coll < 1e-8) delta_coll <- 1.0
-
-    E_aug_coll <- rbind(E_coll, delta_coll * rep(1, ncol(E_coll)))
-    y_aug_coll <- c(target_centroid, delta_coll)
-
-    res_coll <- nnls::nnls(E_aug_coll, y_aug_coll)
-    alpha_coll <- res_coll$x
-    s_coll <- sum(alpha_coll)
-    if (s_coll > 0) alpha_coll <- alpha_coll / s_coll
-
-    approx_coll <- as.numeric(E_coll %*% alpha_coll)
-    residual_coll <- target_centroid - approx_coll
-
-    sep_by_index <- numeric(length(avail))
-    within_sd_by_index <- numeric(length(avail))
-    for (k in seq_along(avail)) {
-      col_s <- (k - 1L) * N_PENT + 1L
-      col_e <- k * N_PENT
-      sep_by_index[k] <- sqrt(mean(residual_coll[col_s:col_e]^2))
-      cls_vals <- X_z[y_class == cls_name, col_s:col_e, drop = FALSE]
-      within_sd_by_index[k] <- mean(apply(cls_vals, 2, sd, na.rm = TRUE), na.rm = TRUE)
-    }
-    within_sd_by_index[within_sd_by_index < 1e-10] <- 1e-10
-
-    sep_distance <- sqrt(sum(residual_coll^2))
-    class_spread <- sqrt(mean(apply(X_z[y_class == cls_name, , drop = FALSE], 2,
-                                    var, na.rm = TRUE), na.rm = TRUE))
-    if (!is.finite(class_spread) || class_spread < 1e-10) class_spread <- 1e-10
-    relative_sep <- sep_distance / class_spread
-
-    cat(sprintf("  [COLLINEARITY] Class '%s': rel_sep=%.4f (threshold=%.2f)\n",
-                cls_name, relative_sep, coll_threshold))
-
-    if (relative_sep < coll_threshold) {
-      snr_by_index <- sep_by_index / within_sd_by_index
-      max_snr <- max(snr_by_index, na.rm = TRUE)
-      if (!is.finite(max_snr) || max_snr < 1e-10) max_snr <- 1.0
-      snr_norm <- snr_by_index / max_snr
-      index_boost <- 1.0 + (coll_boost_max - 1.0) * snr_norm
-      coll_boost <- pmax(coll_boost, index_boost)
-      cat(sprintf("  [COLLINEARITY] >>> '%s' trapped — boosting separating features\n", cls_name))
-    }
-  }
-
-  if (any(coll_boost > 1.0 + 1e-6)) {
-    cat(sprintf("  [COLLINEARITY] Boosting %d/%d indices (max=%.2f)\n",
-                sum(coll_boost > 1.0 + 1e-6), length(avail), max(coll_boost)))
-    z_sds <- z_sds / coll_boost
-    for (k in seq_along(avail)) {
-      idx <- (k - 1L) * N_PENT + seq_len(N_PENT)
-      X_z[, idx] <- (X_mat[, idx] - z_means[k]) / z_sds[k]
-    }
-    X_z[!is.finite(X_z)] <- 0
-    cat("  [COLLINEARITY] Z-scores recomputed with boosted SDs\n")
-  }
-}
 
 # ── PCA ───────────────────────────────────────────────────────────────────────
 vars      <- apply(X_z, 2, var)

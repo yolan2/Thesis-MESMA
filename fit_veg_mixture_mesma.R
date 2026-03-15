@@ -605,6 +605,121 @@ compute_ppi_pixel_coefs <- function(inference_coefs, df_tasks,
 #
 # Aggregation mirrors location_bootstrap_index:
 #   global_coef = mean over locations of (cover / n_total_locations)
+# ---------------------------------------------------------------------------
+# plot_composition_change_map
+# ---------------------------------------------------------------------------
+# Produces per-vegetation-class change maps showing the difference in mean
+# fractional cover between a recent period and an early period.
+#
+# Inputs:
+#   inference_coefs  – long-format data frame with columns:
+#                      location_id, lat, lon, pheno_year, Veg, coef
+#   out_dir          – directory to write PNG files
+#   early_years      – integer vector of years defining the "early" baseline
+#   recent_years     – integer vector of years defining the "recent" period
+#   file_prefix      – prefix for output filenames
+# ---------------------------------------------------------------------------
+plot_composition_change_map <- function(
+    inference_coefs,
+    out_dir      = if (exists("OUT_DIR")) OUT_DIR else ".",
+    early_years  = NULL,   # defaults to first 5 years in data
+    recent_years = NULL,   # defaults to last 5 years in data
+    file_prefix  = "change_map"
+) {
+  if (is.null(inference_coefs) || nrow(inference_coefs) == 0) {
+    cat("[CHANGE MAP] No inference coefficients available; skipping.\n")
+    return(invisible(NULL))
+  }
+  required_cols <- c("lat", "lon", "pheno_year", "Veg", "coef")
+  missing_cols  <- setdiff(required_cols, names(inference_coefs))
+  if (length(missing_cols) > 0) {
+    cat(sprintf("[CHANGE MAP] Missing columns: %s; skipping.\n", paste(missing_cols, collapse = ", ")))
+    return(invisible(NULL))
+  }
+
+  df <- inference_coefs %>%
+    filter(!is.na(lat), !is.na(lon), !is.na(coef), !is.na(pheno_year)) %>%
+    mutate(pheno_year = as.integer(pheno_year), coef = as.numeric(coef))
+
+  all_years <- sort(unique(df$pheno_year))
+  if (length(all_years) < 2) {
+    cat("[CHANGE MAP] Fewer than 2 distinct years; skipping change map.\n")
+    return(invisible(NULL))
+  }
+
+  if (is.null(early_years))  early_years  <- head(all_years, 5)
+  if (is.null(recent_years)) recent_years <- tail(all_years, 5)
+
+  cat(sprintf("[CHANGE MAP] Early period:  %s\n", paste(early_years,  collapse = ", ")))
+  cat(sprintf("[CHANGE MAP] Recent period: %s\n", paste(recent_years, collapse = ", ")))
+
+  # Mean fraction per location × class for each period
+  early_mean <- df %>%
+    filter(pheno_year %in% early_years) %>%
+    group_by(location_id, lat, lon, Veg) %>%
+    summarise(coef_early = mean(coef, na.rm = TRUE), .groups = "drop")
+
+  recent_mean <- df %>%
+    filter(pheno_year %in% recent_years) %>%
+    group_by(location_id, lat, lon, Veg) %>%
+    summarise(coef_recent = mean(coef, na.rm = TRUE), .groups = "drop")
+
+  change_df <- inner_join(early_mean, recent_mean,
+                          by = c("location_id", "lat", "lon", "Veg")) %>%
+    mutate(delta = coef_recent - coef_early)
+
+  if (nrow(change_df) == 0) {
+    cat("[CHANGE MAP] No overlapping locations between early and recent periods.\n")
+    return(invisible(NULL))
+  }
+
+  # Write CSV
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  csv_path <- file.path(out_dir, sprintf("inference_%s.csv", file_prefix))
+  readr::write_csv(change_df, csv_path)
+  cat(sprintf("[CHANGE MAP] Wrote change data: %s\n", csv_path))
+
+  # Symmetric color scale centred at 0
+  abs_max <- max(abs(change_df$delta), na.rm = TRUE)
+  abs_max <- if (is.finite(abs_max) && abs_max > 0) abs_max else 1
+
+  veg_classes <- sort(unique(change_df$Veg))
+
+  p <- ggplot(change_df, aes(x = lon, y = lat, colour = delta)) +
+    geom_point(size = 1.2, alpha = 0.85) +
+    facet_wrap(~ Veg, ncol = ceiling(sqrt(length(veg_classes)))) +
+    scale_colour_gradient2(
+      low      = "#d73027",
+      mid      = "grey92",
+      high     = "#1a9850",
+      midpoint = 0,
+      limits   = c(-abs_max, abs_max),
+      name     = "\u0394 fraction\n(recent \u2212 early)"
+    ) +
+    coord_fixed(ratio = 1.2) +
+    labs(
+      title    = sprintf("Composition change: %s\u2013%s vs %s\u2013%s",
+                         min(early_years), max(early_years),
+                         min(recent_years), max(recent_years)),
+      subtitle = "Red = decline, Green = increase",
+      x = "Longitude", y = "Latitude"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      strip.text       = element_text(face = "bold"),
+      legend.position  = "right",
+      panel.grid.minor = element_blank()
+    )
+
+  png_path <- file.path(out_dir, sprintf("inference_%s.png", file_prefix))
+  ggsave(png_path, p, width = 4 * ceiling(sqrt(length(veg_classes))),
+         height = 4 * ceiling(length(veg_classes) / ceiling(sqrt(length(veg_classes)))),
+         dpi = 150, limitsize = FALSE)
+  cat(sprintf("[CHANGE MAP] Saved change map: %s\n", png_path))
+
+  invisible(change_df)
+}
+
 #   coef_025 / coef_975 from B bootstrap resamples of locations.
 #
 # Outputs (saved to `out_dir`):
@@ -695,14 +810,27 @@ plot_pixel_mixture_timeseries <- function(inference_coefs,
     df_wide[[vc]][is.na(df_wide[[vc]])] <- 0
   }
 
+  veg_priority <- c("populus", "tamarix", "herbs")
+  format_mix_label <- function(species_vec) {
+    nice <- paste0(toupper(substr(species_vec, 1, 1)), substr(species_vec, 2, nchar(species_vec)))
+    if (length(nice) == 1) {
+      paste0(nice, " (pure)")
+    } else {
+      paste(nice, collapse = " + ")
+    }
+  }
+
   classify_row <- function(row_vals) {
     present <- veg_cols[row_vals >= threshold]
     if (length(present) == 0) {
       # fallback: assign dominant species so every pixel gets a class
       present <- veg_cols[which.max(row_vals)]
     }
-    nice <- paste0(toupper(substr(present, 1, 1)), substr(present, 2, nchar(present)))
-    paste(sort(nice), collapse = " + ")
+    # Keep a stable ecological ordering (populus -> tamarix -> herbs -> others)
+    ord <- match(present, veg_priority)
+    ord[is.na(ord)] <- length(veg_priority) + seq_len(sum(is.na(ord)))
+    present <- present[order(ord)]
+    format_mix_label(present)
   }
   df_wide$mixture_type <- apply(df_wide[, veg_cols, drop = FALSE], 1, classify_row)
 
@@ -720,6 +848,10 @@ plot_pixel_mixture_timeseries <- function(inference_coefs,
       by = c("location_id", "pheno_year")
     )
   df_pixel$abs_cover[is.na(df_pixel$abs_cover)] <- 0
+
+  out_px_csv <- file.path(out_dir, sprintf("inference_mixture_%s_pixel_classes.csv", file_prefix))
+  readr::write_csv(df_pixel, out_px_csv)
+  cat(sprintf("Saved reclassified pixel-year mixture classes to: %s\n", out_px_csv))
 
   # ---- 5. Bootstrap by location to get CI (mirrors species_separate) ----
   years     <- sort(unique(df_pixel$pheno_year))
@@ -769,6 +901,7 @@ plot_pixel_mixture_timeseries <- function(inference_coefs,
   )
 
   build_mix_color <- function(mix_name) {
+    mix_name <- gsub(" \\(pure\\)$", "", mix_name)
     parts <- strsplit(mix_name, " \\+ ")[[1]]
     cols  <- sp_base[intersect(parts, names(sp_base))]
     if (length(cols) == 0) return("#AAAAAA")
@@ -807,10 +940,15 @@ plot_pixel_mixture_timeseries <- function(inference_coefs,
     theme_minimal()
 
   out_ts_png <- file.path(out_dir, sprintf("inference_mixture_%s_mixture_timeseries.png", file_prefix))
+  out_tr_png <- file.path(out_dir, sprintf("inference_mixture_%s_mixture_trends.png", file_prefix))
   out_ts_csv <- file.path(out_dir, sprintf("inference_mixture_%s_mixture_timeseries.csv", file_prefix))
+  out_tr_csv <- file.path(out_dir, sprintf("inference_mixture_%s_mixture_trends.csv", file_prefix))
   ggsave(out_ts_png, p_ts, width = 8, height = 6, dpi = 150)
+  ggsave(out_tr_png, p_ts, width = 8, height = 6, dpi = 150)
   readr::write_csv(summary_df, out_ts_csv)
+  readr::write_csv(summary_df, out_tr_csv)
   cat(sprintf("Saved mixture class time series plot to: %s\n", out_ts_png))
+  cat(sprintf("Saved mixture class trend plot to: %s\n", out_tr_png))
 
   # ---- 9. Stacked area proportion plot (bonus) -------------------------
   total_by_year <- summary_df |>
@@ -1492,6 +1630,11 @@ safe_lda_call <- function(X_pca, y, min_n_pcs = 2) {
 # back into original feature space.
 # ---------------------------------------------------------------------------
 .train_pca_lda <- function(X_z, y_labels) {
+  if (!exists("USE_LDA_SPACE_SOLVER")) {
+    stop("[CONFIG] USE_LDA_SPACE_SOLVER is not set. Please define it in mesma_config.R.")
+  }
+  use_lda_space <- isTRUE(USE_LDA_SPACE_SOLVER)
+
   cat("  Computing PCA-LDA weights...\n")
   vars      <- apply(X_z, 2, var)
   keep_cols <- vars > 1e-9
@@ -1528,47 +1671,45 @@ safe_lda_call <- function(X_pca, y, min_n_pcs = 2) {
     stop("[LDA] LDA could not be computed (collinearity / too few samples / invalid feature space)")
   }
 
-  R      <- pca_res$rotation[, 1:n_pcs, drop = FALSE]
-  W_pc   <- lda_res$scaling
-  W_std  <- R %*% W_pc
   svd_v  <- lda_res$svd
-  prop   <- svd_v / sum(svd_v)
+  prop   <- svd_v^2 / sum(svd_v^2)
 
-  use_lda_space <- exists("USE_LDA_SPACE_SOLVER") && isTRUE(USE_LDA_SPACE_SOLVER)
+  res <- list(use_lda_space = use_lda_space)
 
-  if (use_lda_space) {
-    n_dim            <- ncol(W_std)
-    lda_comp_weights <- prop[1:n_dim]
-    cat(sprintf("  LDA-space mode enabled: %d components, weights sum=%.3f\n", n_dim, sum(lda_comp_weights)))
+  # Back-projected per-bin weights: kept for prototype plot bar heights only,
+  # NOT used in fitting or unmixing.
+  if (use_lda_space || TRUE) {
+    R      <- pca_res$rotation[, 1:n_pcs, drop = FALSE]
+    W_pc   <- lda_res$scaling
+    W_std  <- R %*% W_pc
+    n_dim  <- min(length(prop), ncol(W_std))
+
     if (ncol(W_std) > 1) {
-      n_dim2        <- min(length(prop), ncol(W_std))
-      weights_clean <- rowSums(abs(W_std[, 1:n_dim2, drop = FALSE]) %*% diag(prop[1:n_dim2], nrow = n_dim2))
-    } else {
-      weights_clean <- abs(W_std[, 1])
-    }
-    cat("  [INFO] computed per-index weights for diagnostics (ignored by LDA solver)\n")
-  } else {
-    if (ncol(W_std) > 1) {
-      n_dim         <- min(length(prop), ncol(W_std))
       weights_clean <- rowSums(abs(W_std[, 1:n_dim, drop = FALSE]) %*% diag(prop[1:n_dim], nrow = n_dim))
     } else {
       weights_clean <- abs(W_std[, 1])
     }
-    lda_comp_weights <- NULL
+
+    plot_weights <- numeric(ncol(X_z))
+    plot_weights[keep_cols] <- weights_clean
+    cat(sprintf("LDA back-projected weights (for plots only): min=%.4f, max=%.4f, mean=%.4f\n",
+        min(plot_weights[plot_weights > 0], na.rm = TRUE),
+        max(plot_weights, na.rm = TRUE),
+        mean(plot_weights, na.rm = TRUE)))
+    res$plot_weights <- plot_weights
   }
 
-  final_weights <- numeric(ncol(X_z))
-  final_weights[keep_cols] <- weights_clean
-  cat(sprintf("LDA weights (no normalization): min=%.4f, max=%.4f, mean=%.4f\n",
-      min(final_weights[final_weights > 0], na.rm = TRUE),
-      max(final_weights, na.rm = TRUE),
-      mean(final_weights, na.rm = TRUE)))
-
-  res <- list(final_weights = final_weights, use_lda_space = use_lda_space)
   if (use_lda_space) {
-    res$lda_basis            <- W_std
+    lda_comp_weights <- prop[1:n_dim]
+    # Build full-space basis: map zero-variance columns to zero rows
+    W_full <- matrix(0, nrow = ncol(X_z), ncol = ncol(W_std))
+    W_full[keep_cols, ] <- W_std
+    res$lda_basis             <- W_full
     res$lda_component_weights <- lda_comp_weights
+    cat(sprintf("  LDA-space solver enabled: %d discriminant components, weights sum=%.3f\n",
+                n_dim, sum(lda_comp_weights)))
   }
+
   res
 }
 
@@ -1611,12 +1752,7 @@ train_feature_pipeline <- function(df, class_col, feature_cols) {
           )
 
         print(p_survival)
-        if (exists("OUTPUT_DIR") && !is.null(OUTPUT_DIR) && nzchar(as.character(OUTPUT_DIR))) {
-          try(
-            ggplot2::ggsave(file.path(OUTPUT_DIR, "fit_filter_survival_locations.png"), p_survival, width = 6, height = 4),
-            silent = TRUE
-          )
-        }
+        # Plot saving disabled per user request; removed OUTPUT_DIR ggsave call
       }
     }
 
@@ -1685,20 +1821,19 @@ train_feature_pipeline <- function(df, class_col, feature_cols) {
   lda_res_out <- .train_pca_lda(X_z, y_labels)
 
   # Build return list
+  # NOTE: back-projected LDA weights are stored in plot_weights (for prototype
+  # plot bar heights only) and are NOT passed to fitting/unmixing routines.
   res <- list(
-    means         = global_means,
-    sds           = global_sds,
-    weights       = lda_res_out$final_weights,
-    indices       = feature_cols,
-    base_indices  = feature_cols,
-    l2_normalize  = l2_only_mode,
-    zscore_applied = apply_zscore
+    means                 = global_means,
+    sds                   = global_sds,
+    plot_weights          = lda_res_out$plot_weights,
+    indices               = feature_cols,
+    base_indices          = feature_cols,
+    l2_normalize          = l2_only_mode,
+    zscore_applied        = apply_zscore,
+    lda_basis             = lda_res_out$lda_basis,
+    lda_component_weights = lda_res_out$lda_component_weights
   )
-  if (isTRUE(lda_res_out$use_lda_space)) {
-    res$lda_basis             <- lda_res_out$lda_basis
-    res$lda_component_weights <- lda_res_out$lda_component_weights
-    res$use_lda_space         <- TRUE
-  }
   return(res)
 }
 
@@ -3554,14 +3689,9 @@ load_and_prepare_inference_data <- function() {
       }
     }
 
-    # Weights for clustering (PCA-LDA weights for distance calculations)
-    # Storage matrices are built to match `indices` exactly, so they always have `expected_cols` columns.
+    # Uniform weights for clustering (back-projected LDA weights no longer used in fitting)
     n_storage_cols <- expected_cols
-    w_vec <- if(!is.null(params$weights) && length(params$weights) == n_storage_cols) {
-      pmax(params$weights, 0)
-    } else {
-      rep(1, n_storage_cols)
-    }
+    w_vec <- rep(1, n_storage_cols)
     w_vec[w_vec < 1e-9] <- 1e-9 # Prevent div by zero
     
     min_cluster_size <- MIN_CLUSTER_SIZE
@@ -3783,17 +3913,11 @@ load_and_prepare_inference_data <- function() {
 
           # Batch process using solve_batch_fcls for speed
           solver_mode <- if (!is.null(params$solver)) params$solver else "fcls"
-          if (!is.null(params) && !is.null(params$use_lda_space) && isTRUE(params$use_lda_space)) {
-            all_coefs <- solve_batch_fcls(M, Y_test,
-                                          feature_weights = NULL,
-                                          lda_basis = params$lda_basis,
-                                          lda_component_weights = params$lda_component_weights,
-                                          solver = solver_mode)
-          } else {
-            all_coefs <- solve_batch_fcls(M, Y_test,
-                                          params$weights,
-                                          solver = solver_mode)
-          }
+          all_coefs <- solve_batch_fcls(M, Y_test,
+                                        NULL,
+                                        lda_basis             = params$lda_basis,
+                                        lda_component_weights = params$lda_component_weights,
+                                        solver = solver_mode)
 
           # Compute average correctly predicted fraction for vegetation classes
           # Row-normalized after barren subtraction: veg_frac_true / sum(veg_fracs)
@@ -4021,7 +4145,7 @@ load_and_prepare_inference_data <- function() {
     # proportionally to the corresponding weight (higher weight = darker),
     # providing a visual cue for temporally-important bins.  If weights are not
     # provided, a binary 'significant' mask may still be used for light shading.
-    plot_vegetation_prototypes <- function(lib, indices = NULL, out_dir = if (exists("OUT_DIR")) OUT_DIR else ".", prefix = "veg_prototypes", save_png = TRUE, dpi = 150, feature_weights = NULL, show_medians = TRUE, variant_alpha = NULL) {
+    plot_vegetation_prototypes <- function(lib, indices = NULL, out_dir = if (exists("OUT_DIR")) OUT_DIR else ".", prefix = "veg_prototypes", save_png = TRUE, dpi = 150, feature_weights = NULL, lda_weights = NULL, show_medians = TRUE, variant_alpha = NULL, bin_pvalues = NULL) {
       if (is.null(lib) || length(lib) == 0) return(NULL)
       if (is.null(indices)) {
         if (exists("MESMA_PARAMS") && !is.null(MESMA_PARAMS) && !is.null(MESMA_PARAMS$indices)) indices <- MESMA_PARAMS$indices else indices <- OPTIMAL_INDICES
@@ -4035,8 +4159,12 @@ load_and_prepare_inference_data <- function() {
       pheno_month_labels <- c("Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec","Jan","Feb")
       # Convert month-start pheno DOY to pentad position: pentad = ceil(doy / agg_days)
       month_breaks_pentad <- ceiling(pheno_month_starts / TEMPORAL_AGGREGATION_DAYS)
-      # Keep only unique breaks within the temporal budget
-      keep <- month_breaks_pentad >= 1 & month_breaks_pentad <= TEMPORAL_BUDGET & !duplicated(month_breaks_pentad)
+      # Exclude the last (partial/reserved) pentad from plots — it is always
+      # sparse and creates a visual artefact at the right edge of the plot.
+      n_plot_bins <- TEMPORAL_BUDGET - 1L
+
+      # Keep only unique breaks within the plotted temporal budget
+      keep <- month_breaks_pentad >= 1 & month_breaks_pentad <= n_plot_bins & !duplicated(month_breaks_pentad)
       month_breaks_pentad <- month_breaks_pentad[keep]
       month_labels <- pheno_month_labels[keep]
 
@@ -4046,13 +4174,13 @@ load_and_prepare_inference_data <- function() {
       # (which was built from the original full set) remain correctly aligned even after
       # excluded indices are dropped from `indices`.
       orig_indices <- indices
-      weight_mask <- NULL
+      weight_mask <- NULL      # pruning mask (0 = pruned): used for fill colour
+      lda_weight_mask <- NULL  # raw LDA weights: used for bar heights (always positive)
       if (!is.null(feature_weights) && length(feature_weights) == length(indices) * TEMPORAL_BUDGET) {
         weight_mask <- list()
         for (k in seq_along(indices)) {
           w_start <- (k - 1) * TEMPORAL_BUDGET + 1
-          w_end <- k * TEMPORAL_BUDGET
-          weight_mask[[indices[k]]] <- feature_weights[w_start:w_end]
+          weight_mask[[indices[k]]] <- feature_weights[w_start:(w_start + n_plot_bins - 1L)]
         }
         # Drop fully-excluded indices (all pentad weights zero) — do NOT plot these
         excluded <- names(weight_mask)[vapply(weight_mask, function(m) all(m == 0), logical(1))]
@@ -4060,6 +4188,13 @@ load_and_prepare_inference_data <- function() {
           cat(sprintf("[PROTO PLOT] Skipping %d fully-excluded indices: %s\n", length(excluded), paste(excluded, collapse = ", ")))
           indices <- setdiff(indices, excluded)
           weight_mask <- weight_mask[indices]
+        }
+      }
+      if (!is.null(lda_weights) && length(lda_weights) == length(orig_indices) * TEMPORAL_BUDGET) {
+        lda_weight_mask <- list()
+        for (k in seq_along(orig_indices)) {
+          w_start <- (k - 1) * TEMPORAL_BUDGET + 1
+          lda_weight_mask[[orig_indices[k]]] <- lda_weights[w_start:(w_start + n_plot_bins - 1L)]
         }
       }
 
@@ -4082,12 +4217,13 @@ load_and_prepare_inference_data <- function() {
             idx_name <- orig_indices[k]
             if (!idx_name %in% indices) next   # excluded index — don't plot
             start <- (k - 1) * TEMPORAL_BUDGET + 1
-            end <- k * TEMPORAL_BUDGET
+            end   <- (k - 1) * TEMPORAL_BUDGET + n_plot_bins   # drop last pentad
             vals <- vec[start:end]
-            sig <- if (!is.null(weight_mask) && idx_name %in% names(weight_mask)) weight_mask[[idx_name]] > 0 else rep(TRUE, TEMPORAL_BUDGET)
-            wt <- if (!is.null(weight_mask) && idx_name %in% names(weight_mask)) weight_mask[[idx_name]] else rep(NA_real_, TEMPORAL_BUDGET)
+            sig <- if (!is.null(weight_mask) && idx_name %in% names(weight_mask)) weight_mask[[idx_name]][1:n_plot_bins] > 0 else rep(TRUE, n_plot_bins)
+            wt <- if (!is.null(weight_mask) && idx_name %in% names(weight_mask)) weight_mask[[idx_name]][1:n_plot_bins] else rep(NA_real_, n_plot_bins)
 
-            df_tmp <- data.frame(pentad = seq_len(TEMPORAL_BUDGET), value = vals, Veg = v, variant_id = vid, index = idx_name, significant = sig, weight = wt, stringsAsFactors = FALSE)
+            pval <- if (!is.null(bin_pvalues) && idx_name %in% names(bin_pvalues)) bin_pvalues[[idx_name]][1:n_plot_bins] else rep(NA_real_, n_plot_bins)
+            df_tmp <- data.frame(pentad = seq_len(n_plot_bins), value = vals, Veg = v, variant_id = vid, index = idx_name, significant = sig, weight = wt, pvalue = pval, stringsAsFactors = FALSE)
             rows[[length(rows) + 1]] <- df_tmp
           }
         }
@@ -4218,7 +4354,7 @@ load_and_prepare_inference_data <- function() {
                            x = NULL,
                            y = y_lab) +
              ggplot2::scale_x_continuous(breaks = month_breaks_pentad, labels = month_labels,
-                                         limits = c(0.5, TEMPORAL_BUDGET + 0.5)) +
+                                         limits = c(0.5, n_plot_bins + 0.5)) +
              ggplot2::theme_minimal() +
              ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5),
                             plot.subtitle = ggplot2::element_text(hjust = 0.5, size = 9),
@@ -4233,29 +4369,53 @@ load_and_prepare_inference_data <- function() {
         # are visually de-emphasized; surviving bins use blue.
         w_panel <- NULL
         if (has_weight && !is.null(weight_mask) && idx %in% names(weight_mask)) {
-          wts_plot <- weight_mask[[idx]]
-          if (length(wts_plot) == TEMPORAL_BUDGET) {
-            wmax <- max(wts_plot, na.rm = TRUE)
-            wnorm_plot <- if (wmax > 0) wts_plot / wmax else rep(0, TEMPORAL_BUDGET)
+          wts_plot <- weight_mask[[idx]]   # pruning mask (0/1 or 0/positive)
+          # Use raw LDA weights for bar heights if available, else fall back to mask
+          raw_wts <- if (!is.null(lda_weight_mask) && idx %in% names(lda_weight_mask)) {
+            lda_weight_mask[[idx]]
+          } else {
+            wts_plot
+          }
+          if (length(wts_plot) == n_plot_bins) {
+            wmax <- max(raw_wts, na.rm = TRUE)
+            wnorm_plot <- if (wmax > 0) raw_wts / wmax else rep(0, n_plot_bins)
+            pvals_plot <- if (!is.null(bin_pvalues) && idx %in% names(bin_pvalues)) bin_pvalues[[idx]][1:n_plot_bins] else rep(NA_real_, n_plot_bins)
             w_df <- data.frame(
-              pentad  = seq_len(TEMPORAL_BUDGET),
-              weight  = wnorm_plot,
-              pruned  = wts_plot == 0
+              pentad = seq_len(n_plot_bins),
+              weight = wnorm_plot,
+              pruned = wts_plot == 0,
+              pvalue = pvals_plot
             )
-            w_panel <- ggplot2::ggplot(w_df, ggplot2::aes(x = pentad, y = weight, fill = pruned)) +
-              ggplot2::geom_col(width = 0.85, show.legend = FALSE) +
+            w_panel <- ggplot2::ggplot(w_df, ggplot2::aes(x = pentad)) +
+              ggplot2::geom_col(ggplot2::aes(y = weight, fill = pruned), width = 0.85, show.legend = FALSE) +
               ggplot2::scale_fill_manual(values = c("FALSE" = "#2166ac", "TRUE" = "grey70")) +
               ggplot2::scale_x_continuous(breaks = month_breaks_pentad, labels = month_labels,
-                                          limits = c(0.5, TEMPORAL_BUDGET + 0.5)) +
+                                          limits = c(0.5, n_plot_bins + 0.5)) +
               ggplot2::scale_y_continuous(breaks = c(0, 0.5, 1), labels = c("0", "0.5", "1"),
                                           limits = c(0, 1.05)) +
               ggplot2::labs(x = "Month", y = "Rel. weight") +
               ggplot2::theme_minimal() +
               ggplot2::theme(
-                axis.title.y = ggplot2::element_text(size = 7),
-                axis.text.y  = ggplot2::element_text(size = 6),
+                axis.title.y     = ggplot2::element_text(size = 7),
+                axis.text.y      = ggplot2::element_text(size = 6),
                 panel.grid.minor = ggplot2::element_blank()
               )
+            if (any(is.finite(pvals_plot))) {
+              # Overlay p-values as a line on the same [0,1] axis (p-values are
+              # already in [0,1], so no rescaling needed).  A dashed line at
+              # PERM_ALPHA marks the significance threshold.
+              w_panel <- w_panel +
+                ggplot2::geom_line(ggplot2::aes(y = pvalue), color = "firebrick",
+                                   linewidth = 0.7, na.rm = TRUE) +
+                ggplot2::geom_point(ggplot2::aes(y = pvalue), color = "firebrick",
+                                    size = 1.2, na.rm = TRUE) +
+                ggplot2::geom_hline(yintercept = PERM_ALPHA, linetype = "dashed",
+                                    color = "firebrick", linewidth = 0.5) +
+                ggplot2::annotate("text", x = TEMPORAL_BUDGET + 0.3,
+                                  y = PERM_ALPHA + 0.04, label = sprintf("α=%.2f", PERM_ALPHA),
+                                  color = "firebrick", size = 2.5, hjust = 1) +
+                ggplot2::labs(y = "Rel. weight  /  p-value")
+            }
           }
         }
 
@@ -4293,20 +4453,22 @@ load_and_prepare_inference_data <- function() {
       tryCatch({
         # Use params$indices (passed to this function) instead of MESMA_PARAMS which may not exist yet
         plot_indices <- if (!is.null(params) && !is.null(params$indices)) params$indices else indices
+        # plot_weights: pruning mask (0 = pruned) — drives fill colour
+        # lda_weights:  back-projected LDA weights — drives bar height (for visualisation only)
         plot_weights <- if (!is.null(params) && !is.null(params$plot_weights)) {
           params$plot_weights
-        } else if (!is.null(params) && !is.null(params$weights)) {
-          params$weights
         } else {
           NULL
         }
+        plot_lda_weights <- if (!is.null(params) && !is.null(params$plot_weights)) params$plot_weights else NULL
+        plot_bpvals <- if (!is.null(params) && !is.null(params$bin_pvalues)) params$bin_pvalues else NULL
         out_base <- file.path(if (exists("OUT_DIR")) OUT_DIR else ".", "prototype_plots")
-        plot_vegetation_prototypes(res_lib, indices = plot_indices, out_dir = out_base, feature_weights = plot_weights, show_medians = TRUE)
+        plot_vegetation_prototypes(res_lib, indices = plot_indices, out_dir = out_base, feature_weights = plot_weights, lda_weights = plot_lda_weights, show_medians = TRUE, bin_pvalues = plot_bpvals)
         cat(sprintf("[NOTICE] Generated prototype plots (with medians) to %s\n", out_base))
 
         if (exists("GENERATE_PROTO_PLOTS_VARIANTS_ONLY") && isTRUE(GENERATE_PROTO_PLOTS_VARIANTS_ONLY)) {
           out_variants <- file.path(if (exists("OUT_DIR")) OUT_DIR else ".", "prototype_plots_variants_only")
-          plot_vegetation_prototypes(res_lib, indices = plot_indices, out_dir = out_variants, feature_weights = plot_weights, show_medians = FALSE)
+          plot_vegetation_prototypes(res_lib, indices = plot_indices, out_dir = out_variants, feature_weights = plot_weights, lda_weights = plot_lda_weights, show_medians = FALSE, bin_pvalues = plot_bpvals)
           cat(sprintf("[NOTICE] Generated prototype plots (variants-only) to %s\n", out_variants))
         }
       }, error = function(e) {
@@ -4437,28 +4599,23 @@ load_and_prepare_inference_data <- function() {
   }
 
 print_weights_summary <- function(stage_name, params) {
-  if (is.null(params) || is.null(params$weights) || is.null(params$indices)) {
-    cat(sprintf("[WEIGHTS %s] No weights available\n", stage_name))
+  w <- params$plot_weights
+  if (is.null(params) || is.null(w) || is.null(params$indices)) {
+    cat(sprintf("[WEIGHTS %s] No plot_weights available\n", stage_name))
     return(invisible(NULL))
   }
 
-  # LDA-space special reporting
-  if (!is.null(params$use_lda_space) && isTRUE(params$use_lda_space)) {
-    cat(sprintf("[WEIGHTS %s] LDA-space mode active; component weights: %s\n", stage_name,
-                paste(sprintf("%.4f", params$lda_component_weights), collapse=", ")))
-  }
-
   n_indices <- length(params$indices)
-  wlen <- length(params$weights)
+  wlen <- length(w)
   expected <- n_indices * TEMPORAL_BUDGET
 
   if (wlen == expected) {
-    w_mat <- matrix(params$weights, nrow = TEMPORAL_BUDGET, ncol = n_indices)
+    w_mat <- matrix(w, nrow = TEMPORAL_BUDGET, ncol = n_indices)
     per_index_mean <- colMeans(w_mat, na.rm = TRUE)
     per_index_max <- apply(w_mat, 2, max, na.rm = TRUE)
     ord <- order(per_index_mean, decreasing = TRUE)
 
-    cat(sprintf("[WEIGHTS %s] Per-index mean weights (top %d):\n", stage_name, min(8, n_indices)))
+    cat(sprintf("[WEIGHTS %s] Per-index mean plot_weights (top %d):\n", stage_name, min(8, n_indices)))
     topn <- min(8, n_indices)
     for (i in seq_len(topn)) {
       ii <- ord[i]
@@ -4467,8 +4624,8 @@ print_weights_summary <- function(stage_name, params) {
 
     cat(sprintf("[WEIGHTS %s] Full per-index means: %s\n", stage_name, paste(sprintf("%s=%.4f", params$indices, per_index_mean), collapse=", ")))
   } else {
-    cat(sprintf("[WEIGHTS %s] weights length (%d) != expected (%d) -> printing sample values\n", stage_name, wlen, expected))
-    cat(sprintf("[WEIGHTS %s] sample weights (first 20): %s\n", stage_name, paste(sprintf("%.4f", head(params$weights, 20)), collapse=", ")))
+    cat(sprintf("[WEIGHTS %s] plot_weights length (%d) != expected (%d) -> printing sample values\n", stage_name, wlen, expected))
+    cat(sprintf("[WEIGHTS %s] sample plot_weights (first 20): %s\n", stage_name, paste(sprintf("%.4f", head(w, 20)), collapse=", ")))
   }
   invisible(NULL)
 }
@@ -4539,9 +4696,9 @@ print_weights_summary <- function(stage_name, params) {
     MESMA_PARAMS_INITIAL$solver <- "iwlmm"
   }
 
-  if (!is.null(MESMA_PARAMS_INITIAL) && !is.null(MESMA_PARAMS_INITIAL$weights)) {
-    MESMA_PARAMS_INITIAL$weights[is.na(MESMA_PARAMS_INITIAL$weights)] <- 0
-    MESMA_PARAMS_INITIAL$weights[!is.finite(MESMA_PARAMS_INITIAL$weights)] <- 0
+  if (!is.null(MESMA_PARAMS_INITIAL) && !is.null(MESMA_PARAMS_INITIAL$plot_weights)) {
+    MESMA_PARAMS_INITIAL$plot_weights[is.na(MESMA_PARAMS_INITIAL$plot_weights)] <- 0
+    MESMA_PARAMS_INITIAL$plot_weights[!is.finite(MESMA_PARAMS_INITIAL$plot_weights)] <- 0
     print_weights_summary("INITIAL_PCA_LDA", MESMA_PARAMS_INITIAL)
   }
 
@@ -4573,7 +4730,7 @@ print_weights_summary <- function(stage_name, params) {
   MESMA_PARAMS <- MESMA_PARAMS_INITIAL
 
   if (exists("df_train_oob") && !is.null(df_train_oob) && nrow(df_train_oob) > 0 &&
-      !is.null(MESMA_PARAMS_INITIAL) && !is.null(MESMA_PARAMS_INITIAL$weights)) {
+      !is.null(MESMA_PARAMS_INITIAL)) {
 
     # Prepare OOB data
     oob_for_eval <- dplyr::mutate(df_train_oob, target_class = tolower(as.character(Veg)))
@@ -4621,14 +4778,11 @@ print_weights_summary <- function(stage_name, params) {
       list(Y = do.call(rbind, vecs), labels = labels)
     }
 
-    compute_score_from_Y <- function(E, col_names, Y, labels, unique_classes, weights) {
-      if (exists("MESMA_PARAMS_INITIAL") && isTRUE(MESMA_PARAMS_INITIAL$use_lda_space)) {
-        all_coefs <- solve_batch_fcls(E, Y, feature_weights = NULL,
-                                      lda_basis = MESMA_PARAMS_INITIAL$lda_basis,
-                                      lda_component_weights = MESMA_PARAMS_INITIAL$lda_component_weights)
-      } else {
-        all_coefs <- solve_batch_fcls(E, Y, weights)
-      }
+    compute_score_from_Y <- function(E, col_names, Y, labels, unique_classes,
+                                      lda_basis = NULL, lda_component_weights = NULL) {
+      all_coefs <- solve_batch_fcls(E, Y, NULL,
+                                    lda_basis = lda_basis,
+                                    lda_component_weights = lda_component_weights)
       if (is.null(all_coefs)) return(NA_real_)
       veg_classes <- setdiff(unique_classes, "barren")
       sums <- setNames(rep(0, length(veg_classes)), veg_classes)
@@ -4654,9 +4808,11 @@ print_weights_summary <- function(stage_name, params) {
     oob_built <- build_Y_from_df(oob_for_eval, MESMA_PARAMS_INITIAL, TEMPORAL_BUDGET)
     Y_base    <- oob_built$Y
     oob_labels <- oob_built$labels
-    w_full     <- MESMA_PARAMS_INITIAL$weights
+    lda_basis_perm  <- MESMA_PARAMS_INITIAL$lda_basis
+    lda_cw_perm     <- MESMA_PARAMS_INITIAL$lda_component_weights
 
-    baseline_score <- compute_score_from_Y(endm$E, endm$col_names, Y_base, oob_labels, unique_classes, w_full)
+    baseline_score <- compute_score_from_Y(endm$E, endm$col_names, Y_base, oob_labels, unique_classes,
+                                           lda_basis = lda_basis_perm, lda_component_weights = lda_cw_perm)
     cat(sprintf("[PERM] Baseline OOB score: %.4f\n", baseline_score))
 
     n_perm <- if (exists("PERMUTATION_N_ITER") && is.finite(PERMUTATION_N_ITER)) as.integer(PERMUTATION_N_ITER) else 50L
@@ -4695,7 +4851,8 @@ print_weights_summary <- function(stage_name, params) {
         Y_perm <- Y_base
         Y_perm[, col_start:col_end] <- Y_perm[perm_order, col_start:col_end]
         scores[b] <- tryCatch(
-          compute_score_from_Y(endm$E, endm$col_names, Y_perm, oob_labels, unique_classes, w_full),
+          compute_score_from_Y(endm$E, endm$col_names, Y_perm, oob_labels, unique_classes,
+                               lda_basis = lda_basis_perm, lda_component_weights = lda_cw_perm),
           error = function(e) NA_real_
         )
       }
@@ -4746,7 +4903,8 @@ print_weights_summary <- function(stage_name, params) {
         Y_perm <- Y_base
         Y_perm[, surviving_cols[j]] <- Y_perm[sample(nrow(Y_perm)), surviving_cols[j]]
         scores[b] <- tryCatch(
-          compute_score_from_Y(endm$E, endm$col_names, Y_perm, oob_labels, unique_classes, w_full),
+          compute_score_from_Y(endm$E, endm$col_names, Y_perm, oob_labels, unique_classes,
+                               lda_basis = lda_basis_perm, lda_component_weights = lda_cw_perm),
           error = function(e) NA_real_
         )
       }
@@ -4782,14 +4940,17 @@ print_weights_summary <- function(stage_name, params) {
     # Build a plotting weight vector that preserves Phase-2 bin pruning
     # (1 = kept, 0 = pruned), aligned to indices_to_keep.
     phase2_plot_weights <- NULL
+    phase2_bin_pvalues  <- NULL   # named list: index -> numeric(TEMPORAL_BUDGET)
     if (length(indices_to_keep) > 0) {
       phase2_plot_weights <- rep(0, length(indices_to_keep) * TEMPORAL_BUDGET)
+      phase2_bin_pvalues  <- setNames(vector("list", length(indices_to_keep)), indices_to_keep)
       for (ii in seq_along(keep_ki)) {
         src_k <- keep_ki[ii]
         src_rng <- (src_k - 1L) * TEMPORAL_BUDGET + seq_len(TEMPORAL_BUDGET)
         dst_rng <- (ii - 1L) * TEMPORAL_BUDGET + seq_len(TEMPORAL_BUDGET)
         kept_mask <- perm_pvalues[src_rng] < PERM_ALPHA
         phase2_plot_weights[dst_rng] <- as.numeric(kept_mask)
+        phase2_bin_pvalues[[indices_to_keep[ii]]] <- as.numeric(perm_pvalues[src_rng])
       }
     }
 
@@ -4799,7 +4960,7 @@ print_weights_summary <- function(stage_name, params) {
 
       # Step 3b: Re-fit PCA-LDA on the pruned feature set.
       # Discriminants trained on all features are not optimal for the reduced
-      # space; re-fitting ensures LDA weights, means, sds, and lda_basis are
+      # space; re-fitting ensures LDA weights, means, and sds are
       # all consistent with the surviving indices.
       cat(sprintf("\n=== Step 3b: Re-fitting PCA-LDA on pruned feature set (%d indices: %s) ===\n",
                   length(indices_to_keep), paste(indices_to_keep, collapse = ", ")))
@@ -4820,54 +4981,52 @@ print_weights_summary <- function(stage_name, params) {
       if (!is.null(MESMA_PARAMS_PRUNED)) {
         # Propagate solver-mode fields from the initial params so behaviour
         # (sparse, IWLMM, LDA-space, etc.) is unchanged.
-        for (.field in c("solver", "use_lda_space", "l2_normalize",
-                         "interpolate_inference", "use_lda_reliability")) {
+        for (.field in c("solver", "l2_normalize",
+                         "interpolate_inference")) {
           if (!is.null(MESMA_PARAMS_INITIAL[[.field]]) && is.null(MESMA_PARAMS_PRUNED[[.field]]))
             MESMA_PARAMS_PRUNED[[.field]] <- MESMA_PARAMS_INITIAL[[.field]]
         }
         MESMA_PARAMS <- MESMA_PARAMS_PRUNED
         if (!is.null(phase2_plot_weights) && length(phase2_plot_weights) > 0) {
-          plot_w <- if (!is.null(MESMA_PARAMS$weights) && length(MESMA_PARAMS$weights) == length(phase2_plot_weights)) {
-            MESMA_PARAMS$weights
+          # Use back-projected LDA plot_weights as base, zero out phase-2-pruned bins
+          plot_w <- if (!is.null(MESMA_PARAMS$plot_weights) && length(MESMA_PARAMS$plot_weights) == length(phase2_plot_weights)) {
+            MESMA_PARAMS$plot_weights
           } else {
             rep(1, length(phase2_plot_weights))
           }
           plot_w[phase2_plot_weights == 0] <- 0
           MESMA_PARAMS$plot_weights <- plot_w
         }
+        MESMA_PARAMS$bin_pvalues <- phase2_bin_pvalues
         cat("[PERM] PCA-LDA successfully re-fitted on pruned feature set.\n")
       } else {
         # Fallback: manually slice the initial params to the pruned feature space.
-        # keep_ki is 1-based within surviving_indices; surviving_ki maps back to the
-        # original (pre-Phase-1) perm_indices so that w_full is sliced correctly.
         cat("[PERM] Falling back to slicing initial PCA-LDA params to pruned feature space.\n")
         orig_ki <- surviving_ki[keep_ki]   # positions in original perm_indices
         keep_idx_feat_range <- unlist(lapply(orig_ki, function(ki) {
           (ki - 1L) * TEMPORAL_BUDGET + seq_len(TEMPORAL_BUDGET)
         }))
-        # feat_prune is local to surviving_indices; map it to keep_idx_feat_range offsets
-        surv_ki_in_orig <- unlist(lapply(seq_along(keep_ki), function(i) {
-          (i - 1L) * TEMPORAL_BUDGET + seq_len(TEMPORAL_BUDGET)
-        }))
         MESMA_PARAMS              <- MESMA_PARAMS_INITIAL
         MESMA_PARAMS$indices      <- indices_to_keep
         MESMA_PARAMS$base_indices <- indices_to_keep
-        w_kept <- w_full[keep_idx_feat_range]
-        # zero-out bins that were pruned in Phase 2
-        local_prune_surv <- which(surv_ki_in_orig %in% feat_prune)
-        if (length(local_prune_surv) > 0) w_kept[local_prune_surv] <- 0
-        MESMA_PARAMS$weights <- w_kept
         if (!is.null(MESMA_PARAMS$means) && length(MESMA_PARAMS$means) >= max(orig_ki))
           MESMA_PARAMS$means <- MESMA_PARAMS$means[indices_to_keep]
         if (!is.null(MESMA_PARAMS$sds) && length(MESMA_PARAMS$sds) >= max(orig_ki))
           MESMA_PARAMS$sds <- MESMA_PARAMS$sds[indices_to_keep]
-        n_orig_feats <- length(MESMA_PARAMS_INITIAL$indices) * TEMPORAL_BUDGET
-        if (!is.null(MESMA_PARAMS$lda_basis) && is.matrix(MESMA_PARAMS$lda_basis) &&
-            nrow(MESMA_PARAMS$lda_basis) == n_orig_feats)
-          MESMA_PARAMS$lda_basis <- MESMA_PARAMS$lda_basis[keep_idx_feat_range, , drop = FALSE]
-        if (!is.null(phase2_plot_weights) && length(phase2_plot_weights) == length(MESMA_PARAMS$weights)) {
+        # Slice plot_weights (for prototype bars) to pruned feature space
+        if (!is.null(MESMA_PARAMS$plot_weights) && length(MESMA_PARAMS$plot_weights) >= max(keep_idx_feat_range)) {
+          pw_kept <- MESMA_PARAMS$plot_weights[keep_idx_feat_range]
+          surv_ki_in_orig <- unlist(lapply(seq_along(keep_ki), function(i) {
+            (i - 1L) * TEMPORAL_BUDGET + seq_len(TEMPORAL_BUDGET)
+          }))
+          local_prune_surv <- which(surv_ki_in_orig %in% feat_prune)
+          if (length(local_prune_surv) > 0) pw_kept[local_prune_surv] <- 0
+          MESMA_PARAMS$plot_weights <- pw_kept
+        }
+        if (!is.null(phase2_plot_weights) && length(phase2_plot_weights) > 0) {
           MESMA_PARAMS$plot_weights <- phase2_plot_weights
         }
+        MESMA_PARAMS$bin_pvalues <- phase2_bin_pvalues
       }
     } else {
       cat(sprintf("[PERM] Pruning too aggressive (%d < min %d); keeping full feature set.\n",
@@ -4877,7 +5036,7 @@ print_weights_summary <- function(stage_name, params) {
     }
   }
 
-  if (!is.null(MESMA_PARAMS) && !is.null(MESMA_PARAMS$weights)) {
+  if (!is.null(MESMA_PARAMS) && !is.null(MESMA_PARAMS$plot_weights)) {
     print_weights_summary("MESMA_FINAL", MESMA_PARAMS)
   }
 
@@ -4909,7 +5068,7 @@ print_weights_summary <- function(stage_name, params) {
   mesma_lib <- build_mesma_library_weighted(df_train, indices_for_final_library, MESMA_PARAMS, ALLOWED_VEG, precomputed_clusters = precomputed_clusters)
 
   cat("Pre-computing optimized library for MESMA...\n")
-  OPTIMIZED_LIBRARY <- precompute_optimized_library_weighted(mesma_lib, grid_type = "full", feature_weights = (if (!is.null(MESMA_PARAMS) && !is.null(MESMA_PARAMS$weights)) MESMA_PARAMS$weights else NULL) )
+  OPTIMIZED_LIBRARY <- precompute_optimized_library_weighted(mesma_lib, grid_type = "full", feature_weights = NULL)
 
   # Summarize pruning if any
   if (exists("PRUNE_ZERO_WEIGHT_FEATURES") && isTRUE(PRUNE_ZERO_WEIGHT_FEATURES)) {
@@ -4968,8 +5127,8 @@ print_weights_summary <- function(stage_name, params) {
       cat(sprintf("[CONFUSION MATRIX] %s skipped: library not available\n", label))
       return(invisible(NULL))
     }
-    if (is.null(MESMA_PARAMS) || is.null(MESMA_PARAMS$weights)) {
-      cat(sprintf("[CONFUSION MATRIX] %s skipped: MESMA_PARAMS or weights missing\n", label))
+    if (is.null(MESMA_PARAMS)) {
+      cat(sprintf("[CONFUSION MATRIX] %s skipped: MESMA_PARAMS missing\n", label))
       return(invisible(NULL))
     }
 
@@ -5089,31 +5248,20 @@ print_weights_summary <- function(stage_name, params) {
 
       Y <- do.call(rbind, obs_vecs)
 
-      # 3. FCLS with pruned weights
+      # 3. FCLS (no back-projected feature weights — removed from fitting)
       # MESMA_PARAMS is already trimmed to the kept-index feature space.
       # pruned_info$kept_idx (if set) reflects per-bin pruning *within* that space.
-      w <- MESMA_PARAMS$weights
-      lda_basis_use <- MESMA_PARAMS$lda_basis
+      lda_basis_cm <- MESMA_PARAMS$lda_basis
+      lda_cw_cm    <- MESMA_PARAMS$lda_component_weights
       if (!is.null(pruned_info) && !is.null(pruned_info$kept_idx)) {
-        w <- w[pruned_info$kept_idx]
-        # Also prune lda_basis rows to match per-bin pruned Y/E dimensions
-        if (!is.null(lda_basis_use) && is.matrix(lda_basis_use) &&
-            nrow(lda_basis_use) > length(pruned_info$kept_idx)) {
-          lda_basis_use <- lda_basis_use[pruned_info$kept_idx, , drop = FALSE]
-        }
+        if (!is.null(lda_basis_cm)) lda_basis_cm <- lda_basis_cm[pruned_info$kept_idx, , drop = FALSE]
       }
       solver_mode <- if (!is.null(MESMA_PARAMS$solver)) MESMA_PARAMS$solver else "fcls"
-      if (!is.null(MESMA_PARAMS$use_lda_space) && isTRUE(MESMA_PARAMS$use_lda_space)) {
-        all_coefs <- solve_batch_fcls(E, Y,
-                                      feature_weights = NULL,
-                                      lda_basis = lda_basis_use,
-                                      lda_component_weights = MESMA_PARAMS$lda_component_weights,
-                                      solver = solver_mode)
-      } else {
-        all_coefs <- solve_batch_fcls(E, Y,
-                                      w,
-                                      solver = solver_mode)
-      }
+      all_coefs <- solve_batch_fcls(E, Y,
+                                    NULL,
+                                    lda_basis             = lda_basis_cm,
+                                    lda_component_weights = lda_cw_cm,
+                                    solver = solver_mode)
       if (is.null(all_coefs)) return(invisible(NULL))
 
       # 4. Aggregate coefficients by class and build confusion matrix
@@ -5466,31 +5614,50 @@ simple_residual_bootstrap <- function(residuals) {
       y_work <- mesma_apply_representation_vec(y_raw, n_base_idx, n_bins, l2_normalize)
       y_norm <- mesma_zscore_vec_by_index(y_work, indices, PARAMS$means, PARAMS$sds, n_bins)
 
-      # Apply PCA-LDA transform to the z-scored observation so inference sits in the same
-      # PCA-LDA-scored feature space as training. This is applied before masking so column
-      # indices remain aligned between obs and library templates.
-      if (!is.null(PARAMS$weights) && length(PARAMS$weights) == length(y_norm)) {
-        y_norm_full_pca_lda <- y_norm  # PCA-LDA weights applied in solver via feature_weights
-      } else {
-        y_norm_full_pca_lda <- y_norm
-      }
+      # --- LDA-space projection ---
+      # When USE_LDA_SPACE_SOLVER is TRUE the observation and every library
+      # template are projected into the LDA discriminant subspace *before*
+      # masking.  After projection the feature dimension equals the number of
+      # LDA components; valid_mask must therefore be recomputed in that space.
+      lda_basis_inf <- PARAMS$lda_basis
+      lda_cw_inf    <- PARAMS$lda_component_weights
 
-      # If the library was pruned, apply the same column subsetting to the
-      # observation vector, validity mask and weights so dimensions match.
-      weights_for_mask <- PARAMS$weights
-      if (!is.null(.pruned_kept_idx) && length(.pruned_kept_idx) < length(y_norm_full_pca_lda)) {
-        y_norm_full_pca_lda <- y_norm_full_pca_lda[.pruned_kept_idx]
-        valid_mask <- valid_mask[.pruned_kept_idx]
-        if (!is.null(weights_for_mask) && length(weights_for_mask) > length(.pruned_kept_idx)) {
-          weights_for_mask <- weights_for_mask[.pruned_kept_idx]
+      if (!is.null(lda_basis_inf) && ncol(lda_basis_inf) >= 1) {
+        # lda_basis_inf: (n_features x n_components)
+        # Apply pruning to basis rows first if the library was pruned
+        lda_basis_use <- lda_basis_inf
+        if (!is.null(.pruned_kept_idx) && nrow(lda_basis_use) > length(.pruned_kept_idx)) {
+          lda_basis_use <- lda_basis_use[.pruned_kept_idx, , drop = FALSE]
+          y_norm_for_proj <- y_norm[.pruned_kept_idx]
+          valid_mask      <- valid_mask[.pruned_kept_idx]
+        } else {
+          y_norm_for_proj <- y_norm
         }
+        # Zero-out missing pentads in obs before projection so they don't contribute
+        y_norm_for_proj[!valid_mask] <- 0
+        lda_basis_use[!is.finite(lda_basis_use)] <- 0
+        y_norm_full_pca_lda <- as.numeric(t(lda_basis_use) %*% y_norm_for_proj)
+        # In LDA space every component is always "observed"
+        valid_mask    <- rep(TRUE, length(y_norm_full_pca_lda))
+        weights_for_mask <- if (!is.null(lda_cw_inf)) lda_cw_inf else rep(1, length(y_norm_full_pca_lda))
+        # Store the (pruned) basis for template projection below
+        .lda_basis_for_templates <- lda_basis_use
+      } else {
+        # No LDA projection: stay in original feature space
+        if (!is.null(.pruned_kept_idx) && length(.pruned_kept_idx) < length(y_norm)) {
+          y_norm_full_pca_lda <- y_norm[.pruned_kept_idx]
+          valid_mask          <- valid_mask[.pruned_kept_idx]
+        } else {
+          y_norm_full_pca_lda <- y_norm
+        }
+        weights_for_mask <- NULL
+        .lda_basis_for_templates <- NULL
       }
 
-      # Mask the observation (z-scored only, no PCA-LDA weighting applied to data)
+      # Mask the observation
       y_norm_masked <- y_norm_full_pca_lda[valid_mask]
 
-      # Extract masked PCA-LDA weights to pass to solver
-      # The solver will apply weights directly to both endmembers and observations
+      # Weights to pass to solver
       if (!is.null(weights_for_mask) && length(weights_for_mask) == length(y_norm_full_pca_lda)) {
         weights_masked <- weights_for_mask[valid_mask]
       } else {
@@ -5536,16 +5703,16 @@ simple_residual_bootstrap <- function(residuals) {
         # during precompute_optimized_library_weighted, so no need to prune again here
         M_full <- lib$M
 
-        # Apply PCA-LDA transform to each variant row (if we have matching weights)
-        if (!is.null(PARAMS$weights) && length(PARAMS$weights) == ncol(M_full)) {
-          M_full_trans <- t(apply(M_full, 1, function(r) {
-            as.numeric(r)  # PCA-LDA weights applied in solver via feature_weights
-          }))
+        # Project templates into LDA space if active, otherwise keep as-is
+        if (!is.null(.lda_basis_for_templates)) {
+          # M_full: (n_variants x n_features); basis: (n_features x n_components)
+          # Result: (n_variants x n_components)
+          M_full_trans <- M_full %*% .lda_basis_for_templates
         } else {
           M_full_trans <- M_full
         }
 
-        # Mask to the valid observation columns
+        # Mask to the valid observation columns (all TRUE in LDA space)
         lib_M_masked <- M_full_trans[, valid_mask, drop = FALSE]
 
         # Guard against NA/Inf in templates after masking
@@ -6599,6 +6766,180 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
     cat(sprintf("[VALIDATION] Obtained %d predicted coefficient rows from %d locations\n",
                 if(!is.null(validation_coefs)) nrow(validation_coefs) else 0,
                 length(val_locs)))
+
+    # -----------------------------------------------------------------------
+    # CORRELATION: avg correctly predicted fraction vs. n filled pentads
+    # (pentads counted AFTER interpolation, i.e. non-NA pentads in the interpolated matrix)
+    # -----------------------------------------------------------------------
+    tryCatch({
+      if (!is.null(validation_coefs) && nrow(validation_coefs) > 0 &&
+          exists("df_validation") && !is.null(df_validation) && nrow(df_validation) > 0) {
+
+        cat("\n[VALIDATION] Computing correlation: avg correct fraction ~ n_filled_pentads (raw) using training + validation\n")
+
+        # Build a combined dataset containing both validation and training rows.
+        # Use df_train_model when available to stay library-consistent.
+        train_corr_source <- if (exists("df_train_model") && !is.null(df_train_model) && nrow(df_train_model) > 0) {
+          df_train_model
+        } else if (exists("df_train") && !is.null(df_train) && nrow(df_train) > 0) {
+          df_train
+        } else {
+          NULL
+        }
+
+        df_corr_combined <- dplyr::bind_rows(
+          dplyr::mutate(df_validation, data_split = "Validation"),
+          if (!is.null(train_corr_source)) dplyr::mutate(train_corr_source, data_split = "Training") else NULL
+        )
+
+        # Build coefficient rows for training using the same lightweight path as validation.
+        training_coefs <- data.frame()
+        if (!is.null(train_corr_source) && nrow(train_corr_source) > 0) {
+          train_proc <- train_corr_source
+          if (!"pheno_year" %in% names(train_proc) && "date" %in% names(train_proc)) {
+            train_proc$pheno_year <- assign_pheno_year(train_proc$date)
+          }
+          if (!"task_key" %in% names(train_proc)) {
+            train_proc$task_key <- paste(train_proc$location_id, train_proc$pheno_year, sep = "_")
+          }
+
+          train_locs <- unique(train_proc$location_id)
+          train_loc_batches <- split(train_locs, ceiling(seq_along(train_locs) / BATCH_SIZE))
+          training_results_list <- list()
+          for (batch in train_loc_batches) {
+            batch_df <- train_proc[train_proc$location_id %in% batch, ]
+            batch_list <- split(batch_df, batch_df$location_id)
+            results <- suppress_output_safely(.run_map(batch_list, fit_one_location, show_pb = FALSE))
+            training_results_list <- aggregate_batch_results(results, training_results_list)
+          }
+
+          training_coefs <- do.call(rbind, lapply(training_results_list, function(r) {
+            if (!is.null(r$coef_df)) r$coef_df else NULL
+          }))
+          if (is.null(training_coefs)) training_coefs <- data.frame()
+        }
+
+        # Add split labels to coefficient rows so they can be merged with split-aware truth/count data.
+        validation_coefs_tagged <- if (!is.null(validation_coefs) && nrow(validation_coefs) > 0) {
+          dplyr::mutate(validation_coefs, data_split = "Validation")
+        } else {
+          data.frame()
+        }
+        training_coefs_tagged <- if (!is.null(training_coefs) && nrow(training_coefs) > 0) {
+          dplyr::mutate(training_coefs, data_split = "Training")
+        } else {
+          data.frame()
+        }
+        combined_coefs <- dplyr::bind_rows(validation_coefs_tagged, training_coefs_tagged)
+
+        if (!is.null(combined_coefs) && nrow(combined_coefs) > 0 &&
+            !is.null(df_corr_combined) && nrow(df_corr_combined) > 0) {
+
+          # Count filled pentads per location-year BEFORE interpolation.
+          base_idx_corr <- if (!is.null(MESMA_PARAMS$base_indices)) MESMA_PARAMS$base_indices else MESMA_PARAMS$indices
+
+          corr_tasks_for_count <- df_corr_combined %>%
+            dplyr::mutate(pheno_year = if ("pheno_year" %in% names(.)) pheno_year else assign_pheno_year(as.Date(date))) %>%
+            dplyr::group_by(location_id, pheno_year, data_split) %>%
+            dplyr::group_split()
+
+          corr_pentad_counts <- do.call(rbind, lapply(corr_tasks_for_count, function(sub) {
+            lid <- sub$location_id[1]
+            pyr <- sub$pheno_year[1]
+            split_name <- sub$data_split[1]
+            # Always use no-interpolation here so we count raw filled pentads
+            mat <- build_pentad_matrix(sub, base_idx_corr, interpolate = "none")
+            n_filled <- if (!is.null(mat)) {
+              # count pentads (rows) where at least one index is non-NA, excluding last row
+              valid_rows <- which(apply(mat[-nrow(mat), , drop = FALSE], 1, function(r) any(is.finite(r))))
+              length(valid_rows)
+            } else {
+              NA_integer_
+            }
+            data.frame(location_id = lid, pheno_year = pyr, data_split = split_name,
+                       n_filled_pentads = n_filled, stringsAsFactors = FALSE)
+          }))
+
+          # true_veg per location-year comes from source observations.
+          corr_true_veg <- df_corr_combined %>%
+            dplyr::group_by(location_id, pheno_year, data_split) %>%
+            dplyr::summarise(true_veg = {
+              tv <- tolower(unique(as.character(Veg)))
+              tv <- tv[!is.na(tv) & tv != ""]
+              if (length(tv) == 1) tv else NA_character_
+            }, .groups = "drop")
+
+          # Per location-year: correct fraction = coef of true_veg / sum(all veg coefs).
+          corr_correct_frac <- combined_coefs %>%
+            dplyr::filter(tolower(as.character(Veg)) != "barren") %>%
+            dplyr::left_join(corr_true_veg, by = c("location_id", "pheno_year", "data_split")) %>%
+            dplyr::group_by(location_id, pheno_year, data_split, true_veg) %>%
+            dplyr::summarise(
+              veg_total = sum(coef, na.rm = TRUE),
+              correct_coef = sum(coef[tolower(as.character(Veg)) == true_veg[1]], na.rm = TRUE),
+              .groups = "drop"
+            ) %>%
+            dplyr::mutate(
+              correct_frac = dplyr::if_else(veg_total > 1e-10, correct_coef / veg_total, NA_real_)
+            ) %>%
+            dplyr::filter(!is.na(true_veg) & !is.na(correct_frac))
+
+          # Merge with pentad counts.
+          corr_df <- corr_correct_frac %>%
+            dplyr::inner_join(corr_pentad_counts, by = c("location_id", "pheno_year", "data_split"))
+
+          if (nrow(corr_df) >= 3) {
+            r_val <- cor(corr_df$n_filled_pentads, corr_df$correct_frac,
+                         use = "complete.obs", method = "pearson")
+            cat(sprintf("[VALIDATION] Pearson r (train+val; correct_frac ~ n_filled_pentads): %.3f  (n=%d)\n",
+                        r_val, nrow(corr_df)))
+
+            p_val <- tryCatch(
+              cor.test(corr_df$n_filled_pentads, corr_df$correct_frac,
+                       method = "pearson")$p.value,
+              error = function(e) NA_real_
+            )
+            if (!is.na(p_val)) cat(sprintf("[VALIDATION] p-value (train+val): %.4g\n", p_val))
+
+            # Scatter plot
+            p_corr <- ggplot2::ggplot(corr_df,
+                                      ggplot2::aes(x = n_filled_pentads, y = correct_frac,
+                                                   colour = true_veg, shape = data_split)) +
+              ggplot2::geom_point(alpha = 0.65, size = 2) +
+              ggplot2::geom_smooth(method = "lm", se = TRUE, colour = "black",
+                                   linewidth = 0.8, linetype = "dashed") +
+              ggplot2::annotate("text", x = Inf, y = -Inf,
+                                label = sprintf("r = %.3f\np = %.3g\nn = %d",
+                                                r_val,
+                                                if (!is.na(p_val)) p_val else NaN,
+                                                nrow(corr_df)),
+                                hjust = 1.05, vjust = -0.3, size = 3.5) +
+              ggplot2::labs(
+                title = "Training + Validation: avg correctly predicted fraction vs. filled pentads (raw)",
+                x = "N filled pentads (before interpolation)",
+                y = "Correctly predicted fraction (normalised)",
+                colour = "True veg",
+                shape = "Data split"
+              ) +
+              ggplot2::theme_bw()
+
+            corr_plot_path <- file.path(OUTPUT_DIR, "validation_correct_frac_vs_raw_pentads.png")
+            tryCatch({
+              ggplot2::ggsave(corr_plot_path, p_corr, width = 7, height = 5, dpi = 150)
+              cat(sprintf("[VALIDATION] Saved train+validation correlation plot: %s\n", corr_plot_path))
+            }, error = function(e) cat(sprintf("[VALIDATION] Could not save plot: %s\n", e$message)))
+          } else {
+            cat(sprintf("[VALIDATION] Too few matched train+validation rows (%d) to compute correlation\n", nrow(corr_df)))
+          }
+        } else {
+          cat("[VALIDATION] Skipping train+validation correlation: no combined coefficient rows available\n")
+        }
+      }
+    }, error = function(e) {
+      cat(sprintf("[VALIDATION] Correlation analysis failed: %s\n", e$message))
+    })
+    # -----------------------------------------------------------------------
+
   } else {
     cat("[VALIDATION] No df_validation available; skipping unmixing\n")
   }
@@ -6822,6 +7163,12 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
         cat("[INFERENCE] PPI data not available; skipping PPI-normalised mixture plots.\n")
       }
     }
+
+    # --- INFERENCE: Composition change map (2000-2025 delta per location) ---
+    tryCatch(
+      plot_composition_change_map(inference_coefs, out_dir = OUT_DIR, file_prefix = "composition_change"),
+      error = function(e) cat(sprintf("[CHANGE MAP] plot_composition_change_map failed: %s\n", e$message))
+    )
 
   } else {
     cat("[INFERENCE] No inference data to process\n")

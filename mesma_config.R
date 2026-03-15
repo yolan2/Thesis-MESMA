@@ -76,8 +76,6 @@ PERMUTATION_PARALLEL_WORKERS <- 30  # # workers to use specifically for permutat
 # Note: the permutation worker count will be capped to available cores at runtime.
 COMBO_PARALLEL_WORKERS <- max(1L, floor(PARALLEL_WORKERS/2))
 
-# Variant generation
-MAX_VARIANTS_PER_VEG <- 7       # Max variants generated per vegetation type; increase to allow greater intra-class variability.
 
 MIN_ENDMEMBER_SAMPLES <- 5L      # Minimum raw samples required to form an endmember variant. Raise to be stricter.
 
@@ -156,20 +154,8 @@ ENABLE_ENDMEMBER_BUNDLES <- TRUE # If TRUE, represent endmember variability as a
 # Uses the OOB validation residuals (predicted - true fractions) to add systematic prediction bias/error to MC draws
 ENABLE_OOB_FRACTION_UNCERTAINTY <- TRUE  # If TRUE, add OOB-derived fraction errors to MC draws
 
-# (Removed) Huber loss options for FCLS were deprecated; the solver now
-# always uses standard RMSE. The corresponding constants and flags have been
-# cleaned up to simplify configuration.
 
-# --- LDA and PCA space solver options ---------------------------------------
-#
-# USE_LDA_SPACE_SOLVER: If TRUE, projects both observations and endmembers into the LDA discriminant subspace and runs unmixing there. Component weights are the percent-of-explained between-class variance for each discriminant axis. Disables per-feature weighting in favor of LDA component weights. Mutually exclusive with USE_PCA_SPACE_SOLVER.
-#
-# Only one of USE_LDA_SPACE_SOLVER or USE_PCA_SPACE_SOLVER should be TRUE at a time. If both are FALSE, unmixing is performed in the original feature space with per-feature weights.
-#
-# When projecting into the LDA subspace and some input features are missing, the pipeline automatically computes a per-sample reliability weight for each discriminant axis. This downweights axes that depend heavily on unavailable features so that missing data cannot spuriously drive unmixing. This behaviour is always active whenever LDA-space solving is used.
-#
-USE_LDA_SPACE_SOLVER <- TRUE   # Toggle LDA-space unmixing on/off (default FALSE)
-# Note: LDA reliability is enabled automatically when using LDA-space solver.
+
 # --- IWLMM (Iteratively Weighted Linear Mixing Model) ---
 # Experimental alternate unmixing solver that perturbs endmembers within
 # bounds derived from within-class variance (Li et al. 2021).  Enabling this
@@ -222,6 +208,8 @@ MIN_UNIQUE_DOY_INFERENCE <- 3L  # Less strict for inference to allow sparse inpu
 MIN_PENTADS_PER_TRAIN_SAMPLE <- 8L  # Minimum observations required per location-year trace to construct a training sample.
 
 # Modeling/algorithmic caps and defaults
+USE_LDA_SPACE_SOLVER <- TRUE        # Set TRUE to project observations and library into LDA space before unmixing (experimental, disabled).
+
 ENABLE_LDA_L2_NORMALIZATION <- TRUE # L2-normalize training samples to focus on temporal shape rather than amplitude.
                                      # Set TRUE to emphasize shape; FALSE to preserve brightness differences.
 ENABLE_ZSCORE_AFTER_L2 <- TRUE      # Z-score features after L2-normalization (equalizes variance across indices).
@@ -283,33 +271,17 @@ PRUNE_ZERO_MIN_FEATURES <- 3
 # === PERMUTATION IMPORTANCE FEATURE PRUNING ===
 # Measures feature contribution by randomizing each feature and testing performance degradation.
 # Features whose permutation doesn't significantly degrade performance are pruned.
-OOB_TUNING_FRACTION <- 0.15         # Fraction held out from training data for cluster optimization evaluation
+OOB_TUNING_FRACTION <- 0.2         # Fraction held out from training data for cluster optimization evaluation
 VALIDATION_FRACTION <- 0.20         # Fraction held out for validation (stratified by location/Veg)
 PERMUTATION_N_ITER <- 500            # Number of permutations per feature for significance testing
 PERMUTATION_MIN_SAMPLES <- 20       # Minimum OOB samples required for testing
-PERMUTATION_ALPHA <- 0.4          # Significance level for permutation p-values (features with p >= alpha are pruned)
+PERMUTATION_ALPHA <- 0.1          # Significance level for permutation p-values (features with p >= alpha are pruned)
 INDEX_PERM_ALPHA <- 0.1           # Significance level for dropping entirely index groups
 
 # Endmember selection tuning
 MAX_K_EAR <- 2L                  # Maximum number of endmembers to consider per vegetation class in EAR selection (conservative increase to explore one more k).
 CLUSTER_COMPLEXITY_LAMBDA <- 0.005  # Complexity penalty per total endmember: S = min(R_oob, R_train) - λ * sum(k)
 BARREN_SIM_THRESHOLD <- 1     # Pre-filter: drop vegetation training observations whose cosine similarity to barren mean exceeds this threshold
-
-# === COLLINEARITY GUARD (endmember separability) ===
-# When a class centroid lies near the convex hull of the other class centroids
-# in the z-scored feature space, MESMA can describe that class as a mixture
-# of the others (e.g., tamarix ≈ α·populus + β·herbs).  The collinearity guard
-# detects this condition and upweights features that maximise the perpendicular
-# separation of the trapped class, effectively pulling it out of the simplex.
-# The boost is baked into the z-score standard deviations, so inference code
-# requires no changes — the effect propagates automatically through the
-# normalisation parameters stored in MESMA_PARAMS.
-ENABLE_COLLINEARITY_GUARD <- TRUE     # Enable convex-hull membership detection and feature boosting
-COLLINEARITY_THRESHOLD    <- 1.5      # Classes with relative separation below this threshold are considered "trapped".
-                                      # Relative separation = dist(centroid, convex_hull) / within-class spread.
-                                      # Lower values -> only boost severely trapped classes; higher -> more aggressive.
-COLLINEARITY_BOOST_FACTOR <- 3.0      # Maximum multiplier applied to the z-score SDs of the most separating features.
-                                      # Higher -> stronger push out of the simplex.  Typical range: 1.5–5.0.
 
 # === END GLOBAL CONFIG ===
 PROGRESS_LOG_TO_FILE <- FALSE
