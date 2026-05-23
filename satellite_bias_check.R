@@ -26,8 +26,7 @@ if (file.exists("mesma_config.R")) {
 # Compose list of CSVs to load for bias calculation; include training plus
 # any inference or additional files specified in config variables.
 BIAS_INPUTS <- unique(c(INPUT_CSV,
-                        if (exists("INFERENCE_CSV") && nzchar(INFERENCE_CSV)) INFERENCE_CSV,
-                        if (exists("ADDITIONAL_BIAS_CSVS")) ADDITIONAL_BIAS_CSVS))
+                        if (exists("INFERENCE_CSV") && nzchar(INFERENCE_CSV)) INFERENCE_CSV))
 # ensure non-null
 BIAS_INPUTS <- BIAS_INPUTS[!is.na(BIAS_INPUTS) & nzchar(BIAS_INPUTS)]
 cat(sprintf("[BIAS CHECK] Loading %d CSV(s) for bias computation:\n  %s\n",
@@ -331,6 +330,7 @@ p_time <- ggplot(time_bias, aes(x = year, y = mean_bias, colour = band,
   facet_wrap(~band, scales = "free_y", ncol = 3) +
   scale_colour_brewer(palette = "Dark2", guide = "none") +
   scale_fill_brewer(palette = "Dark2", guide = "none") +
+  scale_x_continuous(limits = c(1984, NA)) +
   labs(
     title = "Mean Bias by Year (L457 - L89)",
     x = "Year", y = "Mean difference ± SE"
@@ -406,6 +406,76 @@ loc_bias <- pairs_long[, .(mean_bias = mean(diff, na.rm = TRUE),
                         by = .(location_id, lat, lon, band)]
 fwrite(loc_bias, file.path(OUT_DIR, "per_location_bias.csv"))
 cat(sprintf("Saved: %s/per_location_bias.csv\n", OUT_DIR))
+
+# ── Plot 6: Mean band value by year, before vs after bias correction ──────────
+# This is the key diagnostic for the pre/post-2013 discontinuity.
+# For each raw band we show:
+#   - LANDSAT_457 raw (no correction ever applied)
+#   - LANDSAT_89  raw  (before correction)
+#   - LANDSAT_89  corrected (after applying the affine from bias_stats_features.csv)
+# If the correction works, the corrected L89 line should track the L457 line.
+cat("Plotting pre/post-correction band values by year …\n")
+
+# Apply the saved affine to the full df (raw bands only)
+df_corr <- copy(df)
+for (i in seq_len(nrow(bias_stats))) {
+  b    <- bias_stats$band[i]
+  b_lo <- tolower(b)
+  if (!(b_lo %in% tolower(BANDS))) next                 # only raw bands
+  # match column name case-insensitively
+  col <- names(df_corr)[tolower(names(df_corr)) == b_lo]
+  if (length(col) == 0) next
+  if (!isTRUE(bias_stats$ols_significant[i])) next
+  slope <- bias_stats$ols_slope[i]
+  intcp <- bias_stats$ols_intercept[i]
+  if (!is.finite(slope) || !is.finite(intcp)) next
+  oli_rows <- tolower(trimws(df_corr$satellite)) == "landsat_89"
+  df_corr[[col]][oli_rows] <- slope * df_corr[[col]][oli_rows] + intcp
+}
+
+# Build long tables for raw and corrected
+melt_bands <- function(d, label) {
+  band_cols <- names(d)[tolower(names(d)) %in% tolower(BANDS)]
+  m <- melt(d[, c("year", "satellite", band_cols), with = FALSE],
+            id.vars = c("year", "satellite"),
+            variable.name = "band", value.name = "val")
+  m[, correction := label]
+  m
+}
+
+long_raw  <- melt_bands(df,      "raw")
+long_corr <- melt_bands(df_corr, "corrected (L89 only)")
+long_both <- rbindlist(list(long_raw, long_corr))
+
+# For L457 raw == corrected, so keep only one copy
+long_plot <- long_both[!(satellite == "LANDSAT_457" & correction == "corrected (L89 only)")]
+long_plot[satellite == "LANDSAT_457", correction := "raw (L457 — unchanged)"]
+
+yr_mean <- long_plot[, .(mean_val = mean(val, na.rm = TRUE), n = .N),
+                      by = .(year, band, satellite, correction)]
+yr_mean[, band := toupper(band)]
+
+p_prepost <- ggplot(yr_mean, aes(x = year, y = mean_val,
+                                  colour = interaction(satellite, correction, sep = "\n"),
+                                  linetype = correction)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 2013, linetype = "dotted", colour = "grey40") +
+  annotate("text", x = 2013.2, y = -Inf, label = "L8 launch", vjust = -0.5,
+           hjust = 0, size = 2.8, colour = "grey40") +
+  facet_wrap(~band, scales = "free_y", ncol = 3) +
+  scale_x_continuous(limits = c(1984, NA)) +
+  labs(
+    title    = "Mean band value by year: raw vs bias-corrected",
+    subtitle = "Dotted vertical = 2013 (Landsat 8 launch). Corrected L89 should track L457.",
+    x = "Year", y = "Mean reflectance",
+    colour = "Satellite × correction", linetype = "Correction"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "bottom")
+
+ggsave(file.path(OUT_DIR, "band_value_by_year_correction_check.png"),
+       p_prepost, width = 14, height = 9, dpi = 150)
+cat(sprintf("Saved: %s/band_value_by_year_correction_check.png\n", OUT_DIR))
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 cat("\n=== satellite_bias_check.R complete ===\n")

@@ -16,7 +16,7 @@ source("mesma_helpers.R")
 set_mesma_seed()
 
 # --- required packages -----------------------------------------------------
-# load in bulk using require/ lapply; duplicate library calls removed
+# load in bulk using require/ lapply
 pkgs <- c(
   "dplyr", "purrr", "readr", "ggplot2",
   "magrittr", # pipes
@@ -29,112 +29,10 @@ for (p in pkgs) {
   library(p, character.only = TRUE)
 }
 
-# --- Shared utility: suppress stdout/message during an expression ---
-suppress_output_safely <- function(expr, quiet_output = TRUE, quiet_message = TRUE) {
-  if (quiet_output) {
-    capture.output(val <- force(expr))
-  } else {
-    val <- force(expr)
-  }
-  if (quiet_message) suppressMessages(val) else val
-}
-
-# --- Shared utility: filter valid vegetation rows (excludes NA/empty/barren) ---
-filter_valid_vegetation <- function(coefs, exclude_barren = TRUE) {
-  veg_char <- as.character(coefs$Veg)
-  mask <- !is.na(veg_char) & nchar(trimws(veg_char)) > 0 & trimws(veg_char) != "NA"
-  if (exclude_barren) mask <- mask & !normalize_veg_name(veg_char) %in% c("barren")
-  coefs[mask, ]
-}
-
-# --- Shared utility: aggregate batch results into a results list ---
-aggregate_batch_results <- function(batch_results, results_list, save_csv_dir = NULL) {
-  for (k in names(batch_results)) {
-    loc_result <- batch_results[[k]]
-    if (is.null(loc_result)) next
-    if (!is.null(save_csv_dir)) {
-      loc_data <- purrr::map_dfr(loc_result, "coef_df")
-      if (nrow(loc_data) > 0) {
-        out_fname <- file.path(save_csv_dir, paste0("result_", make.names(k), ".csv"))
-        readr::write_csv(loc_data, out_fname)
-      }
-    }
-    purrr::imap(loc_result, function(r, yr_char) {
-      if (is.null(r)) return(NULL)
-      if (!is.null(save_csv_dir) && (is.null(r$coef_df) || nrow(r$coef_df) == 0)) return(NULL)
-      res_key <- if (!is.null(r$coef_df) && "pheno_year" %in% names(r$coef_df)) {
-        paste(k, r$coef_df$pheno_year[1], sep = "_")
-      } else {
-        paste(k, yr_char, sep = "_")
-      }
-      results_list[[res_key]] <<- list(
-        coef_df = r$coef_df,
-        diagnostics = r$diagnostics,
-        uncertainty = r$uncertainty
-      )
-    })
-  }
-  results_list
-}
-
-# --- Shared utility: save canonical inference fractions CSV for downstream scripts ---
-save_inference_results_csv <- function(inference_coefs, out_csv = "inference_results/inference_results.csv", source_csv = NA_character_) {
-  if (is.null(inference_coefs) || !is.data.frame(inference_coefs) || nrow(inference_coefs) == 0) {
-    cat("[INFERENCE] No inference coefficients available to write canonical CSV.\n")
-    return(invisible(FALSE))
-  }
-
-  source_base <- if (!is.na(source_csv) && nzchar(as.character(source_csv))) basename(as.character(source_csv)) else NA_character_
-  source_tag <- if (!is.na(source_base) && nzchar(source_base)) {
-    gsub("_+", "_", gsub("[^A-Za-z0-9]+", "_", tools::file_path_sans_ext(source_base)))
-  } else {
-    NA_character_
-  }
-
-  out_df <- inference_coefs
-  if (!("inference_source_csv" %in% names(out_df))) out_df$inference_source_csv <- source_base
-  if (!("inference_source_tag" %in% names(out_df))) out_df$inference_source_tag <- source_tag
-
-  # Keep stable column order for downstream readers while preserving any extra columns
-  preferred_cols <- c(
-    "location_id", "pheno_year", "lat", "lon", "Veg", "variant_id",
-    "coef", "rmse", "coef_025", "coef_975", "coef_sd", "interval",
-    "n_obs", "inseparable_variant_flag", "inseparable_variant_details",
-    "inference_source_csv", "inference_source_tag"
-  )
-  ordered_cols <- c(intersect(preferred_cols, names(out_df)), setdiff(names(out_df), preferred_cols))
-  out_df <- out_df[, ordered_cols, drop = FALSE]
-
-  # Deterministic row ordering: location -> year -> class
-  if (all(c("location_id", "pheno_year", "Veg") %in% names(out_df))) {
-    out_df <- out_df %>%
-      mutate(
-        location_id = as.character(location_id),
-        pheno_year = suppressWarnings(as.integer(pheno_year)),
-        Veg = as.character(Veg)
-      ) %>%
-      arrange(location_id, pheno_year, Veg)
-  }
-
-  out_dir <- dirname(out_csv)
-  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-
-  readr::write_csv(out_df, out_csv, na = "NA")
-  cat(sprintf("[INFERENCE] Wrote canonical inference fractions CSV: %s (%d rows)\n", out_csv, nrow(out_df)))
-
-  # Also persist a source-specific copy so lower/middle/etc. remain separated across runs.
-  if (!is.na(source_tag) && nzchar(source_tag)) {
-    source_csv_out <- file.path(out_dir, sprintf("inference_results_%s.csv", source_tag))
-    readr::write_csv(out_df, source_csv_out, na = "NA")
-    cat(sprintf("[INFERENCE] Wrote source-specific inference CSV: %s\n", source_csv_out))
-  }
-
-  invisible(TRUE)
-}
 
 # --- Shared plot constants ---
 
-SPECIES_COLORS <- c("Herbs" = "#2E8B57", "Populus" = "#228B22", "Tamarix" = "#CD853F")
+SPECIES_COLORS <- c("Herbs" = "#9ACD32", "Populus" = "#006400", "Tamarix" = "#D95F02")
 
 # --- Shared utility: normalize vegetation names (lowercase + trim) ---
 normalize_veg_name <- function(x) {
@@ -143,31 +41,12 @@ normalize_veg_name <- function(x) {
   tolower(trimws(x))
 }
 
-# Compute_haversine_distance_matrix is defined in mesma_helpers.R; the
-# duplicate here has been removed to keep behaviour consistent across scripts.
+# Compute_haversine_distance_matrix is defined in mesma_helpers.R to keep behaviour consistent across scripts.
 
-
-# --- Utility: interpret interpolation flag/option ---
-# Accepts logicals (TRUE/FALSE) or character strings.  Returns one of
-# "linear", "whittaker", or "none".  NULL is passed through.
-get_interpolate_method <- function(val) {
-  if (is.null(val)) return(NULL)
-  if (is.logical(val)) {
-    if (isTRUE(val)) return("linear")
-    return("none")
-  }
-  match.arg(tolower(as.character(val)), c("linear","whittaker","none"))
-}
 
 # --- Inform user of chosen temporal fill/interpolation method ---
 # Logging must occur after the helper above is defined.
-interp_method <- NULL
-if (exists("MESMA_PARAMS") && !is.null(MESMA_PARAMS$interpolate_inference)) {
-  interp_method <- MESMA_PARAMS$interpolate_inference
-} else if (exists("INTERPOLATE_INFERENCE")) {
-  interp_method <- INTERPOLATE_INFERENCE
-}
-interp_method <- get_interpolate_method(interp_method)
+interp_method <- resolve_interpolation_method()
 cat(sprintf("[NOTICE] Temporal fill option at startup: %s\n", interp_method))
 
 # --- Simple Whittaker smoothing for a 1‑D vector ---
@@ -353,6 +232,7 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
       geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
        labs(title = paste0(method, ": Vegetation Fractions"),
            x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
+      scale_x_continuous(limits = c(1984, NA)) +
       theme_minimal()
 
     # --- Olofsson-style bias correction overlay (dashed lines + SE band) ---
@@ -394,6 +274,7 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
     geom_ribbon(aes(ymin = coef_025, ymax = coef_975), alpha = 0.15, fill = "saddlebrown", color = NA) +
     labs(title = paste0(method, ": Barren Fraction"), x = "Year", y = "Barren Fraction") +
     scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
+    scale_x_continuous(limits = c(1984, NA)) +
     theme_minimal()
   ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_barren_cover.png")), p_barren, width = 8, height = 6)
   readr::write_csv(inf_barren, file.path(OUT_DIR, paste0("inference_", file_prefix, "_barren_cover.csv")))
@@ -419,6 +300,7 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
         scale_fill_manual(values = SPECIES_COLORS) +
            labs(title = paste0(method, " Species"),
              x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
+        scale_x_continuous(limits = c(1984, NA)) +
         theme_minimal()
       ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_separate.png")), p_sp_ts, width = 8, height = 6)
       readr::write_csv(species_data, file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_separate.csv")))
@@ -443,6 +325,7 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
             scale_fill_manual(values = SPECIES_COLORS) +
               labs(title = paste0(method, " Species Share"),
                  x = "Year", y = "Proportion", fill = "Veg") +
+            scale_x_continuous(limits = c(1984, NA)) +
             theme_minimal()
           ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_stacked.png")), p_sp_stacked, width = 8, height = 6)
           readr::write_csv(df_prop_sp, file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_stacked.csv")))
@@ -673,12 +556,12 @@ if ("location_id" %in% names(raw_df) && !is.character(raw_df$location_id)) {
 
 df <- raw_df
 
-# --- drop observations with phenology year before 1989 ----------------------
+# --- drop observations with phenology year before 1984 ----------------------
 # applying the cutoff here ensures downstream scripts (january_averages,
 # fit_mesma, etc.) never see the unwanted years.  We compute a temporary
 # pheno_year if it is not already present so that filtering works on raw
 # input CSVs as well.
-cutoff <- 1989
+cutoff <- 1984
 if ("date" %in% names(df) || "pheno_year" %in% names(df)) {
   ph <- NULL
   if ("pheno_year" %in% names(df)) {
@@ -922,7 +805,8 @@ if ("NDDI" %in% names(df)) {
           ggplot2::geom_line() + ggplot2::geom_point() +
           ggplot2::theme_minimal() +
           ggplot2::labs(title = "Images per Location by Year",
-                        x = "Year", y = "Avg images / location")
+                        x = "Year", y = "Avg images / location") +
+          ggplot2::scale_x_continuous(limits = c(1984, NA))
         print(p_years)
         if (exists("OUTPUT_DIR") && !is.null(OUTPUT_DIR)) {
           try(
@@ -948,7 +832,8 @@ if ("NDDI" %in% names(df)) {
           ggplot2::geom_line() + ggplot2::geom_point() +
           ggplot2::theme_minimal() +
           ggplot2::labs(title = "Images per Location by Year",
-                        x = "Year", y = "Avg images / location")
+                        x = "Year", y = "Avg images / location") +
+          ggplot2::scale_x_continuous(limits = c(1984, NA))
         print(p_years)
         if (exists("OUTPUT_DIR") && !is.null(OUTPUT_DIR)) {
           try(
@@ -1181,7 +1066,7 @@ if ("location_id" %in% names(df) && "location_id" %in% names(gpts_map)) {
 
   post_non_na <- sum(!is.na(joined$Veg) & joined$Veg != "")
 
-  # The old 'row-number mapping' fallback has been removed per user request.  We
+  # The row-number mapping fallback is not used here. We
   # only ever join on the canonical "location_id" field and do not attempt any
   # secondary join strategies.  This simplifies behaviour and avoids confusing
   # implicit matches when IDs are missing or misaligned.

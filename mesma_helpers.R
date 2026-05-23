@@ -85,14 +85,7 @@ apply_oli_etm_bias_correction <- function(df,
   df
 }
 
-compute_soil_line_slope <- function(input_df, min_samples = NULL, assign_global_dvi = TRUE) {
-  if (is.null(min_samples)) {
-    if (exists("MIN_ENDMEMBER_SAMPLES", inherits = TRUE)) {
-      min_samples <- get("MIN_ENDMEMBER_SAMPLES", inherits = TRUE)
-    } else {
-      min_samples <- 5L
-    }
-  }
+compute_soil_line_slope <- function(input_df, min_samples = 5L, assign_global_dvi = TRUE) {
 
   if (is.null(input_df) || nrow(input_df) == 0) {
     stop("[SOIL LINE] No input data provided to compute_soil_line_slope")
@@ -421,8 +414,7 @@ analyze_library_similarity <- function(mesma_lib, compressed_templates_accessor,
   for (veg in names(mesma_lib)) {
     if (is.null(mesma_lib[[veg]])) next
     # Try to access raw_lib_templates from global environment for fallback
-    rt <- if (exists("raw_lib_templates", envir = globalenv()) && !is.null(get("raw_lib_templates", envir = globalenv())[[veg]])) get("raw_lib_templates", envir = globalenv())[[veg]] else NULL
-    for (variant in filter_variants_by_min_samples(mesma_lib[[veg]], min_samples = MIN_ENDMEMBER_SAMPLES, veg = veg, raw_template = rt)) {
+    for (variant in mesma_lib[[veg]]) {
       vid <- if (!is.null(variant$variant_id)) variant$variant_id else if (!is.null(variant$id)) variant$id else NA_character_
       
       # If vid is still NA, try to construct one
@@ -665,7 +657,7 @@ add_excluded_years_shade <- function(start_year = 1992, end_year = 1999, is_date
 # Helper: add vertical lines at year boundaries for ggplot2 time-series plots.
 # Usage: + add_year_lines(is_date = TRUE)  # x axis is Date
 #        + add_year_lines(is_date = FALSE) # x axis is numeric (year)
-add_year_lines <- function(start_year = 1985, end_year = 2025, is_date = FALSE, color = "grey50", linetype = "dashed", alpha = 0.5) {
+add_year_lines <- function(start_year = 1984, end_year = 2025, is_date = FALSE, color = "grey50", linetype = "dashed", alpha = 0.5) {
   if (!requireNamespace("ggplot2", quietly = TRUE)) return(NULL)
   years <- seq(start_year, end_year, by = 1)
   if (is_date) {
@@ -964,4 +956,135 @@ normalize_veg_name <- function(x) {
   x <- as.character(x)
   x[!nzchar(trimws(x))] <- NA_character_
   tolower(trimws(x))
+}
+
+# --- Shared utility: suppress stdout/message during an expression ---
+suppress_output_safely <- function(expr, quiet_output = TRUE, quiet_message = TRUE) {
+  if (quiet_output) {
+    capture.output(val <- force(expr))
+  } else {
+    val <- force(expr)
+  }
+  if (quiet_message) suppressMessages(val) else val
+}
+
+# --- Shared utility: filter valid vegetation rows (excludes NA/empty/barren) ---
+filter_valid_vegetation <- function(coefs, exclude_barren = TRUE) {
+  veg_char <- as.character(coefs$Veg)
+  mask <- !is.na(veg_char) & nchar(trimws(veg_char)) > 0 & trimws(veg_char) != "NA"
+  if (exclude_barren) mask <- mask & !normalize_veg_name(veg_char) %in% c("barren")
+  coefs[mask, ]
+}
+
+# --- Shared utility: aggregate batch results into a results list ---
+aggregate_batch_results <- function(batch_results, results_list, save_csv_dir = NULL) {
+  for (k in names(batch_results)) {
+    loc_result <- batch_results[[k]]
+    if (is.null(loc_result)) next
+    if (!is.null(save_csv_dir)) {
+      loc_data <- purrr::map_dfr(loc_result, "coef_df")
+      if (nrow(loc_data) > 0) {
+        out_fname <- file.path(save_csv_dir, paste0("result_", make.names(k), ".csv"))
+        readr::write_csv(loc_data, out_fname)
+      }
+    }
+    purrr::imap(loc_result, function(r, yr_char) {
+      if (is.null(r)) return(NULL)
+      if (!is.null(save_csv_dir) && (is.null(r$coef_df) || nrow(r$coef_df) == 0)) return(NULL)
+      res_key <- if (!is.null(r$coef_df) && "pheno_year" %in% names(r$coef_df)) {
+        paste(k, r$coef_df$pheno_year[1], sep = "_")
+      } else {
+        paste(k, yr_char, sep = "_")
+      }
+      results_list[[res_key]] <<- list(
+        coef_df = r$coef_df,
+        diagnostics = r$diagnostics,
+        uncertainty = r$uncertainty
+      )
+    })
+  }
+  results_list
+}
+
+# --- Shared utility: save canonical inference fractions CSV for downstream scripts ---
+save_inference_results_csv <- function(inference_coefs, out_csv = "inference_results/inference_results.csv", source_csv = NA_character_) {
+  if (is.null(inference_coefs) || !is.data.frame(inference_coefs) || nrow(inference_coefs) == 0) {
+    cat("[INFERENCE] No inference coefficients available to write canonical CSV.\n")
+    return(invisible(FALSE))
+  }
+
+  source_base <- if (!is.na(source_csv) && nzchar(as.character(source_csv))) basename(as.character(source_csv)) else NA_character_
+  source_tag <- if (!is.na(source_base) && nzchar(source_base)) {
+    gsub("_+", "_", gsub("[^A-Za-z0-9]+", "_", tools::file_path_sans_ext(source_base)))
+  } else {
+    NA_character_
+  }
+
+  out_df <- inference_coefs
+  if (!("inference_source_csv" %in% names(out_df))) out_df$inference_source_csv <- source_base
+  if (!("inference_source_tag" %in% names(out_df))) out_df$inference_source_tag <- source_tag
+
+  # Keep stable column order for downstream readers while preserving any extra columns
+  preferred_cols <- c(
+    "location_id", "pheno_year", "lat", "lon", "Veg", "variant_id",
+    "coef", "rmse", "coef_025", "coef_975", "coef_sd", "interval",
+    "n_obs", "inseparable_variant_flag", "inseparable_variant_details",
+    "inference_source_csv", "inference_source_tag"
+  )
+  ordered_cols <- c(intersect(preferred_cols, names(out_df)), setdiff(names(out_df), preferred_cols))
+  out_df <- out_df[, ordered_cols, drop = FALSE]
+
+  # Deterministic row ordering: location -> year -> class
+  if (all(c("location_id", "pheno_year", "Veg") %in% names(out_df))) {
+    out_df <- out_df %>%
+      mutate(
+        location_id = as.character(location_id),
+        pheno_year = suppressWarnings(as.integer(pheno_year)),
+        Veg = as.character(Veg)
+      ) %>%
+      arrange(location_id, pheno_year, Veg)
+  }
+
+  out_dir <- dirname(out_csv)
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  readr::write_csv(out_df, out_csv, na = "NA")
+  cat(sprintf("[INFERENCE] Wrote canonical inference fractions CSV: %s (%d rows)\n", out_csv, nrow(out_df)))
+
+  # Also persist a source-specific copy so lower/middle/etc. remain separated across runs.
+  if (!is.na(source_tag) && nzchar(source_tag)) {
+    source_csv_out <- file.path(out_dir, sprintf("inference_results_%s.csv", source_tag))
+    readr::write_csv(out_df, source_csv_out, na = "NA")
+    cat(sprintf("[INFERENCE] Wrote source-specific inference CSV: %s\n", source_csv_out))
+  }
+
+  invisible(TRUE)
+}
+
+# --- Utility: interpret interpolation flag/option ---
+# Accepts logicals (TRUE/FALSE) or character strings.  Returns one of
+# "linear", "whittaker", or "none".  NULL is passed through.
+get_interpolate_method <- function(val) {
+  if (is.null(val)) return(NULL)
+  if (is.logical(val)) {
+    if (isTRUE(val)) return("linear")
+    return("none")
+  }
+  match.arg(tolower(as.character(val)), c("linear","whittaker","none"))
+}
+
+# Reads the interpolation method from global parameters (MESMA_PARAMS or
+# INTERPOLATE_INFERENCE), normalises it via get_interpolate_method(), and
+# returns the resolved string ("linear", "whittaker", or "none").
+# Falls back to `fallback` when nothing is defined (default: "linear").
+resolve_interpolation_method <- function(fallback = "linear") {
+  val <- NULL
+  if (exists("MESMA_PARAMS") && !is.null(MESMA_PARAMS$interpolate_inference)) {
+    val <- MESMA_PARAMS$interpolate_inference
+  } else if (exists("INTERPOLATE_INFERENCE")) {
+    val <- INTERPOLATE_INFERENCE
+  } else {
+    val <- fallback
+  }
+  get_interpolate_method(val)
 }

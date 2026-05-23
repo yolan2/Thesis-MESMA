@@ -4,12 +4,11 @@
 # Produces a scatter plot of training endmembers (one point per loc-year)
 # projected into PCA-LDA space, coloured by vegetation class.
 #
-# The pipeline mirrors the logic inside train_feature_pipeline():
-#   1. Load preprocessed data and filter to TRAIN_YEARS
-#   2. Build a temporal feature vector per loc-year (pentad averages, L2-norm,
-#      z-score) — the same representation used for training
-#   3. PCA (retain 95 % variance)  →  LDA on PCA scores
-#   4. Project each loc-year sample onto LD1/LD2 and plot
+# Uses the EXACT PCA-LDA space trained in fit_veg_mixture_mesma.R:
+#   1. Load trained z-score params, L2-norm flag, and PCA-LDA objects
+#   2. Apply identical data preprocessing (L2-norm → z-score)
+#   3. Project onto trained PCA-LDA basis
+#   4. Plot results in the exact training space
 # =============================================================================
 
 suppressPackageStartupMessages({
@@ -28,11 +27,28 @@ df          <- readRDS("preprocessed_data.rds")
 norm_params <- readRDS("training_norm_params.rds")
 INDEX_SCALES <- norm_params$INDEX_SCALES
 
-# Feature columns: prefer training norm indices, fall back to OPTIMAL_INDICES
-if (!is.null(INDEX_SCALES) && length(INDEX_SCALES) > 0) {
+# Extract training parameters to ensure we use the exact same PCA-LDA space
+training_l2_normalize <- if (!is.null(norm_params$l2_normalize)) norm_params$l2_normalize else TRUE
+training_zscore_applied <- if (!is.null(norm_params$zscore_applied)) norm_params$zscore_applied else TRUE
+training_means <- if (!is.null(norm_params$means)) norm_params$means else NULL
+training_sds <- if (!is.null(norm_params$sds)) norm_params$sds else NULL
+training_lda_basis <- if (!is.null(norm_params$lda_basis)) norm_params$lda_basis else NULL
+training_pca_res <- if (!is.null(norm_params$pca_loadings)) norm_params$pca_loadings else NULL
+
+cat(sprintf("Training parameters loaded: L2=%s, Z-score=%s, LDA basis=%s\n",
+            training_l2_normalize, training_zscore_applied, !is.null(training_lda_basis)))
+
+# Feature columns: use trained indices if available (ensures consistency with fit_veg_mixture)
+# Otherwise fall back to INDEX_SCALES or OPTIMAL_INDICES
+if (!is.null(norm_params$indices) && length(norm_params$indices) > 0) {
+  avail <- intersect(norm_params$indices, names(df))
+  cat("[INFO] Using trained indices from fit_veg_mixture.R\n")
+} else if (!is.null(INDEX_SCALES) && length(INDEX_SCALES) > 0) {
   avail <- intersect(names(INDEX_SCALES), names(df))
+  cat("[INFO] Using INDEX_SCALES from training normalization\n")
 } else {
   avail <- intersect(OPTIMAL_INDICES, names(df))
+  cat("[INFO] Using OPTIMAL_INDICES (training params not found)\n")
 }
 if (length(avail) == 0) stop("No feature indices found in preprocessed data.")
 cat(sprintf("Features (%d): %s\n", length(avail), paste(avail, collapse = ", ")))
@@ -111,11 +127,13 @@ for (nm in names(traces)) {
 
   vec <- as.numeric(mat)
 
-  # L2-normalize whole vector (ENABLE_LDA_L2_NORMALIZATION = TRUE)
-  v_clean <- vec
-  v_clean[!is.finite(v_clean)] <- 0
-  nrm <- sqrt(sum(v_clean^2))
-  if (is.finite(nrm) && nrm > 1e-9) vec <- vec / nrm
+  # Apply SAME L2-normalization as training (whole-vector norm per observation)
+  if (isTRUE(training_l2_normalize)) {
+    v_clean <- vec
+    v_clean[!is.finite(v_clean)] <- 0
+    nrm <- sqrt(sum(v_clean^2))
+    if (is.finite(nrm) && nrm > 1e-9) vec <- vec / nrm
+  }
 
   X_list[[length(X_list) + 1L]] <- vec
 
@@ -135,24 +153,52 @@ if (n_samples < 4L) stop("Too few samples for PCA-LDA.")
 X_mat <- do.call(rbind, X_list)
 
 # ── Z-score per feature×pentad column group (ENABLE_ZSCORE_AFTER_L2 = TRUE) ──
+# Use TRAINING z-score parameters if available
 X_z <- X_mat
-for (k in seq_along(avail)) {
-  idx <- (k - 1L) * N_PENT + seq_len(N_PENT)
-  v   <- X_mat[, idx]
-  mu  <- mean(v, na.rm = TRUE)
-  sg  <- sd(v,   na.rm = TRUE)
-  if (is.na(sg) || sg < 1e-9) sg <- 1
-  X_z[, idx] <- (v - mu) / sg
+if (isTRUE(training_zscore_applied) && !is.null(training_means) && !is.null(training_sds)) {
+  cat("Applying training z-score parameters...\n")
+  for (k in seq_along(avail)) {
+    idx <- (k - 1L) * N_PENT + seq_len(N_PENT)
+    v   <- X_mat[, idx]
+    mu  <- training_means[avail[k]]
+    sg  <- training_sds[avail[k]]
+    if (is.na(sg) || sg < 1e-9) sg <- 1
+    X_z[, idx] <- (v - mu) / sg
+  }
+  X_z[!is.finite(X_z)] <- 0
+} else {
+  # Fallback: compute z-scores from data if training params not available
+  cat("Training z-score parameters not available; computing from data...\n")
+  for (k in seq_along(avail)) {
+    idx <- (k - 1L) * N_PENT + seq_len(N_PENT)
+    v   <- X_mat[, idx]
+    mu  <- mean(v, na.rm = TRUE)
+    sg  <- sd(v,   na.rm = TRUE)
+    if (is.na(sg) || sg < 1e-9) sg <- 1
+    X_z[, idx] <- (v - mu) / sg
+  }
+  X_z[!is.finite(X_z)] <- 0
 }
-X_z[!is.finite(X_z)] <- 0
 
 # ── PCA ───────────────────────────────────────────────────────────────────────
+# Use trained PCA object if available; otherwise compute from data
 vars      <- apply(X_z, 2, var)
 keep_cols <- vars > 1e-9
 X_pca_in  <- X_z[, keep_cols, drop = FALSE]
-pca_res   <- prcomp(X_pca_in, center = FALSE, scale. = FALSE)
 
-cum_var <- cumsum(pca_res$sdev^2) / sum(pca_res$sdev^2)
+if (!is.null(training_pca_res) && !is.null(training_pca_res$rotation)) {
+  cat("Using trained PCA loadings...\n")
+  # Project onto trained PCA space
+  pca_res <- list(x = X_pca_in %*% training_pca_res$rotation,
+                  rotation = training_pca_res$rotation,
+                  sdev = training_pca_res$sdev)
+  cum_var <- cumsum(pca_res$sdev^2) / sum(pca_res$sdev^2)
+} else {
+  cat("Training PCA not available; computing PCA from data...\n")
+  pca_res   <- prcomp(X_pca_in, center = FALSE, scale. = FALSE)
+  cum_var <- cumsum(pca_res$sdev^2) / sum(pca_res$sdev^2)
+}
+
 n_pcs   <- which(cum_var > PCA_VARIANCE_THRESHOLD)[1L]
 if (is.na(n_pcs)) n_pcs <- ncol(pca_res$x)
 
@@ -168,11 +214,25 @@ cat(sprintf("PCA: using %d PCs (%.1f %% var retained)\n",
             n_pcs, 100 * cum_var[n_pcs]))
 
 # ── LDA on PCA scores ─────────────────────────────────────────────────────────
-lda_res <- withCallingHandlers(
-  MASS::lda(pca_res$x[, 1:n_pcs, drop = FALSE],
-            grouping = as.factor(y_class)),
-  warning = function(w) invokeRestart("muffleWarning")
-)
+# Use trained LDA basis if available; otherwise compute from data
+if (!is.null(training_lda_basis) && nrow(training_lda_basis) > 0) {
+  cat("Using trained LDA basis...\n")
+  # Project PCA scores onto trained LDA basis
+  lda_res <- list(scaling = training_lda_basis)
+  if (!is.null(norm_params$lda_component_weights)) {
+    lda_res$svd <- sqrt(norm_params$lda_component_weights)
+  } else {
+    # Estimate approximate SVD from scaling matrix
+    lda_res$svd <- sqrt(colSums(training_lda_basis^2))
+  }
+} else {
+  cat("Training LDA not available; computing LDA from data...\n")
+  lda_res <- withCallingHandlers(
+    MASS::lda(pca_res$x[, 1:n_pcs, drop = FALSE],
+              grouping = as.factor(y_class)),
+    warning = function(w) invokeRestart("muffleWarning")
+  )
+}
 n_ld <- ncol(lda_res$scaling)
 cat(sprintf("LDA: %d discriminant axis/axes\n", n_ld))
 
@@ -196,11 +256,11 @@ plot_df <- data.frame(
 
 # ── Colour palette ────────────────────────────────────────────────────────────
 palette_base <- c(
-  "populus"    = "#2ca02c",
-  "tamarix"    = "#d62728",
+  "populus"    = "#006400",
+  "tamarix"    = "#D95F02",
   "phragmites" = "#1f77b4",
-  "herbs"      = "#bcbd22",
-  "barren"     = "#8c564b"
+  "herbs"      = "#9ACD32",
+  "barren"     = "#D3D3D3"
 )
 classes_present <- levels(plot_df$class)
 extra_classes   <- setdiff(classes_present, names(palette_base))
@@ -280,3 +340,60 @@ if (n_ld >= 2L) {
   cat("LD2 class centroids:\n")
   print(round(tapply(X_ld[, 2], y_class, mean), 3))
 }
+
+# =============================================================================
+# Relative importance of spectral indices in LDA
+# -----------------------------------------------------------------------------
+# Back-project LDA coefficients through PCA to get per-index contributions.
+# Each feature vector is [N_PENT * n_indices], so we sum squared loadings
+# across pentads to get a single importance score per index per LD axis.
+# =============================================================================
+cat("\n--- RELATIVE IMPORTANCE OF INDICES IN LDA ---\n")
+
+# Combined projection: [n_feature_pentads x n_ld]
+# keep_cols masks out zero-variance columns; align rotation to kept cols
+rot <- training_pca_res$rotation[keep_cols, 1:n_pcs, drop = FALSE]
+combined <- rot %*% lda_res$scaling  # [n_kept_feat_pentads x n_ld]
+
+# Map kept feature×pentad positions back to index names
+kept_positions  <- which(keep_cols)
+# Each index occupies N_PENT consecutive columns in the flattened vector
+index_of_pos    <- avail[((kept_positions - 1L) %/% N_PENT) + 1L]
+
+importance_df <- data.frame(index = index_of_pos, combined^2,
+                             check.names = FALSE)
+colnames(importance_df)[-1] <- paste0("LD", seq_len(n_ld), "_sq")
+
+imp_summary <- importance_df %>%
+  group_by(index) %>%
+  summarise(across(starts_with("LD"), sum), .groups = "drop") %>%
+  mutate(across(starts_with("LD"), ~ . / sum(.) * 100))  # normalise to %
+
+# Sort by LD1
+imp_summary <- imp_summary[order(-imp_summary$LD1_sq), ]
+
+cat("\nIndex importance (% of total squared loading per LD axis):\n")
+print(as.data.frame(imp_summary), digits = 3, row.names = FALSE)
+
+# ── Bar plot ──────────────────────────────────────────────────────────────────
+imp_long <- tidyr::pivot_longer(imp_summary,
+                                cols      = starts_with("LD"),
+                                names_to  = "axis",
+                                values_to = "importance_pct")
+imp_long$index <- factor(imp_long$index,
+                         levels = rev(imp_summary$index))  # sorted by LD1
+imp_long$axis  <- sub("_sq$", "", imp_long$axis)
+
+p_imp <- ggplot(imp_long, aes(x = index, y = importance_pct, fill = axis)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("LD1" = "#1f77b4", "LD2" = "#ff7f0e",
+                               "LD3" = "#2ca02c")) +
+  labs(title = "Relative importance of spectral indices in LDA",
+       x = NULL, y = "% of total squared loading", fill = "Axis") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+imp_file <- "lda_index_importance.png"
+ggsave(imp_file, p_imp, width = 7, height = 5, dpi = 150)
+cat(sprintf("Saved: %s\n", imp_file))

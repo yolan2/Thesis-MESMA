@@ -5,14 +5,6 @@
 # logging, and parallel backend setup used by downstream modules.
 
 
-# --- Logging ---
-log_msg <- function(...) {
-  ts <- format(Sys.time(), "%H:%M:%S")
-  msg <- sprintf("[%s] %s\n", ts, sprintf(...))
-  cat(msg)
-  if (isTRUE(PROGRESS_LOG_TO_FILE)) try(cat(msg, file = LOG_FILE, append = TRUE), silent = TRUE)
-}
-
 # --- Parallel backend ---
 setup_parallel_backend <- function(workers = NULL) {
   # Capture current plan to allow restoration
@@ -50,41 +42,28 @@ setup_parallel_backend <- function(workers = NULL) {
 # GLOBAL CONSTANTS
 # =============================================================================
 
-INPUT_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_train (3).csv"
+INPUT_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_train (4).csv"
                                  # Path to the input CSV used for training. Replace with your own file path.
 INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_kon (1).csv"
 #choose "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_kon (1).csv"
 #or "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_low (3).csv"
 #or "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_mid (2).csv"
-ADDITIONAL_BIAS_CSVS <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_low (3).csv"
-
 
 # Training year selection
 # If you only want to build variants using the most recent data, set TRAIN_YEARS to a single year (e.g., 2024) or a vector of years.
 TRAIN_YEARS <- c(2023, 2024)  # Years to use for training (inclusive)
-# Quiet mode suppresses verbose informational printing when TRUE
-# Set to TRUE to reduce console noise (useful for CI or large runs)
-QUIET_MODE <- TRUE
-
-
 PARALLEL_ENABLE <- TRUE
 
-PARALLEL_WORKERS <- 4            # # workers to spawn when PARALLEL_ENABLE=TRUE for general tasks (keep small for memory reasons)
-PERMUTATION_PARALLEL_WORKERS <- 30  # # workers to use specifically for permutation testing (can be larger than PARALLEL_WORKERS)
-# Stage-2 (pentad-level) significance threshold - less strict than index-level
-
-# Note: the permutation worker count will be capped to available cores at runtime.
+PARALLEL_WORKERS <- 4            # # workers to spawn when PARALLEL_ENABLE=TRUE for general tasks (keep small for memory (RAM) reasons)
+# Note: combo worker count will be capped to available cores at runtime.
 COMBO_PARALLEL_WORKERS <- max(1L, floor(PARALLEL_WORKERS/2))
 
-
-MIN_ENDMEMBER_SAMPLES <- 5L      # Minimum raw samples required to form an endmember variant. Raise to be stricter.
 
 ALLOWED_VEG <- c("populus", "tamarix", "herbs")
                                  # Restrict vegetation classes to these labels during training; edit to match your dataset.
 
 # Index defaults
 OPTIMAL_INDICES <- c(
-  "EVI",      # Enhanced Vegetation Index (requires blue)
   "PSRI",     # Plant Senescence Reflectance Index (requires blue)
   "NDMI",     # moisture / water index (NIR-SWIR1)
   "NDTI",     # SWIR1-SWIR2 difference
@@ -104,16 +83,8 @@ OUTLIER_SPLINE_MAX_DF <- 10L     # Max degrees-of-freedom for spline trend in ou
 GENERATE_PROTO_PLOTS <- TRUE     # Turn on to save one plot per prototype (useful for inspection; can generate many files)
 GENERATE_PROTO_PLOTS_VARIANTS_ONLY <- TRUE  # Also save a variants-only version (no median overlays)
 
-# Run / testing flags
-# Training enabled by default (do not permanently disable training here)
-
-
-
 # -----------------------------------------------------------------------------
 # USER-TUNABLE PARAMETERS (centralized)
-# Move any frequently-adjusted constants here for easy configuration
-# NOTE: each parameter below has a short tuning note explaining its purpose and how
-#       to change it safely. Prefer conservative changes and test on a small dataset.
 # -----------------------------------------------------------------------------
 
 # Combinatorics safeguards
@@ -131,17 +102,15 @@ MAX_INFERENCE_LOCATIONS <- 2000L # Max locations processed per inference CSV fil
 #       underestimate long-distance spatial correlation and therefore understate
 #       uncertainty of spatial aggregates.
 #       When enabled, we resample *spatial blocks* of locations instead.
-#       BloALSEck size is determined from the data via empirical variogram fitting
+#       Blocksize size is determined from the data via empirical variogram fitting
 #       (estimate_autocorrelation_range). BOOTSTRAP_BLOCK_KM serves only as a
 #       fallback when the variogram cannot be estimated (too few locations, etc.).
 ENABLE_SPATIAL_BLOCK_BOOTSTRAP <- TRUE
-BOOTSTRAP_BLOCK_KM <- 30.0            # Fallback block width (km) used only when variogram estimation fails.
+BOOTSTRAP_BLOCK_KM <- 5.0            # Fallback block width (km) used only when variogram estimation fails.
 BOOTSTRAP_BLOCK_MAX_MISSING_FRAC <- 0.30  # If > this fraction of locations lack coords, fall back to i.i.d. bootstrap.
 
 # Uncertainty handling
 ENABLE_UNCERTAINTY <- TRUE       # Turn off to skip expensive uncertainty estimation (bootstrap, MC propagation) for faster runs.
-ENABLE_MULTI_YEAR_BOOTSTRAP <- FALSE # If TRUE, run per-location multi-year bootstrap; set FALSE to skip for speed/stability.
-
 # MC propagation
 ENABLE_MONTE_CARLO <- TRUE       # Propagate observation noise into coefficient uncertainty via repeated unmixing draws. Disable to save time.
 MC_N_DRAWS <- 50L                # Number of MC draws per location-year (>=10 recommended). Lower to speed up, increase to stabilize CI estimates.
@@ -167,7 +136,7 @@ USE_IWLMM <- TRUE        # Set TRUE to enable IWLMM unmixing during MESMA
 IWLMM_MAX_ITER <- 5            # Maximum alternating optimization iterations
 IWLMM_TOL <- 1e-4               # Convergence tolerance on coefficients
 IWLMM_BOUND_SIGMA <- 2.0        # Multiplier on per-feature sigma to bound perturbations
-IWLMM_REGULARIZE_DELTA <- 0.0   # Optional L2 regularization on endmember perturbations
+IWLMM_REGULARIZE_DELTA <- 0.01   # Optional L2 regularization on endmember perturbations
 
 # When the iterative solver computes feature weights it can produce extreme
 # values that destabilise the QP.  These limits are applied after the normal
@@ -185,19 +154,13 @@ DEFAULT_UNMIX_SOLVER <- "fcls"   # default fallback when MESMA_PARAMS$solver uns
 # ENABLE_SPARSE_MIXING, which has been removed because it had no effect.
 # Sparse subset behaviour is now driven entirely by the parameters below.
 USE_SPARSE_UNMIXING <- TRUE  # Set TRUE to apply L1-penalized solver to every unmixing call.
-# (removed) ENABLE_SPARSE_MIXING <- FALSE
 SPARSE_MIXING_LAMBDA <- 0.01     # Sparsity penalty added to score as: rmse + lambda * n_active_components.
-# Notes: n_active_components counts coefficients exceeding SPARSE_COEF_THRESHOLD.
-# Barren endmember is excluded from this count so that sparsity penalties only
-# affect vegetation classes.
-SPARSE_MIN_COMPONENTS <- 1L      # Minimum number of active classes allowed in sparse subset search.
-SPARSE_MAX_COMPONENTS <- 4L      # Maximum number of active classes allowed in sparse subset search.
-SPARSE_COEF_THRESHOLD <- 0.02    # Coefficients > threshold are counted as active components for sparsity penalty.
-SPARSE_UNMIX_K <- 3L              # Number of nonzero endmembers to keep per-sample when using sparse solver
+# Notes: n_active_components counts all non-zero coefficients (including barren).
+SPARSE_UNMIX_K <- 2L              # Max number of active vegetation endmembers per pixel (barren is always kept on top of this)
 
 # Feature selection / pruning
 ENABLE_FEATURE_PRUNING <- TRUE  # Automatically drop highly correlated features before training?
-FEATURE_PRUNING_THRESHOLD <- 0.95 # Correlation threshold above which a feature is considered redundant and dropped.
+FEATURE_PRUNING_THRESHOLD <- 0.9 # Correlation threshold above which a feature is considered redundant and dropped.
 
 
 
@@ -209,6 +172,13 @@ MIN_PENTADS_PER_TRAIN_SAMPLE <- 8L  # Minimum observations required per location
 
 # Modeling/algorithmic caps and defaults
 USE_LDA_SPACE_SOLVER <- TRUE        # Set TRUE to project observations and library into LDA space before unmixing (experimental, disabled).
+
+# Standard visual representation colors for vegetation types
+VEG_CALIBRATION_COLORS <- c(
+  "herbs"   = "#9ACD32",   # YellowGreen
+  "populus" = "#006400",   # DarkGreen
+  "tamarix" = "#D95F02"    # Burnt Orange
+)
 
 ENABLE_LDA_L2_NORMALIZATION <- TRUE # L2-normalize training samples to focus on temporal shape rather than amplitude.
                                      # Set TRUE to emphasize shape; FALSE to preserve brightness differences.
@@ -222,7 +192,7 @@ GAM_GAMMA <- 1.0                 # Regularization / smoothing strength for GAM (
 
 # Sample/cluster controls
 # Support multiple barren/soil prototypes extracted from training bare-soil observations
-RAW_BARREN_N_PROTOTYPES <- 2L  # Maximum number of barren endmembers to consider during optimization (like MAX_K_EAR for vegetation).
+RAW_BARREN_N_PROTOTYPES <- 1L  # Maximum number of barren endmembers to consider during optimization (like MAX_K_EAR for vegetation).
                                 # The optimizer will search k=1..RAW_BARREN_N_PROTOTYPES for barren class.
                                 # Tuning: set >1 if you expect distinct soil types/brightness regimes in the region
                                 # (e.g., sandy vs. clay surfaces). Increasing this improves representativeness but
@@ -235,6 +205,12 @@ LOWER_BND <- 0                   # Lower bound used for non-negativity constrain
 # Batch processing
 BATCH_SIZE <- 6  # Default batch size for location-level processing. Lower for memory-constrained runs; higher for throughput.
 
+# Temporary results directory (used by fit script for intermediate CSVs).
+# Override by setting TEMP_RESULTS_DIR before sourcing this file if desired.
+if (!exists("TEMP_RESULTS_DIR", inherits = TRUE)) {
+  TEMP_RESULTS_DIR <- file.path(getwd(), "temp_results")
+}
+
 # Temporal (pentad) settings
 TEMPORAL_AGGREGATION_DAYS <- 10L  # Temporal aggregation window in days (~pentad length). Smaller -> finer but sparser.
 TEMPORAL_BUDGET <- ceiling(365 / TEMPORAL_AGGREGATION_DAYS)  # Number of temporal bins (pentads) used in modeling
@@ -243,7 +219,7 @@ TEMPORAL_BUDGET <- ceiling(365 / TEMPORAL_AGGREGATION_DAYS)  # Number of tempora
 MIN_CLUSTER_SIZE <- 4L           # Minimum cluster size to accept a variant prototype
 # Temporal-filling method used during inference/validation (and in any
 # functions that accept an `interpolate` argument).  Accepted values are:
-#   * "linear" (or TRUE)   - linearly interpolate missing pentads (legacy default)
+#   * "linear" (or TRUE)   - linearly interpolate missing pentads (default)
 #   * "whittaker"          - apply Whittaker penalized smoothing (fills gaps and
 #                             smooths the resulting pentad series)
 #   * "none" (or FALSE)    - leave missing pentads as NA
@@ -260,28 +236,23 @@ PCA_VARIANCE_THRESHOLD <- 0.95    # PCA energy to retain when reducing endmember
 # vegetation matrix during `precompute_optimized_library_weighted()` and the
 # same pruning is repeated during inference so that the solver works on the
 # reduced feature set. Pruned columns are recorded in `pruned_info` for
-# diagnostics and bookkeeping. See PRUNE_ZERO_WEIGHT_MAX_FRAC and
-# PRUNE_ZERO_MIN_FEATURES for guards that prevent over‑pruning.
+# diagnostics and bookkeeping.
 PRUNE_ZERO_WEIGHT_FEATURES <- TRUE
-# If fraction of zeroed features exceeds this, skip pruning to avoid degenerate libraries
-PRUNE_ZERO_WEIGHT_MAX_FRAC <- 0.8
-# Minimum number of features to keep after pruning to avoid degenerate models
-PRUNE_ZERO_MIN_FEATURES <- 3
 
-# === PERMUTATION IMPORTANCE FEATURE PRUNING ===
-# Measures feature contribution by randomizing each feature and testing performance degradation.
-# Features whose permutation doesn't significantly degrade performance are pruned.
-OOB_TUNING_FRACTION <- 0.2         # Fraction held out from training data for cluster optimization evaluation
-VALIDATION_FRACTION <- 0.20         # Fraction held out for validation (stratified by location/Veg)
-PERMUTATION_N_ITER <- 500            # Number of permutations per feature for significance testing
-PERMUTATION_MIN_SAMPLES <- 20       # Minimum OOB samples required for testing
-PERMUTATION_ALPHA <- 0.1          # Significance level for permutation p-values (features with p >= alpha are pruned)
-INDEX_PERM_ALPHA <- 0.1           # Significance level for dropping entirely index groups
+OOB_TUNING_FRACTION <- 0.3         # Fraction held out from training data for cluster optimization evaluation
+VALIDATION_FRACTION <- 0.3         # Fraction held out for validation (stratified by location/Veg)
 
 # Endmember selection tuning
 MAX_K_EAR <- 2L                  # Maximum number of endmembers to consider per vegetation class in EAR selection (conservative increase to explore one more k).
 CLUSTER_COMPLEXITY_LAMBDA <- 0.005  # Complexity penalty per total endmember: S = min(R_oob, R_train) - λ * sum(k)
-BARREN_SIM_THRESHOLD <- 1     # Pre-filter: drop vegetation training observations whose cosine similarity to barren mean exceeds this threshold
+BARREN_SIM_THRESHOLD <- 1  # Pre-filter: drop vegetation training observations whose cosine similarity to barren mean exceeds this threshold
+
+# PPI-based barren cap
+# When TRUE, the MESMA-derived barren fraction is clamped to (1 - PPI_veg_cover) where
+# PPI_veg_cover = min(peak_summer_PPI / PPI_FULL_VEG_COVER, 1).  Vegetation coefficients
+# are scaled up proportionally to fill the freed fraction.  This prevents MESMA from
+# assigning more barren than the PPI time series supports.
+ENABLE_PPI_BARREN_CAP <- TRUE
 
 # === END GLOBAL CONFIG ===
 PROGRESS_LOG_TO_FILE <- FALSE
@@ -293,7 +264,6 @@ LOG_FILE <- "mesma_progress.log"
 # NEW LOGIC: "blue" is always included in RAW_BANDS for index calculation
 # (EVI, PSRI, etc.) and will never be dropped.
 RAW_BANDS <- c("blue", "green", "red", "nir", "swir1", "swir2")
-# EXCLUDE_BLUE_BAND is deprecated and ignored.
 
 # Sensor-bias correction behavior in preprocessing
 # When TRUE, shift LANDSAT_89 (OLI) raw bands to ETM+ scale using affine
@@ -307,9 +277,7 @@ RAW_BANDS <- c("blue", "green", "red", "nir", "swir1", "swir2")
 ENABLE_BAND_BIAS_CORRECTION <- TRUE
 
 # Sensor-bias correction behavior in preprocessing
-# (deprecated) direct index-level shift for LANDSAT_89 using stats from
-# satellite_bias_check/bias_stats_features.csv.  This mechanism is no longer
-# supported and the value remains FALSE for compatibility.
+# satellite_bias_check/bias_stats_features.csv.  
 ENABLE_DIRECT_INDEX_BIAS_CORRECTION <- FALSE
 
 # Features excluded from direct index correction (kept case-insensitive).

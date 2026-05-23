@@ -47,28 +47,8 @@ if (file.exists("mesma_helpers.R")) {
   set_mesma_seed()
 }
 
-# --- Utility: interpret interpolation flag/option (same as in fit script) ---
-# Accepts logicals (TRUE/FALSE) or character strings.  Returns one of
-# "linear", "whittaker", or "none".  NULL is passed through.
-get_interpolate_method <- function(val) {
-  if (is.null(val)) return(NULL)
-  if (is.logical(val)) {
-    if (isTRUE(val)) return("linear")
-    else return("none")
-  }
-  v <- tolower(as.character(val))
-  if (v %in% c("linear", "whittaker", "none")) return(v)
-  stop(sprintf("Invalid interpolate method '%s' (expected 'linear','whittaker' or 'none')", val))
-}
-
 # report active temporal fill mode (mirrors fit script behaviour)
-interp_method <- NULL
-if (exists("MESMA_PARAMS") && !is.null(MESMA_PARAMS$interpolate_inference)) {
-  interp_method <- MESMA_PARAMS$interpolate_inference
-} else if (exists("INTERPOLATE_INFERENCE")) {
-  interp_method <- INTERPOLATE_INFERENCE
-}
-interp_method <- get_interpolate_method(interp_method)
+interp_method <- resolve_interpolation_method()
 cat(sprintf("[NOTICE] Temporal fill option at startup: %s\n", interp_method))
 
 
@@ -112,23 +92,19 @@ INDICES_OF_INTEREST <- c("EVI", "MSAVI", "NDVI", "PPI", "OSAVI", "NIRv", "NBR", 
 SUMMER_DETREND_MONTHS <- c(7,8,9)  # July - September (use median across these months)
 MIN_SEASONAL_SAMPLES <- 50
 
-# Polynomial degree used when fitting seasonal detrend curves on summer data
-# (previously a smooth spline was used across the full year).  Users may override
-# by setting DETREND_POLY_DEGREE before sourcing the script.
+# Polynomial degree used when fitting seasonal detrend curves on summer data.
+# Users may override by setting DETREND_POLY_DEGREE before sourcing the script.
 if (!exists("DETREND_POLY_DEGREE", inherits = TRUE)) DETREND_POLY_DEGREE <- 3
 
 # PPI configuration: fixed-M fallback used to be allowed, but we now
-# always compute M from rows where no_soil == 1.  The following constant is
-# retained for backward compatibility (unused by current code).
-PPI_FIXED_M <- NA_real_  # deprecated; no fallback allowed
+# always compute M from rows where no_soil == 1.
 # Soil baseline months for dvi_soil: use January-March per location mean.
 PPI_SOIL_BASELINE_MONTHS <- c(1L, 2L, 3L)
 # PPI M calibration: M must be strictly ABOVE the maximum observed DVI so that
 # ppi() never receives dvi >= M (avoids negative-log issues).  We simply take
 # the maximum DVI among all rows with no_soil==1 over the target months.
 compute_ppi_m_from_populus_q90 <- function(df, months = SUMMER_DETREND_MONTHS) {
-  # NOTE: despite the name, we now ignore Veg and simply take the maximum DVI
-  # among all rows where no_soil == 1 within the requested months.
+  # Use the maximum DVI among rows where no_soil == 1 within the requested months.
   if (is.null(df) || nrow(df) == 0) return(NA_real_)
   if (!"DVI" %in% names(df) && all(c("nir", "red") %in% names(df))) df$DVI <- as.numeric(df$nir) - as.numeric(df$red)
   if (!"DVI" %in% names(df)) return(NA_real_)
@@ -565,21 +541,6 @@ DVI_SOIL_JFM_MEAN_BY_LOCATION <- tapply(
   }
 )
 
-map_dvi_soil_from_full_baseline <- function(df, lookup, context = "data") {
-  if (is.null(df) || nrow(df) == 0) stop(sprintf("[PPI] %s: empty df", context))
-  if (!"location_id" %in% names(df)) stop(sprintf("[PPI] %s: missing location_id", context))
-  if (!"DVI" %in% names(df) && all(c("nir", "red") %in% names(df))) df$DVI <- as.numeric(df$nir) - as.numeric(df$red)
-  if (!"DVI" %in% names(df)) stop(sprintf("[PPI] %s: missing DVI (and nir/red not available)", context))
-
-  mapped <- as.numeric(lookup[as.character(df$location_id)])
-  need_idx <- is.finite(df$DVI) & !is.finite(mapped)
-  if (any(need_idx)) {
-    bad_locs <- unique(as.character(df$location_id[need_idx]))
-    stop(sprintf("[PPI] %s: missing full-data Jan-Mar mean dvi_soil baseline for %d rows across %d locations (example locs: %s)",
-                 context, sum(need_idx), length(bad_locs), paste(head(bad_locs, 10), collapse = ", ")))
-  }
-  mapped
-}
 
 # Instead of fitting seasonal models, use July-September medians per user request
 if (!"date" %in% names(df_raw)) stop("Phenology data must include a 'date' column")
@@ -607,9 +568,6 @@ for (idx in indices_available) {
     INDEX_SUMMER_MEDIANS[[idx]] <- NA_real_
   }
 }
-
-# Expose medians as a global variable (some legacy workflows reference this)
-assign("INDEX_SUMMER_MEDIANS", INDEX_SUMMER_MEDIANS, envir = globalenv())
 
 cat(sprintf("[INDEX DETREND] Created %d '_median' columns populated with Jul-Sep values\n", length(indices_available)))
 
@@ -684,15 +642,6 @@ RAW_BANDS <- c("blue", "green", "red", "nir", "swir1", "swir2")
 
 # Compute a set of spectral indices from raw bands
 
-# Function to calculate robust variance using STL decomposition + MAD
-# Helper: compute MAD^2 with minimal sample requirement (top-level helper, no nested defs)
-compute_mad2 <- function(x, min_samples = 3) {
-  x <- x[is.finite(x)]
-  if (length(x) < min_samples) return(NA_real_)
-  m <- mad(x, na.rm = TRUE, constant = 1.4826)
-  if (!is.finite(m)) return(NA_real_)
-  m^2
-}
 
 # Safe multiplication helper: explicitly handle recycling and avoid implicit warnings.
 # Returns element-wise product (with explicit replication of the shorter vector when appropriate),
@@ -779,14 +728,8 @@ if (!all(paste0(INDICES_OF_INTEREST, "_median") %in% names(df_raw))) {
       INDEX_SUMMER_MEDIANS[[idx]] <- NA_real_
     }
   }
-  assign("INDEX_SUMMER_MEDIANS", INDEX_SUMMER_MEDIANS, envir = globalenv())
 } else {
   cat("[INDEX DETREND] Median columns present — proceeding with Jul-Sep medians\n")
-  if (!exists("INDEX_SUMMER_MEDIANS", envir = globalenv())) {
-    idx_means <- lapply(intersect(INDICES_OF_INTEREST, names(df_raw)), function(idx) median(df_raw[[idx]][lubridate::month(df_raw$date) %in% SUMMER_DETREND_MONTHS], na.rm = TRUE))
-    names(idx_means) <- intersect(INDICES_OF_INTEREST, names(df_raw))
-    assign("INDEX_SUMMER_MEDIANS", idx_means, envir = globalenv())
-  }
 }
 
 cat("\n=== CALCULATING PURE ENDMEMBER SEPARABILITY (POPULUS VS SOIL) ===\n")
@@ -904,9 +847,8 @@ if (nrow(summer_rows_sep) == 0 || length(sep_index_cols) == 0) {
   }
 }
 
-# Synthetic mixing removed by request. Keep lightweight compatibility objects for downstream bias/trend code paths.
+# Lightweight compatibility objects for downstream bias/trend code paths.
 FVC_MODELS <- list()
-assign("FVC_CALIBRATION_MODELS", FVC_MODELS, envir = globalenv())
 
 estimate_fvc_from_index <- function(df, index_name, model_list = FVC_MODELS) {
   if (!(index_name %in% names(df))) return(rep(NA_real_, nrow(df)))
@@ -1026,7 +968,7 @@ if (file.exists("ppi_helpers.R")) {
 INPUT_CSV <- if (exists("data_file") && !is.null(data_file)) {
   data_file
 } else {
-  "C:\\Users\\yolan\\Downloads\\Landsat_Harmonized_Bands_1985_2025_train (3).csv"
+  "C:\\Users\\yolan\\Downloads\\Landsat_Harmonized_Bands_1985_2025_train (4).csv"
 }
 
 # Infer canonical inference scope from filename/tag (MESMA-style low/mid/kon naming)
@@ -1098,8 +1040,8 @@ df_list <- lapply(input_csvs, function(csv_path) {
 })
 
 df <- dplyr::bind_rows(df_list)
-# filter out any pheno years earlier than 1989 in the combined inference data
-cutoff <- 1989
+# filter out any pheno years earlier than 1984 in the combined inference data
+cutoff <- 1984
 if ("date" %in% names(df) || "pheno_year" %in% names(df)) {
   if (!"pheno_year" %in% names(df) && "date" %in% names(df)) {
     df$pheno_year <- ifelse(lubridate::month(as.Date(df$date)) >= 3,
@@ -1180,7 +1122,7 @@ if ("location_id" %in% names(df)) {
 
 # Early dust filtering (NDDI) on the raw input CSV to drop contaminated rows early
 eps <- 1e-9
-# compute dust-only index (NDSI removed)
+# compute dust-only index
 if (all(c('red','nir') %in% names(df))) df$NDDI <- (as.numeric(df$red) - as.numeric(df$nir)) / (as.numeric(df$red) + as.numeric(df$nir) + eps)
 
 if ("NDDI" %in% names(df)) {
@@ -1210,7 +1152,7 @@ if (all(c("lon", "lat") %in% names(df))) {
 # 'zenith.angle' will be left NA so that PPI is not computed with an invalid
 # assumed study-area mean.
 
-# The vegetation mapping via external CSV has been removed –
+# The vegetation mapping via external CSV is not used here.
 # we rely entirely on Veg values present in the main/train datasets.
 # Previous mapping code was causing confusion and is no longer needed.
 # gpts_map will be constructed later from the main data if necessary.
@@ -1223,7 +1165,7 @@ ENABLE_TRAINING_STATS <- FALSE
 if (isTRUE(ENABLE_TRAINING_STATS)) {
 # --- TRAINING DATA (used for statistics) ---
 # Always use explicit training CSV; no fallback allowed.
-TRAINING_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_train (3).csv"
+TRAINING_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_train (4).csv"
 if (!file.exists(TRAINING_CSV)) {
   stop(sprintf("[TRAINING] Required TRAINING_CSV not found: %s", TRAINING_CSV))
 }
@@ -1324,8 +1266,8 @@ cat(sprintf("[TRAINING] EVI finite values after calculate_indices: %d/%d\n",
   training_df <- add_ppi_columns(training_df, dvi_soil = dvi_soil_vec)
   cat(sprintf("[TRAINING] Applied per-location Jan-Mar mean dvi_soil baseline with M=%.6f (no_soil==1 Jul-Sep max DVI); soil median=%.6f\n", ppi_m_train, stats::median(dvi_soil_vec, na.rm=TRUE)))
   # Filter training years to the analysis window
-  cat("Filtering training data for years 1985-2025...\n")
-  training_df <- training_df |> dplyr::filter(year >= 1985 & year <= 2025)
+  cat("Filtering training data for years 1984-2025...\n")
+  training_df <- training_df |> dplyr::filter(year >= 1984 & year <= 2025)
   cat("Training rows after year filtering:", nrow(training_df), "\n")
 } else {
   cat("[TRAINING] skipped (ENABLE_TRAINING_STATS=FALSE)\n")
@@ -1373,8 +1315,8 @@ df$year <- lubridate::year(df$date)
 if (!"pheno_year" %in% names(df)) df$pheno_year <- assign_pheno_year(df$date)
 df$month <- lubridate::month(df$date)
 
-cat("Filtering data for years 1985-2025...\n")
-df <- df |> dplyr::filter(year >= 1985 & year <= 2025)
+cat("Filtering data for years 1984-2025...\n")
+df <- df |> dplyr::filter(year >= 1984 & year <= 2025)
 cat("Data rows after year filtering:", nrow(df), "\n")
 
 # Normalize band column names (e.g. "Blue" → "blue", "NIR" → "nir")
@@ -1633,73 +1575,6 @@ for (idx in intersect(INDICES_OF_INTEREST, names(summer_data))) {
 cat("Number of winter (Jan-Mar) observations:", nrow(winter_data), "\n")
 cat("Number of summer (Jun-Sep) observations:", nrow(summer_data), "\n")
 
-# Compute dataset-level SNR for indices (per-index SNR across locations)
-#
-# This helper is mostly vestigial but implements the same variance-based approach
-# used elsewhere: signal is the square of the seasonal amplitude (July minus
-# January mean) and noise is the variance of the residuals around a fitted
-# seasonal curve for each location-year.  The overall SNR is the median across
-# location-years.
-compute_global_index_snr <- function(df, indices, group_col = "location_id", eps = 1e-8) {
-  # Wrap entire computation so an unexpected error doesn't abort the calling script
-  result <- tryCatch({
-    out <- numeric(length(indices)); names(out) <- indices
-    if (!"month" %in% names(df) && "date" %in% names(df)) df$month <- lubridate::month(df$date)
-    if (!"pheno_year" %in% names(df) && "date" %in% names(df)) df$pheno_year <- assign_pheno_year(df$date)
-    for (idx in indices) {
-    if (!idx %in% names(df)) { out[idx] <- NA_real_; next }
-    s_vals <- numeric(0)
-    locs <- unique(na.omit(as.character(df[[group_col]])))
-    for (loc in locs) {
-      sub_loc <- df[df[[group_col]] == loc, , drop = FALSE]
-      if (nrow(sub_loc) == 0) next
-      yrs_list <- split(sub_loc, sub_loc$pheno_year)
-      # make sure split produced something iterable (should be a list)
-      if (!is.list(yrs_list)) {
-        warning(sprintf("[GLOBAL SNR] loc=%s produced non-list years object of class %s; skipping",
-                        loc, paste(class(yrs_list), collapse=",")))
-        next
-      }
-      for (yr in yrs_list) {
-        if (!idx %in% names(yr) || !"month" %in% names(yr)) next
-        jan_vals <- yr[[idx]][yr$month == 1]; jul_vals <- yr[[idx]][yr$month == 7]
-        jan_vals <- jan_vals[is.finite(jan_vals)]; jul_vals <- jul_vals[is.finite(jul_vals)]
-        if (length(jan_vals) < 1 || length(jul_vals) < 1) next
-        amp <- mean(jul_vals, na.rm = TRUE) - mean(jan_vals, na.rm = TRUE)
-        vals_year <- yr[[idx]]; vals_year <- vals_year[is.finite(vals_year)]
-        if (length(vals_year) < 3) next
-        # fit a simple seasonal spline for this year and compute residual variance
-        doy <- if ("doy" %in% names(yr)) yr$doy else lubridate::yday(yr$date)
-        fit <- tryCatch(stats::smooth.spline(doy, vals_year, df = min(5, length(unique(doy)) - 1)),
-                        error = function(e) NULL)
-        if (is.null(fit)) {
-          noise_var <- stats::var(vals_year, na.rm = TRUE)
-        } else {
-          pred <- stats::predict(fit, doy)$y
-          noise_var <- stats::var(vals_year - pred, na.rm = TRUE)
-        }
-        if (!is.finite(amp) || !is.finite(noise_var) || noise_var <= 0) next
-        # convert amplitude to variance by squaring
-        s_vals <- c(s_vals, (amp^2) / (noise_var + eps))
-      }
-    }
-    if (length(s_vals) == 0) { out[idx] <- NA_real_; next }
-    out[idx] <- median(s_vals, na.rm = TRUE)
-  }
-  out
-  }, error = function(e) {
-    warning(sprintf("[GLOBAL SNR] computation failed: %s", e$message))
-    # return NA vector matching expected length
-    vec <- rep(NA_real_, length(indices))
-    names(vec) <- indices
-    vec
-  })
-  return(result)
-}
-
-# Calculate SNR for the indices of interest using training data
-indices_to_snr <- INDICES_OF_INTEREST
-
 ## Compute SNR using estimated FVC fractions (variance-based noise)
 ## Signal variance is approximated by the square of the Dynamic Range
 ##   (Dynamic Range = 99th - 1st percentile of all data, soil->veg).
@@ -1775,7 +1650,7 @@ mat <- NA_real_
 # ")
 
 # Spatial autocorrelation and block-bootstrap helpers are now maintained in mesma_helpers.R and
-# sourced at the top of this script.  Duplicated definitions have been removed.
+# sourced at the top of this script.
 
 
 # see mesma_helpers.R for compute_haversine_distance_matrix (shared)
@@ -1924,63 +1799,6 @@ process_global_averages <- function(data, month_name) {
   dplyr::bind_cols(avg_stats, ci_df)
 }
 
-# -----------------------------------------------------------------------------
-# Plotting helpers: create error-bar figures from summary data
-# -----------------------------------------------------------------------------
-plot_global_averages <- function(summary_df, title_prefix, output_dir) {
-  if (is.null(summary_df) || nrow(summary_df) == 0) return(invisible(NULL))
-  idxs <- intersect(INDICES_OF_INTEREST,
-                    gsub("^avg_", "", grep("^avg_", names(summary_df), value = TRUE)))
-  if (length(idxs) == 0) return(invisible(NULL))
-
-  long <- do.call(rbind, lapply(idxs, function(idx) {
-    data.frame(index = idx,
-               mean = summary_df[[paste0("avg_", idx)]],
-               ci_lower = summary_df[[paste0(idx, "_ci_lower")]],
-               ci_upper = summary_df[[paste0(idx, "_ci_upper")]],
-               stringsAsFactors = FALSE)
-  }))
-
-  p <- ggplot(long, aes(x = index, y = mean)) +
-    geom_point() +
-    geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
-    theme_minimal() +
-    labs(title = paste0(title_prefix, " Global Averages (95% CI)"),
-         x = "Index", y = "Mean value")
-
-  fn <- file.path(output_dir, paste0(gsub("\\s+", "_", title_prefix), "_global_CI.png"))
-  ggsave(fn, plot = p, width = 10, height = 6)
-  cat("Saved global CI plot to:", fn, "\n")
-}
-
-plot_vegtype_averages <- function(df, title_prefix, output_dir) {
-  if (is.null(df) || nrow(df) == 0) return(invisible(NULL))
-  idxs <- intersect(INDICES_OF_INTEREST,
-                    gsub("^avg_", "", grep("^avg_", names(df), value = TRUE)))
-  if (length(idxs) == 0) return(invisible(NULL))
-
-  long <- do.call(rbind, lapply(idxs, function(idx) {
-    data.frame(Veg = df$Veg,
-               index = idx,
-               mean = df[[paste0("avg_", idx)]],
-               ci_lower = df[[paste0(idx, "_ci_lower")]],
-               ci_upper = df[[paste0(idx, "_ci_upper")]],
-               stringsAsFactors = FALSE)
-  }))
-
-  p <- ggplot(long, aes(x = Veg, y = mean)) +
-    geom_point() +
-    geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
-    facet_wrap(~ index, scales = "free_y") +
-    theme_minimal() +
-    labs(title = paste0(title_prefix, " Veg-Type Averages (95% CI)"),
-         x = "Veg type", y = "Mean value")
-
-  fn <- file.path(output_dir, paste0(gsub("\\s+", "_", title_prefix), "_vegtype_CI.png"))
-  ggsave(fn, plot = p, width = 14, height = 10)
-  cat("Saved veg‑type CI plot to:", fn, "\n")
-}
-
 
 # Calculate Global averages for winter (non-detrended)
 winter_global_avg <- process_global_averages(winter_data, "Winter (Jan-Mar)")
@@ -2000,8 +1818,14 @@ location_summary <- function(data, metrics = c("MSAVI", "NDVI", "PPI")) {
   )
 }
 
-loc_winter <- location_summary(winter_data, metrics = INDICES_OF_INTEREST)
-loc_summer <- location_summary(summer_data, metrics = INDICES_OF_INTEREST)
+# Veg-type averages must use training data (df_raw), not inference data.
+# df_raw has per-location Veg labels; the inference data does not.
+.train_month <- lubridate::month(as.Date(df_raw$date))
+training_winter <- df_raw[!is.na(.train_month) & .train_month %in% c(1L, 2L, 3L), , drop = FALSE]
+training_summer <- df_raw[!is.na(.train_month) & .train_month %in% SUMMER_DETREND_MONTHS, , drop = FALSE]
+rm(.train_month)
+loc_winter <- location_summary(training_winter, metrics = INDICES_OF_INTEREST)
+loc_summer <- location_summary(training_summer, metrics = INDICES_OF_INTEREST)
 
 # Prepare mapping at location level (map_df should already be loaded if available)
 map_loc <- NULL
@@ -2096,22 +1920,37 @@ veg_stats_from_locs <- function(loc_tbl, data_tbl, period_name) {
 }
 
 cat("Calculating Vegetation Type winter averages using mapping CSV and location summaries...\n")
-veg_type_averages <- veg_stats_from_locs(loc_winter, winter_data, "Winter (Jan-Mar)")
+veg_type_averages <- veg_stats_from_locs(loc_winter, training_winter, "Winter (Jan-Mar)")
 
 cat("Calculating Vegetation Type summer (detrended) averages using mapping CSV and location summaries...\n")
-veg_type_averages_summer <- veg_stats_from_locs(loc_summer, summer_data, "Summer (Jun-Sep)")
+veg_type_averages_summer <- veg_stats_from_locs(loc_summer, training_summer, "Summer (Jun-Sep)")
+
+# Q90 of summer PPI per vegetation type (used by gw_correlation.R to normalise fractions)
+# Uses training data so that Veg labels are available.
+if ("PPI" %in% names(training_summer) && "Veg" %in% names(training_summer)) {
+  ppi_q90_by_veg <- training_summer |>
+    dplyr::filter(!is.na(PPI), !is.na(Veg)) |>
+    dplyr::mutate(Veg = tolower(trimws(as.character(Veg)))) |>
+    dplyr::group_by(Veg) |>
+    dplyr::summarise(ppi_q90 = quantile(PPI, 0.9, na.rm = TRUE), n_obs = dplyr::n(), .groups = "drop")
+  cat("\n=== SUMMER PPI Q90 BY VEGETATION TYPE ===\n")
+  print(ppi_q90_by_veg)
+} else {
+  ppi_q90_by_veg <- data.frame(Veg = character(0), ppi_q90 = numeric(0), n_obs = integer(0))
+  cat("[NOTICE] PPI or Veg column not found in training_summer; ppi_q90_by_veg is empty.\n")
+}
 
 # Print results
-cat("\n=== GLOBAL WINTER AVERAGES (1985-2025) ===\n")
+cat("\n=== GLOBAL WINTER AVERAGES (1984-2025) ===\n")
 print(winter_global_avg)
 
-cat("\n=== GLOBAL SUMMER AVERAGES (detrended) (1985-2025) ===\n")
+cat("\n=== GLOBAL SUMMER AVERAGES (detrended) (1984-2025) ===\n")
 print(summer_global_avg)
 
-cat("\n=== WINTER AVERAGES BY VEGETATION TYPE (1985-2025) ===\n")
+cat("\n=== WINTER AVERAGES BY VEGETATION TYPE (1984-2025) ===\n")
 print(veg_type_averages)
 
-cat("\n=== SUMMER AVERAGES BY VEGETATION TYPE (1985-2025) ===\n")
+cat("\n=== SUMMER AVERAGES BY VEGETATION TYPE (1984-2025) ===\n")
 print(veg_type_averages_summer)
 
 # --- Create Summary Table as requested ---
@@ -2265,6 +2104,7 @@ results_list <- list(
   "Summer_Global_Avg" = summer_global_avg,
   "Winter_VegType_Avg" = veg_type_averages,
   "Summer_VegType_Avg" = veg_type_averages_summer,
+  "Summer_PPI_Q90_Veg" = ppi_q90_by_veg,
   "Summary_Table" = summary_table
 )
 # write each component of the results list to its own CSV file for easy inspection
@@ -2353,7 +2193,6 @@ if (!SKIP_TRENDS) {
 indices_to_plot <- intersect(INDICES_OF_INTEREST,
                               c("NDVI", "MSAVI", "EVI", "PPI"))
 
-# Combined/global trend plots removed per request.
 # Only per-inference CSV trend plots with CI are generated below.
 
 # -----------------------------------------------------------------------------
@@ -2487,7 +2326,8 @@ run_scope_trend_plots <- function(df_scope, scope_name, scope_output_dir,
     scale_colour_manual(values = col_vals, name = NULL) +
     scale_fill_manual(values = fill_vals, name = NULL) +
     scale_linetype_manual(values = lt_vals, name = NULL) +
-    facet_wrap(~ index, scales = "free_y") +
+    scale_x_continuous(limits = c(1984, NA)) +
+    facet_wrap(~ index, scales = "fixed") +
     labs(
       title    = sprintf("%s: Summer Indices (95%% CI)", toupper(scope_name)),
       subtitle = subtitle_txt,
@@ -2514,6 +2354,7 @@ run_scope_trend_plots <- function(df_scope, scope_name, scope_output_dir,
       scale_colour_manual(values = col_vals, name = NULL) +
       scale_fill_manual(values = fill_vals, name = NULL) +
       scale_linetype_manual(values = lt_vals, name = NULL) +
+      scale_x_continuous(limits = c(1984, NA)) +
       labs(
         title    = sprintf("%s: %s (95%% CI)", toupper(scope_name), idx),
         subtitle = subtitle_txt,
@@ -2548,6 +2389,7 @@ run_scope_trend_plots <- function(df_scope, scope_name, scope_output_dir,
       scale_colour_manual(values = pal) +
       scale_fill_manual(values = pal) +
       scale_linetype_manual(values = lt_vals, name = "Pipeline") +
+      scale_x_continuous(limits = c(1984, NA)) +
       labs(
         title    = sprintf("%s: All Indices", toupper(scope_name)),
         subtitle = subtitle_txt,

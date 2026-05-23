@@ -15,7 +15,8 @@ sheet_loc_map <- list(Alagan = NULL, Yingsu = NULL)
 veg_to_use <- "all"            # change to the veg/label you want to correlate (or NULL/'all' for all)
 # Vegetation classes to exclude from plotting/analysis (e.g. 'barren')
 exclude_vegs <- c('barren')
-metric_col <- "coef"               # column in `inference_csv` to correlate (must be numeric)
+metric_col <- "coef"               # expected PPI-normalized column in `inference_csv`
+require_ppi_normalized_trend <- TRUE  # fail fast when only known un-normalized metrics are available
 # evaluate lags from min_lag_years through max_lag_years; negative values allowed
 min_lag_years <- -2                # include additional lags down to -2 (GW leads by two years)
 max_lag_years <- 3                   # evaluate lags 0..max_lag_years (default includes 1-year lag)
@@ -74,6 +75,40 @@ build_veg_palette <- function(veg_levels) {
     }
   }
   pal
+}
+
+# Resolve the metric column used for GW correlation, preferring explicit
+# PPI-normalized columns when present.
+resolve_inference_metric_col <- function(df, preferred_col = "coef") {
+  candidates <- unique(c(
+    preferred_col,
+    "coef_ppi_norm", "coef_abs", "ppi_norm_coef", "coef"
+  ))
+  for (col in candidates) {
+    if (col %in% names(df)) {
+      vals <- suppressWarnings(as.numeric(df[[col]]))
+      if (any(is.finite(vals))) return(col)
+    }
+  }
+  NA_character_
+}
+
+# Guard against accidentally using relative/raw (un-normalized) trend columns.
+assert_ppi_normalized_metric <- function(df, metric_col) {
+  unnormalized_cols <- c("coef_raw", "coef_rel", "rel_coef", "raw_coef", "unnormalized_coef")
+  present_unorm <- intersect(unnormalized_cols, names(df))
+  if (length(present_unorm) > 0 && metric_col %in% present_unorm) {
+    stop(sprintf(
+      "Selected metric '%s' is an un-normalized trend column. Choose a PPI-normalized metric.",
+      metric_col
+    ))
+  }
+
+  # Variant rows can duplicate class estimates. Collapse to one value per
+  # location-year-veg before trend/correlation stats.
+  if (!all(c("location_id", "pheno_year", "Veg", metric_col) %in% names(df))) {
+    stop("Inference data is missing required columns for metric validation")
+  }
 }
 
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
@@ -242,7 +277,6 @@ compute_trend_stats <- function(df, x_col, y_col) {
 }
 
 # Plot time-series trends for groundwater+inference (combined only)
-# Note: single-variable 'mean' trend plots have been removed per request.
 plot_trends_for_sheet <- function(inf_yearly_df, gw_yearly_df, joined_df, sheet, id_tag, veg, out_dir, default_lag, veg_color = '#1f77b4', restrict01 = TRUE) {
   # use joined_df which already aligns years unlagged, scale groundwater to fit on same axis
   if(!is.null(joined_df) && nrow(joined_df) >= 3) {
@@ -275,6 +309,7 @@ plot_trends_for_sheet <- function(inf_yearly_df, gw_yearly_df, joined_df, sheet,
         sec.axis = sec_axis(~ (. - min_inf)/scale_factor + min_gw, name = 'groundwater depth (m)')
       ) +
       scale_color_manual(name = '', values = c('inf' = veg_color, 'gw' = '#d62728'), labels = c('inference', 'gw')) +
+      scale_x_continuous(limits = c(1984, NA)) +
       labs(x = 'year') +
       annotate('text', x = min(comb$pheno_year, na.rm = TRUE), y = max_inf + y_pad * 3.5, hjust = 0, label = paste(ann_txt, collapse = '\n'), size = 3) +
       theme_mesma()
@@ -311,6 +346,7 @@ plot_dual_axis_time_series <- function(inf_yearly_df, gw_yearly_df, sheet, id_ta
     geom_line(aes(y = gw_scaled, color = 'gw'), linewidth = 0.9, linetype = 'dashed') + geom_point(aes(y = gw_scaled, color = 'gw')) +
     scale_y_continuous(name = 'vegetation fraction', limits = c(0,1), sec.axis = sec_axis(~ (. - min_inf)/scale_factor + min_gw, name = 'groundwater depth (m)')) +
     scale_color_manual('', values = c('veg' = veg_color, 'gw' = '#d62728'), labels = c('vegetation', 'groundwater')) +
+    scale_x_continuous(limits = c(1984, NA)) +
     labs(x = 'year') +
     theme_mesma()
   invisible(joined)
@@ -343,10 +379,32 @@ plot_scatter_lagged <- function(inf_yearly_df, gw_yearly_df, lag = 1, sheet, id_
 # ------------------- Run analysis -------------------
 message('Reading inference results...')
 inf <- readr::read_csv(inference_csv, show_col_types = FALSE)
-# restrict satellite/inference data to years after 2000
+
+metric_col_resolved <- resolve_inference_metric_col(inf, preferred_col = metric_col)
+if (is.na(metric_col_resolved)) {
+  stop("No usable PPI-normalized inference metric column found in inference CSV")
+}
+metric_col <- metric_col_resolved
+assert_ppi_normalized_metric(inf, metric_col)
+if (isTRUE(require_ppi_normalized_trend) && metric_col != "coef" && grepl("raw|rel|unnormal", metric_col, ignore.case = TRUE)) {
+  stop(sprintf("Resolved metric '%s' is not PPI-normalized.", metric_col))
+}
+message(sprintf("Using inference metric column for GW trend/correlation: %s", metric_col))
+
+# Use per-location-year-class medians to remove variant duplication before
+# any trend/correlation aggregation.
+if (all(c("location_id", "pheno_year", "lat", "lon", "Veg", metric_col) %in% names(inf))) {
+  inf <- inf %>%
+    mutate(.metric_value = suppressWarnings(as.numeric(.data[[metric_col]]))) %>%
+    group_by(location_id, pheno_year, lat, lon, Veg) %>%
+    summarize(.metric_value = median(.metric_value, na.rm = TRUE), .groups = "drop") %>%
+    rename(!!metric_col := .metric_value)
+}
+
+# restrict satellite/inference data to years after 1984
 if('pheno_year' %in% names(inf)) {
-  inf <- inf %>% mutate(pheno_year = as.integer(pheno_year)) %>% filter(pheno_year > 2000)
-  message(sprintf('Filtered inference to pheno_year > 2000; remaining rows: %d', nrow(inf)))
+  inf <- inf %>% mutate(pheno_year = as.integer(pheno_year)) %>% filter(pheno_year >= 1984)
+  message(sprintf('Filtered inference to pheno_year >= 1984; remaining rows: %d', nrow(inf)))
 }
 message(sprintf('Inference rows: %d, columns: %d', nrow(inf), ncol(inf)))
 
@@ -361,7 +419,7 @@ if(!is.null(veg_to_use)) {
 }
 
 # For each groundwater sheet: inspect structure, convert to yearly, try to match, compute lags
-# NOTE: combined Alagan+Yingsu support removed; each sheet is processed separately.
+# Each sheet is processed separately.
 # Users who want to analyse both should include them individually in `sheets_to_use`.
 final_reports <- list()
 corr_list <- list()   # accumulate all lagged correlation tables for final Excel
@@ -457,15 +515,26 @@ for(sheet in sheets_to_use) {
 
     # plot correlation vs lag (report lagged correlations numerically)
     p1 <- ggplot(stats_tbl, aes(x = lag, y = pearson_r)) +
-        geom_point(size = 3, color = veg_color) + geom_line(color = veg_color) +
-        # place labels slightly closer to the point and give extra vertical room so they are not clipped
-        geom_text(aes(label = ifelse(n >= 3, sprintf('r=%.2f\n p=%.3f', pearson_r, p_value), 'n<3')), vjust = -0.5, size = 3) +
-        scale_y_continuous(limits = c(-1,1), expand = expansion(mult = c(0.05, 0.25))) +
-      coord_cartesian(clip = 'off') +
-      scale_x_continuous(breaks = stats_tbl$lag, labels = label_fun) +
-      labs(x = 'lag (years)', y = 'Pearson r') +
-      theme_minimal() +
-      theme(plot.margin = margin(t = 14, r = 8, b = 8, l = 8))
+        geom_hline(yintercept = 0, linetype = 'dashed', color = 'grey60', linewidth = 0.4) +
+        geom_line(color = veg_color, linewidth = 0.9) +
+        geom_point(size = 3.5, color = veg_color) +
+        # only label lags other than -1 and 0
+        geom_text(
+          data = subset(stats_tbl, !(lag %in% c(-1, 0))),
+          aes(label = ifelse(n >= 3, sprintf('r=%.2f\np=%.3f', pearson_r, p_value), 'n<3')),
+          vjust = -0.6, size = 2.7, lineheight = 0.9
+        ) +
+        scale_y_continuous(limits = c(-1, 1), expand = expansion(mult = c(0.05, 0.28))) +
+        coord_cartesian(clip = 'off') +
+        scale_x_continuous(breaks = stats_tbl$lag, labels = label_fun) +
+        labs(x = 'Lag (years)', y = 'Pearson r',
+             title = sprintf('%s — %s', sheet, veg)) +
+        theme_mesma() +
+        theme(
+          plot.title  = element_text(size = 9, face = 'bold', margin = margin(b = 6)),
+          plot.margin = margin(t = 16, r = 10, b = 8, l = 10),
+          panel.grid.major.x = element_blank()
+        )
     f1 <- file.path(out_dir, sprintf('r_vs_lag_%s_%s_%s.png', sheet, id_tag, veg))
     ggsave(filename = f1, plot = p1, width = 6, height = 4)
     message('Saved plot: ', f1)
@@ -517,13 +586,26 @@ for(sheet in sheets_to_use) {
     combined <- bind_rows(lapply(veg_results, function(x) x$stats), .id = 'veg')
     if(nrow(combined) > 0) {
       p_all <- ggplot(combined, aes(x = lag, y = pearson_r, color = veg, group = veg)) +
-        geom_line() + geom_point() +
-        geom_text(data = subset(combined, lag == 0), aes(label = sprintf("r=%.2f\np=%.3f", pearson_r, p_value)), vjust = -0.5, hjust = 0.5, size = 3) +
+        geom_hline(yintercept = 0, linetype = 'dashed', color = 'grey60', linewidth = 0.4) +
+        geom_line(linewidth = 0.9) +
+        geom_point(size = 3) +
+        # suppress labels at lag -1 and 0
+        geom_text(
+          data = subset(combined, !(lag %in% c(-1, 0)) & !is.na(pearson_r)),
+          aes(label = sprintf("r=%.2f\np=%.3f", pearson_r, p_value)),
+          vjust = -0.6, hjust = 0.5, size = 2.6, lineheight = 0.9, show.legend = FALSE
+        ) +
         scale_color_manual(values = veg_palette) +
-          scale_y_continuous(limits = c(-1,1)) +
+        scale_y_continuous(limits = c(-1, 1), expand = expansion(mult = c(0.05, 0.28))) +
         scale_x_continuous(breaks = unique(combined$lag), labels = label_fun(unique(combined$lag))) +
-        labs(x = 'lag (years)', y = 'Pearson r', title = paste('All Vegs:', sheet)) +
-        theme_minimal() + theme(plot.margin = margin(t = 14, r = 8, b = 8, l = 8))
+        labs(x = 'Lag (years)', y = 'Pearson r', title = paste('All vegetation classes —', sheet)) +
+        theme_mesma() +
+        theme(
+          plot.title       = element_text(size = 9, face = 'bold', margin = margin(b = 6)),
+          plot.margin      = margin(t = 16, r = 10, b = 8, l = 10),
+          panel.grid.major.x = element_blank(),
+          legend.title     = element_blank()
+        )
       fp <- file.path(out_dir, sprintf('r_vs_lag_%s_allvegs.png', sheet))
       ggsave(fp, plot = p_all, width = 6, height = 4)
       message('Saved combined correlation overview: ', fp)
