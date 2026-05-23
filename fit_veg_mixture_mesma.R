@@ -5877,5 +5877,4 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
        best_score=best_score,
        best_W=best_W,
        all_results=df)
-}
 # End of script
