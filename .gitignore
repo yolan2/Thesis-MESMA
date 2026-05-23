@@ -10,5 +10,8 @@
 # Allow Python scripts
 !*.py
 
+# Allow Markdown files
+!*.md
+
 # Allow directories (needed to traverse into them)
 !*/
