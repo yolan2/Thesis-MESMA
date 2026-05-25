@@ -1,6 +1,6 @@
 # =============================================================================
 # plot_mesma_maps.R
-# Maps of MESMA inference output: vegetation fraction change 1984-2025
+# Maps of MESMA inference output: vegetation fraction change 1986-2025
 # =============================================================================
 # Reads inference_results.csv and produces:
 #   1. Per-class fraction maps (one panel per decade or selected years)
@@ -17,7 +17,7 @@ library(ggrepel)
 # --- Config ------------------------------------------------------------------
 INFERENCE_CSV <- "C:/Users/yolan/OneDrive/Documenten/UGENT/Master/R_MESMA/inference_results/inference_results_Landsat_Harmonized_Bands_1985_2025_low_3_.csv"
 OUT_DIR       <- "C:/Users/yolan/OneDrive/Documenten/UGENT/Master/R_MESMA/maps"
-YEAR_START    <- 1984
+YEAR_START    <- 1986
 YEAR_END      <- 2025
 # Years to show in the faceted time-slice maps (NULL = all years)
 SLICE_YEARS   <- sort(unique(c(seq(YEAR_START, YEAR_END, by = 5), YEAR_END)))

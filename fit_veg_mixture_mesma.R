@@ -204,7 +204,7 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
       geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
        labs(title = paste0(method, ": Vegetation Fractions"),
            x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
-      scale_x_continuous(limits = c(1984, NA)) +
+      scale_x_continuous(limits = c(1986, NA)) +
       theme_minimal()
 
     ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_normalized_timeseries.png")), p_ts, width = 8, height = 6)
@@ -225,7 +225,7 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
     geom_ribbon(aes(ymin = coef_025, ymax = coef_975), alpha = 0.15, fill = "saddlebrown", color = NA) +
     labs(title = paste0(method, ": Barren Fraction"), x = "Year", y = "Barren Fraction") +
     scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
-    scale_x_continuous(limits = c(1984, NA)) +
+    scale_x_continuous(limits = c(1986, NA)) +
     theme_minimal()
   ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_barren_cover.png")), p_barren, width = 8, height = 6)
   readr::write_csv(inf_barren, file.path(OUT_DIR, paste0("inference_", file_prefix, "_barren_cover.csv")))
@@ -251,7 +251,7 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
         scale_fill_manual(values = SPECIES_COLORS) +
            labs(title = paste0(method, " Species"),
              x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
-        scale_x_continuous(limits = c(1984, NA)) +
+        scale_x_continuous(limits = c(1986, NA)) +
         theme_minimal()
       ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_separate.png")), p_sp_ts, width = 8, height = 6)
       readr::write_csv(species_data, file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_separate.csv")))
@@ -276,7 +276,7 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
             scale_fill_manual(values = SPECIES_COLORS) +
               labs(title = paste0(method, " Species Share"),
                  x = "Year", y = "Proportion", fill = "Veg") +
-            scale_x_continuous(limits = c(1984, NA)) +
+            scale_x_continuous(limits = c(1986, NA)) +
             theme_minimal()
           ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_stacked.png")), p_sp_stacked, width = 8, height = 6)
           readr::write_csv(df_prop_sp, file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_stacked.csv")))
@@ -587,8 +587,8 @@ safe_col_weighted_avg <- function(mat, wts) {
 cat("[NOTICE] Loading preprocessed data from preprocess_data.R outputs...\n")
 
 df <- readRDS("preprocessed_data.rds")
-# safety net: ensure no rows with phenology year before 1984 remain
-cutoff <- 1984
+# safety net: ensure no rows with phenology year before 1986 remain
+cutoff <- 1986
 if ("date" %in% names(df) || "pheno_year" %in% names(df)) {
   if (!"pheno_year" %in% names(df) && "date" %in% names(df)) {
     df$pheno_year <- ifelse(lubridate::month(df$date) >= 3,
@@ -622,9 +622,6 @@ cat(sprintf("Selected %d indices from preprocessed data: %s\n",
 cat(sprintf("[NOTICE] Loaded preprocessed data: %d rows, %d columns\n", nrow(df), ncol(df)))
 cat(sprintf("[NOTICE] Loaded gpts_map with %d locations\n", nrow(gpts_map)))
 cat(sprintf("[NOTICE] Loaded normalization params for %d indices\n", length(INDEX_SCALES)))
-
-timing_info <- list()
-timing_info$start_time <- Sys.time()
 
 cat("Starting vegetation mixture analysis with MESMA approach...\n")
 
@@ -1313,8 +1310,6 @@ lib <- list()
 for (v in vegs) {
   lib[[v]] <- list(n_samples = 0)
 }
-
-timing_info$lib_construction_done <- Sys.time()
 
 cat("=== Building raw index library ===\n")
 
@@ -2165,7 +2160,7 @@ load_and_prepare_inference_data <- function() {
             p_trend <- ggplot(plot_dt, aes(x = pheno_year, y = mean_val)) +
               add_excluded_years_shade(is_date = FALSE) + add_year_lines(is_date = FALSE) +
               geom_line() + geom_point() + facet_wrap(~index, scales = "free_y") + theme_minimal() +
-              scale_x_continuous(limits = c(1984, NA)) +
+              scale_x_continuous(limits = c(1986, NA)) +
               coord_cartesian(ylim = c(0, NA))
             # Use fixed filename (no date/time)
             pfile <- file.path(OUT_DIR, "inference_trends.png")
@@ -4542,7 +4537,6 @@ sample_oob_residual <- function(dominant_class) {
     } else {
       get_interpolate_method(INTERPOLATE_INFERENCE)
     }
-    cat(sprintf("[NOTICE] temporal fill method for inference/validation: %s\n", interp_method_for_inference))
     raw_mat <- build_pentad_matrix(task_data, base_indices_for_build, interpolate = interp_method_for_inference)
     if (is.null(raw_mat)) {
       return(NULL)
@@ -5395,8 +5389,6 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
   # Collect full per-task results for downstream reporting (variant trajectories, diagnostics, uncertainty)
   results_list <- list()
 
-  start_time <- Sys.time()
-
   for (i in seq_along(loc_batches)) {
     batch_locs <- loc_batches[[i]]
     batch_df <- df_tasks[df_tasks$location_id %in% batch_locs, ]
@@ -5412,12 +5404,6 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
   }
   cat("\n")
   
-  end_time <- Sys.time()
-  processing_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
-  cat(sprintf(
-    "\nProcessing finished in %.2f seconds (%.2f minutes)\n",
-    processing_time, processing_time / 60
-  ))
   } # End of n_locs_to_process > 0 conditional
 
   # ==========================================================================
@@ -5686,8 +5672,6 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
     next_progress_idx <- 1L
     
     inference_results_list <- list()
-    inference_start_time <- Sys.time()
-    
     for (i in seq_along(inference_loc_batches)) {
       batch_locs <- inference_loc_batches[[i]]
       batch_df <- df_tasks_inference_proc[df_tasks_inference_proc$location_id %in% batch_locs, ]
@@ -5721,11 +5705,6 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
     }
 
     cat("\n")
-    
-    inference_end_time <- Sys.time()
-    inference_processing_time <- as.numeric(difftime(inference_end_time, inference_start_time, units = "secs"))
-    cat(sprintf("[INFERENCE] Processing finished in %.2f seconds (%.2f minutes)\n",
-                inference_processing_time, inference_processing_time / 60))
     
     # Combine inference results
     inference_coefs <- do.call(rbind, lapply(inference_results_list, function(r) {
@@ -5857,22 +5836,13 @@ if (!dir.exists(TEMP_RESULTS_DIR)) {
     cat("[INFO] Training results CSV saving skipped (training outputs removed by config)\n")
   }
 
-  # Calculate total number of year results processed
-  n_year_results <- 0
-  if (!is.null(all_coefs) && nrow(all_coefs) > 0) {
-    n_year_results <- length(unique(paste(all_coefs$location_id, all_coefs$pheno_year, sep = "_")))
-  }
-
-  if (n_year_results > 0 && exists("processing_time")) {
-    cat(sprintf("Average time per year-result: %.2f seconds\n", processing_time / n_year_results))
-  } else {
-    cat("Average time per year-result: N/A (0 results)\n")
-  }
-
   # Ensure required library/templates exist for visualization
   ensure_library_and_templates()
 
-  df <- do.call(rbind, lapply(results, as.data.frame))
+  df <- all_coefs
+  if (!exists("best_params")) best_params <- NULL
+  if (!exists("best_score")) best_score <- NA_real_
+  if (!exists("best_W")) best_W <- NULL
   list(best_params=best_params,
        best_score=best_score,
        best_W=best_W,

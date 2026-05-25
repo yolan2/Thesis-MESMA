@@ -330,7 +330,7 @@ p_time <- ggplot(time_bias, aes(x = year, y = mean_bias, colour = band,
   facet_wrap(~band, scales = "free_y", ncol = 3) +
   scale_colour_brewer(palette = "Dark2", guide = "none") +
   scale_fill_brewer(palette = "Dark2", guide = "none") +
-  scale_x_continuous(limits = c(1984, NA)) +
+  scale_x_continuous(limits = c(1986, NA)) +
   labs(
     title = "Mean Bias by Year (L457 - L89)",
     x = "Year", y = "Mean difference ± SE"
@@ -463,7 +463,7 @@ p_prepost <- ggplot(yr_mean, aes(x = year, y = mean_val,
   annotate("text", x = 2013.2, y = -Inf, label = "L8 launch", vjust = -0.5,
            hjust = 0, size = 2.8, colour = "grey40") +
   facet_wrap(~band, scales = "free_y", ncol = 3) +
-  scale_x_continuous(limits = c(1984, NA)) +
+  scale_x_continuous(limits = c(1986, NA)) +
   labs(
     title    = "Mean band value by year: raw vs bias-corrected",
     subtitle = "Dotted vertical = 2013 (Landsat 8 launch). Corrected L89 should track L457.",

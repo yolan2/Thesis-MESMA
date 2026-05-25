@@ -1011,9 +1011,9 @@ infer_mid_low_kon_sequence <- function(path) {
 # Load the phenology data
 # Prefer explicit inference files when present (kon/mid/low), otherwise auto-detect from INPUT_CSV.
 preferred_inference_csvs <- c(
-  "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_kon (1).csv",
-  "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_mid (2).csv",
-  "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_low (3).csv"
+  "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_kon (2).csv",
+  "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_low (2).csv",
+  "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_mid (4).csv"
 )
 existing_preferred_inference_csvs <- preferred_inference_csvs[file.exists(preferred_inference_csvs)]
 
@@ -1034,14 +1034,17 @@ if (length(input_csvs) > 1) {
 df_list <- lapply(input_csvs, function(csv_path) {
   cat("Loading data from:", csv_path, "\n")
   d <- readr::read_csv(csv_path, show_col_types = FALSE)
+  if ("location_id" %in% names(d)) {
+    d$location_id <- as.character(d$location_id)
+  }
   d$.inference_source_csv <- as.character(csv_path)
   d$.inference_scope <- infer_inference_scope(basename(csv_path))
   d
 })
 
 df <- dplyr::bind_rows(df_list)
-# filter out any pheno years earlier than 1984 in the combined inference data
-cutoff <- 1984
+# filter out any pheno years earlier than 1986 in the combined inference data
+cutoff <- 1986
 if ("date" %in% names(df) || "pheno_year" %in% names(df)) {
   if (!"pheno_year" %in% names(df) && "date" %in% names(df)) {
     df$pheno_year <- ifelse(lubridate::month(as.Date(df$date)) >= 3,
@@ -1266,8 +1269,8 @@ cat(sprintf("[TRAINING] EVI finite values after calculate_indices: %d/%d\n",
   training_df <- add_ppi_columns(training_df, dvi_soil = dvi_soil_vec)
   cat(sprintf("[TRAINING] Applied per-location Jan-Mar mean dvi_soil baseline with M=%.6f (no_soil==1 Jul-Sep max DVI); soil median=%.6f\n", ppi_m_train, stats::median(dvi_soil_vec, na.rm=TRUE)))
   # Filter training years to the analysis window
-  cat("Filtering training data for years 1984-2025...\n")
-  training_df <- training_df |> dplyr::filter(year >= 1984 & year <= 2025)
+  cat("Filtering training data for years 1986-2025...\n")
+  training_df <- training_df |> dplyr::filter(year >= 1986 & year <= 2025)
   cat("Training rows after year filtering:", nrow(training_df), "\n")
 } else {
   cat("[TRAINING] skipped (ENABLE_TRAINING_STATS=FALSE)\n")
@@ -1315,8 +1318,8 @@ df$year <- lubridate::year(df$date)
 if (!"pheno_year" %in% names(df)) df$pheno_year <- assign_pheno_year(df$date)
 df$month <- lubridate::month(df$date)
 
-cat("Filtering data for years 1984-2025...\n")
-df <- df |> dplyr::filter(year >= 1984 & year <= 2025)
+cat("Filtering data for years 1986-2025...\n")
+df <- df |> dplyr::filter(year >= 1986 & year <= 2025)
 cat("Data rows after year filtering:", nrow(df), "\n")
 
 # Normalize band column names (e.g. "Blue" → "blue", "NIR" → "nir")
@@ -1574,6 +1577,12 @@ for (idx in intersect(INDICES_OF_INTEREST, names(summer_data))) {
 
 cat("Number of winter (Jan-Mar) observations:", nrow(winter_data), "\n")
 cat("Number of summer (Jun-Sep) observations:", nrow(summer_data), "\n")
+
+# Indices to use for SNR calculations (guard against missing columns)
+indices_to_snr <- intersect(INDICES_OF_INTEREST, names(analysis_df))
+if (length(indices_to_snr) == 0) {
+  indices_to_snr <- intersect(INDICES_OF_INTEREST, names(df))
+}
 
 ## Compute SNR using estimated FVC fractions (variance-based noise)
 ## Signal variance is approximated by the square of the Dynamic Range
@@ -1941,16 +1950,16 @@ if ("PPI" %in% names(training_summer) && "Veg" %in% names(training_summer)) {
 }
 
 # Print results
-cat("\n=== GLOBAL WINTER AVERAGES (1984-2025) ===\n")
+cat("\n=== GLOBAL WINTER AVERAGES (1986-2025) ===\n")
 print(winter_global_avg)
 
-cat("\n=== GLOBAL SUMMER AVERAGES (detrended) (1984-2025) ===\n")
+cat("\n=== GLOBAL SUMMER AVERAGES (detrended) (1986-2025) ===\n")
 print(summer_global_avg)
 
-cat("\n=== WINTER AVERAGES BY VEGETATION TYPE (1984-2025) ===\n")
+cat("\n=== WINTER AVERAGES BY VEGETATION TYPE (1986-2025) ===\n")
 print(veg_type_averages)
 
-cat("\n=== SUMMER AVERAGES BY VEGETATION TYPE (1984-2025) ===\n")
+cat("\n=== SUMMER AVERAGES BY VEGETATION TYPE (1986-2025) ===\n")
 print(veg_type_averages_summer)
 
 # --- Create Summary Table as requested ---
@@ -2247,15 +2256,18 @@ run_scope_trend_plots <- function(df_scope, scope_name, scope_output_dir,
         dplyr::do({
           tmp <- .
           res <- bootstrap_hierarchical_means(tmp, metrics = c(norm_metric), B = B)
-          loc_means <- sapply(unique(tmp$location_id), function(id) {
+          loc_ids <- unique(tmp$location_id)
+          loc_means <- sapply(loc_ids, function(id) {
             sub <- tmp[tmp$location_id == id, ]
             mean(sub[[norm_metric]], na.rm = TRUE)
           })
           data.frame(mean_val  = mean(loc_means, na.rm = TRUE),
+                     n_locations = length(loc_ids),
                      ci_lower  = res[1],
                      ci_upper  = res[2])
         }) |>
         dplyr::ungroup()
+      yearly_boot <- yearly_boot[yearly_boot$n_locations >= 500, , drop = FALSE]
       yearly_boot$index    <- idx
       yearly_boot$pipeline <- label
       result_list[[idx]] <- yearly_boot
@@ -2326,7 +2338,7 @@ run_scope_trend_plots <- function(df_scope, scope_name, scope_output_dir,
     scale_colour_manual(values = col_vals, name = NULL) +
     scale_fill_manual(values = fill_vals, name = NULL) +
     scale_linetype_manual(values = lt_vals, name = NULL) +
-    scale_x_continuous(limits = c(1984, NA)) +
+    scale_x_continuous(limits = c(1986, NA)) +
     facet_wrap(~ index, scales = "fixed") +
     labs(
       title    = sprintf("%s: Summer Indices (95%% CI)", toupper(scope_name)),
@@ -2354,7 +2366,7 @@ run_scope_trend_plots <- function(df_scope, scope_name, scope_output_dir,
       scale_colour_manual(values = col_vals, name = NULL) +
       scale_fill_manual(values = fill_vals, name = NULL) +
       scale_linetype_manual(values = lt_vals, name = NULL) +
-      scale_x_continuous(limits = c(1984, NA)) +
+      scale_x_continuous(limits = c(1986, NA)) +
       labs(
         title    = sprintf("%s: %s (95%% CI)", toupper(scope_name), idx),
         subtitle = subtitle_txt,
@@ -2389,7 +2401,7 @@ run_scope_trend_plots <- function(df_scope, scope_name, scope_output_dir,
       scale_colour_manual(values = pal) +
       scale_fill_manual(values = pal) +
       scale_linetype_manual(values = lt_vals, name = "Pipeline") +
-      scale_x_continuous(limits = c(1984, NA)) +
+      scale_x_continuous(limits = c(1986, NA)) +
       labs(
         title    = sprintf("%s: All Indices", toupper(scope_name)),
         subtitle = subtitle_txt,

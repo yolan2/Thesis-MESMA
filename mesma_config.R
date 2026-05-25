@@ -44,10 +44,10 @@ setup_parallel_backend <- function(workers = NULL) {
 
 INPUT_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_train (4).csv"
                                  # Path to the input CSV used for training. Replace with your own file path.
-INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_kon (1).csv"
+INFERENCE_CSV <- "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_mid (3).csv"
 #choose "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_kon (1).csv"
 #or "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_low (3).csv"
-#or "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_mid (2).csv"
+#or "C:/Users/yolan/Downloads/Landsat_Harmonized_Bands_1985_2025_mid (3).csv"
 
 # Training year selection
 # If you only want to build variants using the most recent data, set TRAIN_YEARS to a single year (e.g., 2024) or a vector of years.
@@ -167,7 +167,7 @@ FEATURE_PRUNING_THRESHOLD <- 0.9 # Correlation threshold above which a feature i
 # Data quality thresholds (filtering / skipping)
 MIN_OBS_PER_LOC_YEAR <- 8L      # Minimum rows required per location-year for processing (raised from 3). Increase to be stricter on noisy cases.
 MIN_UNIQUE_DOY_DEFAULT <- 5L    # Minimum unique DOYs per loc-year during training to consider time-series adequate.
-MIN_UNIQUE_DOY_INFERENCE <- 3L  # Less strict for inference to allow sparse inputs.
+MIN_UNIQUE_DOY_INFERENCE <- 6L  # Less strict for inference to allow sparse inputs.
 MIN_PENTADS_PER_TRAIN_SAMPLE <- 8L  # Minimum observations required per location-year trace to construct a training sample.
 
 # Modeling/algorithmic caps and defaults
@@ -243,7 +243,7 @@ OOB_TUNING_FRACTION <- 0.3         # Fraction held out from training data for cl
 VALIDATION_FRACTION <- 0.3         # Fraction held out for validation (stratified by location/Veg)
 
 # Endmember selection tuning
-MAX_K_EAR <- 2L                  # Maximum number of endmembers to consider per vegetation class in EAR selection (conservative increase to explore one more k).
+MAX_K_EAR <- 1L                  # Maximum number of endmembers to consider per vegetation class in EAR selection.
 CLUSTER_COMPLEXITY_LAMBDA <- 0.005  # Complexity penalty per total endmember: S = min(R_oob, R_train) - λ * sum(k)
 BARREN_SIM_THRESHOLD <- 1  # Pre-filter: drop vegetation training observations whose cosine similarity to barren mean exceeds this threshold
 

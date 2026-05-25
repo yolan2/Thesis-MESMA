@@ -232,7 +232,7 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
       geom_ribbon(aes(ymin = coef_025, ymax = coef_975, fill = Veg), alpha = 0.15, color = NA) +
        labs(title = paste0(method, ": Vegetation Fractions"),
            x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
-      scale_x_continuous(limits = c(1984, NA)) +
+      scale_x_continuous(limits = c(1986, NA)) +
       theme_minimal()
 
     # --- Olofsson-style bias correction overlay (dashed lines + SE band) ---
@@ -274,7 +274,7 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
     geom_ribbon(aes(ymin = coef_025, ymax = coef_975), alpha = 0.15, fill = "saddlebrown", color = NA) +
     labs(title = paste0(method, ": Barren Fraction"), x = "Year", y = "Barren Fraction") +
     scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
-    scale_x_continuous(limits = c(1984, NA)) +
+    scale_x_continuous(limits = c(1986, NA)) +
     theme_minimal()
   ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_barren_cover.png")), p_barren, width = 8, height = 6)
   readr::write_csv(inf_barren, file.path(OUT_DIR, paste0("inference_", file_prefix, "_barren_cover.csv")))
@@ -300,7 +300,7 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
         scale_fill_manual(values = SPECIES_COLORS) +
            labs(title = paste0(method, " Species"),
              x = "Year", y = "Total Normalized Fraction", color = "Veg", fill = "Veg") +
-        scale_x_continuous(limits = c(1984, NA)) +
+        scale_x_continuous(limits = c(1986, NA)) +
         theme_minimal()
       ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_separate.png")), p_sp_ts, width = 8, height = 6)
       readr::write_csv(species_data, file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_separate.csv")))
@@ -325,7 +325,7 @@ plot_inference_method_results <- function(full_data, method, file_prefix,
             scale_fill_manual(values = SPECIES_COLORS) +
               labs(title = paste0(method, " Species Share"),
                  x = "Year", y = "Proportion", fill = "Veg") +
-            scale_x_continuous(limits = c(1984, NA)) +
+            scale_x_continuous(limits = c(1986, NA)) +
             theme_minimal()
           ggsave(file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_stacked.png")), p_sp_stacked, width = 8, height = 6)
           readr::write_csv(df_prop_sp, file.path(OUT_DIR, paste0("inference_", file_prefix, "_species_stacked.csv")))
@@ -556,12 +556,12 @@ if ("location_id" %in% names(raw_df) && !is.character(raw_df$location_id)) {
 
 df <- raw_df
 
-# --- drop observations with phenology year before 1984 ----------------------
+# --- drop observations with phenology year before 1986 ----------------------
 # applying the cutoff here ensures downstream scripts (january_averages,
 # fit_mesma, etc.) never see the unwanted years.  We compute a temporary
 # pheno_year if it is not already present so that filtering works on raw
 # input CSVs as well.
-cutoff <- 1984
+cutoff <- 1986
 if ("date" %in% names(df) || "pheno_year" %in% names(df)) {
   ph <- NULL
   if ("pheno_year" %in% names(df)) {
@@ -806,7 +806,7 @@ if ("NDDI" %in% names(df)) {
           ggplot2::theme_minimal() +
           ggplot2::labs(title = "Images per Location by Year",
                         x = "Year", y = "Avg images / location") +
-          ggplot2::scale_x_continuous(limits = c(1984, NA))
+          ggplot2::scale_x_continuous(limits = c(1986, NA))
         print(p_years)
         if (exists("OUTPUT_DIR") && !is.null(OUTPUT_DIR)) {
           try(
@@ -833,7 +833,7 @@ if ("NDDI" %in% names(df)) {
           ggplot2::theme_minimal() +
           ggplot2::labs(title = "Images per Location by Year",
                         x = "Year", y = "Avg images / location") +
-          ggplot2::scale_x_continuous(limits = c(1984, NA))
+          ggplot2::scale_x_continuous(limits = c(1986, NA))
         print(p_years)
         if (exists("OUTPUT_DIR") && !is.null(OUTPUT_DIR)) {
           try(

@@ -309,7 +309,7 @@ plot_trends_for_sheet <- function(inf_yearly_df, gw_yearly_df, joined_df, sheet,
         sec.axis = sec_axis(~ (. - min_inf)/scale_factor + min_gw, name = 'groundwater depth (m)')
       ) +
       scale_color_manual(name = '', values = c('inf' = veg_color, 'gw' = '#d62728'), labels = c('inference', 'gw')) +
-      scale_x_continuous(limits = c(1984, NA)) +
+      scale_x_continuous(limits = c(1986, NA)) +
       labs(x = 'year') +
       annotate('text', x = min(comb$pheno_year, na.rm = TRUE), y = max_inf + y_pad * 3.5, hjust = 0, label = paste(ann_txt, collapse = '\n'), size = 3) +
       theme_mesma()
@@ -346,7 +346,7 @@ plot_dual_axis_time_series <- function(inf_yearly_df, gw_yearly_df, sheet, id_ta
     geom_line(aes(y = gw_scaled, color = 'gw'), linewidth = 0.9, linetype = 'dashed') + geom_point(aes(y = gw_scaled, color = 'gw')) +
     scale_y_continuous(name = 'vegetation fraction', limits = c(0,1), sec.axis = sec_axis(~ (. - min_inf)/scale_factor + min_gw, name = 'groundwater depth (m)')) +
     scale_color_manual('', values = c('veg' = veg_color, 'gw' = '#d62728'), labels = c('vegetation', 'groundwater')) +
-    scale_x_continuous(limits = c(1984, NA)) +
+    scale_x_continuous(limits = c(1986, NA)) +
     labs(x = 'year') +
     theme_mesma()
   invisible(joined)
@@ -401,10 +401,10 @@ if (all(c("location_id", "pheno_year", "lat", "lon", "Veg", metric_col) %in% nam
     rename(!!metric_col := .metric_value)
 }
 
-# restrict satellite/inference data to years after 1984
+# restrict satellite/inference data to years after 1986
 if('pheno_year' %in% names(inf)) {
-  inf <- inf %>% mutate(pheno_year = as.integer(pheno_year)) %>% filter(pheno_year >= 1984)
-  message(sprintf('Filtered inference to pheno_year >= 1984; remaining rows: %d', nrow(inf)))
+  inf <- inf %>% mutate(pheno_year = as.integer(pheno_year)) %>% filter(pheno_year >= 1986)
+  message(sprintf('Filtered inference to pheno_year >= 1986; remaining rows: %d', nrow(inf)))
 }
 message(sprintf('Inference rows: %d, columns: %d', nrow(inf), ncol(inf)))
 

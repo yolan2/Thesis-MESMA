@@ -657,7 +657,7 @@ add_excluded_years_shade <- function(start_year = 1992, end_year = 1999, is_date
 # Helper: add vertical lines at year boundaries for ggplot2 time-series plots.
 # Usage: + add_year_lines(is_date = TRUE)  # x axis is Date
 #        + add_year_lines(is_date = FALSE) # x axis is numeric (year)
-add_year_lines <- function(start_year = 1984, end_year = 2025, is_date = FALSE, color = "grey50", linetype = "dashed", alpha = 0.5) {
+add_year_lines <- function(start_year = 1986, end_year = 2025, is_date = FALSE, color = "grey50", linetype = "dashed", alpha = 0.5) {
   if (!requireNamespace("ggplot2", quietly = TRUE)) return(NULL)
   years <- seq(start_year, end_year, by = 1)
   if (is_date) {
